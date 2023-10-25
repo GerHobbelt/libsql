@@ -28,10 +28,8 @@ impl Statement {
         }
     }
 
-    pub fn execute(&self) -> Result<Rows> {
-        Ok(Rows {
-            raw: self.raw,
-            raw_stmt: self.raw_stmt,
-        })
+    pub fn execute(&self) -> Option<Rows> {
+        unsafe { libsql_sys::sqlite3_reset(self.raw_stmt) };
+        Rows::execute(self.raw, self.raw_stmt)
     }
 }

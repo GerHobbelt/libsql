@@ -56,10 +56,7 @@ pub unsafe extern "C" fn libsql_disconnect(conn: libsql_connection_t) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libsql_execute(
-    conn: libsql_connection_t,
-    sql: *const std::ffi::c_char,
-) {
+pub unsafe extern "C" fn libsql_execute(conn: libsql_connection_t, sql: *const std::ffi::c_char) {
     let sql = unsafe { std::ffi::CStr::from_ptr(sql) };
     let sql = match sql.to_str() {
         Ok(sql) => sql,
@@ -110,12 +107,6 @@ pub unsafe extern "C" fn libsql_free_rows_future(res: libsql_rows_future_t) {
 pub unsafe extern "C" fn libsql_wait_result(res: libsql_rows_future_t) {
     let res = res.get_ref_mut();
     res.wait().unwrap();
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn libsql_row_count(res: libsql_rows_t) -> std::ffi::c_int {
-    let res = res.get_ref();
-    res.row_count()
 }
 
 #[no_mangle]
