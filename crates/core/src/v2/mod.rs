@@ -103,7 +103,9 @@ impl Database {
     pub async fn sync(&self) -> Result<usize> {
         match &self.db_type {
             DbType::Sync { db } => db.sync().await,
-            _ => Err(crate::Error::SyncNotSupported),
+            DbType::Memory => Err(crate::Error::SyncNotSupported("in-memory".into())),
+            DbType::File { .. } => Err(crate::Error::SyncNotSupported("file".into())),
+            DbType::Remote { .. }=> Err(crate::Error::SyncNotSupported("remote".into())),
         }
     }
 }
@@ -117,6 +119,10 @@ trait Conn {
     async fn prepare(&self, sql: &str) -> Result<Statement>;
 
     async fn transaction(&self, tx_behavior: TransactionBehavior) -> Result<Transaction>;
+
+    fn is_autocommit(&self) -> bool;
+
+    fn changes(&self) -> u64;
 
     fn last_insert_rowid(&self) -> i64;
 }
@@ -160,6 +166,14 @@ impl Connection {
         self.conn.transaction(tx_behavior).await
     }
 
+    pub fn is_autocommit(&self) -> bool {
+       self.conn.is_autocommit()
+    }
+
+    pub fn changes(&self) -> u64 {
+       self.conn.changes()
+    }
+
     pub fn last_insert_rowid(&self) -> i64 {
         self.conn.last_insert_rowid()
     }
@@ -199,6 +213,14 @@ impl Conn for LibsqlConnection {
                 conn: Arc::new(self.clone()),
             },
         })
+    }
+
+    fn is_autocommit(&self) -> bool {
+       self.conn.is_autocommit()
+    }
+
+    fn changes(&self) -> u64 {
+        self.conn.changes()
     }
 
     fn last_insert_rowid(&self) -> i64 {

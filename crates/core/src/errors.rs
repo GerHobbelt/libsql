@@ -24,8 +24,10 @@ pub enum Error {
     ToSqlConversionFailure(crate::BoxError),
     #[error("Hrana: `{0}`")]
     Hrana(#[from] crate::v2::HranaError),
-    #[error("Sync is not supported")]
-    SyncNotSupported,
+    #[error("Sync is not supported in databases opened in {0} mode.")]
+    SyncNotSupported(String),
+    #[error("Column not found: {0}")]
+    ColumnNotFound(i32),
 }
 
 pub(crate) fn error_from_handle(raw: *mut libsql_sys::ffi::sqlite3) -> String {
