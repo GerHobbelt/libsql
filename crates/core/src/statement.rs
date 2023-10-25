@@ -8,7 +8,7 @@ use std::sync::Arc;
 /// A prepared statement.
 #[derive(Debug, Clone)]
 pub struct Statement {
-    conn: Connection,
+    pub(crate) conn: Connection,
     pub(crate) inner: Arc<libsql_sys::Statement>,
 }
 
@@ -23,8 +23,8 @@ impl Statement {
                 conn,
                 inner: Arc::new(stmt),
             }),
-            Err(libsql_sys::Error::LibError(err)) => Err(Error::PrepareFailed(
-                err,
+            Err(libsql_sys::Error::LibError(_err)) => Err(Error::PrepareFailed(
+                errors::extended_error_code(raw),
                 sql.to_string(),
                 errors::error_from_handle(raw),
             )),
@@ -104,7 +104,7 @@ impl Statement {
             crate::ffi::SQLITE_DONE => Ok(self.conn.changes()),
             crate::ffi::SQLITE_ROW => Err(Error::ExecuteReturnedRows),
             _ => Err(Error::LibError(
-                err,
+                errors::extended_error_code(self.conn.raw),
                 errors::error_from_handle(self.conn.raw),
             )),
         }
@@ -212,13 +212,31 @@ impl Statement {
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct Column<'stmt> {
     pub name: &'stmt str,
+    pub origin_name: Option<&'stmt str>,
+    pub table_name: Option<&'stmt str>,
+    pub database_name: Option<&'stmt str>,
     pub decl_type: Option<&'stmt str>,
 }
 
 impl Column<'_> {
-    /// Returns the name of the column.
+    /// Returns the name assigned to the column in the result set.
     pub fn name(&self) -> &str {
         self.name
+    }
+
+    /// Returns the name of the column in the origin table.
+    pub fn origin_name(&self) -> Option<&str> {
+        self.origin_name
+    }
+
+    /// Returns the name of the origin table.
+    pub fn table_name(&self) -> Option<&str> {
+        self.table_name
+    }
+
+    /// Returns the name of the origin database.
+    pub fn database_name(&self) -> Option<&str> {
+        self.database_name
     }
 
     /// Returns the type of the column (`None` for expression).
@@ -264,6 +282,22 @@ impl Statement {
         self.inner.column_name(col as i32)
     }
 
+    pub fn column_origin_name(&self, col: usize) -> Option<&str> {
+        self.inner.column_origin_name(col as i32)
+    }
+
+    pub fn column_table_name(&self, col: usize) -> Option<&str> {
+        self.inner.column_table_name(col as i32)
+    }
+
+    pub fn column_database_name(&self, col: usize) -> Option<&str> {
+        self.inner.column_database_name(col as i32)
+    }
+
+    pub fn column_decltype(&self, col: usize) -> Option<&str> {
+        self.inner.column_decltype(col as i32)
+    }
+
     /// Returns the column index in the result set for a given column name.
     ///
     /// If there is no AS clause then the name of the column is unspecified and
@@ -300,15 +334,11 @@ impl Statement {
         let mut cols = Vec::with_capacity(n);
         for i in 0..n {
             let name = self.column_name(i);
-            let decl_type = match self.inner.column_type(i as i32) as u32 {
-                libsql_sys::ffi::SQLITE_NULL => Some("null"),
-                libsql_sys::ffi::SQLITE_INTEGER => Some("integer"),
-                libsql_sys::ffi::SQLITE_FLOAT => Some("float"),
-                libsql_sys::ffi::SQLITE_TEXT => Some("text"),
-                libsql_sys::ffi::SQLITE_BLOB => Some("blob"),
-                _ => None,
-            };
-            cols.push(Column { name, decl_type });
+            let origin_name = self.column_origin_name(i);
+            let table_name = self.column_table_name(i);
+            let database_name = self.column_database_name(i);
+            let decl_type = self.column_decltype(i);
+            cols.push(Column { name, origin_name, table_name, database_name, decl_type });
         }
         cols
     }
