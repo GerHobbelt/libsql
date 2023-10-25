@@ -1,11 +1,14 @@
 mod client;
+mod connection;
 pub mod frame;
+mod parser;
 pub mod replica;
 
 pub use client::pb;
+pub use connection::RemoteConnection;
 
 pub const WAL_PAGE_SIZE: i32 = 4096;
-pub const WAL_MAGIC: u64 = u64::from_le_bytes(*b"SQLDWAL\0");
+// pub const WAL_MAGIC: u64 = u64::from_le_bytes(*b"SQLDWAL\0");
 
 /// The frame uniquely identifying, monotonically increasing number
 pub type FrameNo = u64;
@@ -22,16 +25,21 @@ use tokio::sync::mpsc::Sender;
 
 use client::Client;
 
+use self::parser::Statement;
+use self::pb::query::Params;
+use self::pb::{ExecuteResults, Positional, Program, ProgramReq, DescribeRequest, DescribeResult};
+
 pub struct Replicator {
-    pub frames_sender: Sender<Frames>,
-    pub current_frame_no_notifier: tokio::sync::watch::Receiver<FrameNo>,
+    pub(crate) frames_sender: Sender<Frames>,
+    #[allow(dead_code)]
+    pub(crate) current_frame_no_notifier: tokio::sync::watch::Receiver<FrameNo>,
     // The hook context needs to live as long as the injector and have a stable memory address.
     // Safety: it must never ever be used directly! Ever. Really.
     _hook_ctx: Arc<parking_lot::Mutex<InjectorHookCtx>>,
-    pub meta: Arc<parking_lot::Mutex<Option<replica::meta::WalIndexMeta>>>,
-    pub injector: replica::injector::FrameInjector<'static>,
-    pub client: Option<Client>,
-    pub next_offset: AtomicU64,
+    pub(crate) meta: Arc<parking_lot::Mutex<Option<replica::meta::WalIndexMeta>>>,
+    pub(crate) injector: replica::injector::FrameInjector<'static>,
+    pub(crate) client: Option<Client>,
+    pub(crate) next_offset: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -273,38 +281,48 @@ impl Replicator {
 }
 
 impl Writer {
-    pub async fn execute(
+    pub async fn execute_program(
         &self,
-        sql: &str,
-        params: impl Into<pb::query::Params> + Send,
-    ) -> anyhow::Result<u64> {
-        tracing::trace!("executing remote sql statement: {sql}");
-        let (write_frame_no, rows_affected) = self.client.execute(sql, params.into()).await?;
+        steps: Vec<Statement>,
+        params: impl Into<pb::query::Params>,
+    ) -> anyhow::Result<ExecuteResults> {
+        let mut params = Some(params.into());
 
-        tracing::trace!(
-            "statement executed on remote waiting for frame_no: {}",
-            write_frame_no
-        );
-        Ok(rows_affected)
+        let steps = steps
+            .into_iter()
+            .map(|stmt| pb::Step {
+                query: Some(pb::Query {
+                    stmt: stmt.stmt,
+                    // TODO(lucio): Pass params
+                    params: Some(
+                        params
+                            .take()
+                            .unwrap_or(Params::Positional(Positional::default())),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+
+        self.client
+            .execute_program(ProgramReq {
+                client_id: self.client.client_id(),
+                pgm: Some(Program { steps }),
+            })
+            .await
     }
 
-    pub async fn query(
-        &self,
-        sql: &str,
-        params: impl Into<pb::query::Params> + Send,
-    ) -> anyhow::Result<pb::ResultRows> {
-        let (write_frame_no, rows) = self.client.query(sql, params.into()).await?;
-
-        tracing::trace!(
-            "statement executed on remote waiting for frame_no: {}",
-            write_frame_no
-        );
-
-        Ok(rows)
-    }
-
-    pub async fn execute_batch(&self, sql: Vec<String>) -> anyhow::Result<()> {
-        self.client.execute_batch(sql).await?;
-        Ok(())
+    pub async fn describe(&self, stmt: impl Into<String>) -> anyhow::Result<DescribeResult> {
+        let stmt = stmt.into();
+        let result = self
+            .client
+            .describe(DescribeRequest {
+                client_id: self.client.client_id(),
+                stmt,
+            })
+            .await;
+        println!("{:#?}", result);
+        result
     }
 }

@@ -1,5 +1,6 @@
+use crate::params::{Params, ValueRef};
 use crate::v1::rows::{MappedRows, Row};
-use crate::v1::{params::Params, Connection, Rows, ValueRef};
+use crate::v1::{Connection, Rows};
 use crate::{errors, Error, Result};
 
 use std::cell::RefCell;
@@ -47,43 +48,6 @@ impl Statement {
         let rows = self.query(params)?;
 
         Ok(MappedRows::new(rows, f))
-    }
-
-    pub(crate) async fn query2(
-        &self,
-        params: Params,
-    ) -> Result<Box<dyn crate::rows::RowsInner + Send + Sync>> {
-        #[cfg(feature = "replication")]
-        {
-            if !self.is_readonly() && self.conn.writer.is_some() {
-                use crate::replication::pb;
-                let params: pb::query::Params = params.into();
-                let rows = self
-                    .conn
-                    .writer
-                    .as_ref()
-                    .unwrap() // Unwrap is safe since we check if there is a writer
-                    .query(&self.sql, params)
-                    .await
-                    .map_err(|e| Error::WriteDelegation(e.into()))?;
-
-                return Ok(Box::new(crate::rows::LibsqlRemoteRows(rows, 0)));
-            }
-        }
-
-        self.bind(&params);
-        let err = self.inner.step();
-
-        let rows = Rows::new2(
-            self.clone(),
-            RefCell::new(Some((
-                err,
-                errors::extended_error_code(self.conn.raw),
-                errors::error_from_handle(self.conn.raw),
-            ))),
-        );
-
-        Ok(Box::new(crate::rows::LibsqlRows(rows)))
     }
 
     pub fn query(&self, params: &Params) -> Result<Rows> {
@@ -142,35 +106,6 @@ impl Statement {
 
     pub fn readonly(&self) -> bool {
         self.inner.readonly()
-    }
-
-    pub async fn execute2(&self, params: Params) -> Result<u64> {
-        #[cfg(feature = "replication")]
-        {
-            if !self.is_readonly() && self.conn.writer.is_some() {
-                use crate::replication::pb;
-                let params: pb::query::Params = params.into();
-                return self
-                    .conn
-                    .writer
-                    .as_ref()
-                    .unwrap() // Unwrap is safe since we check if there is a writer
-                    .execute(&self.sql, params)
-                    .await
-                    .map_err(|e| Error::WriteDelegation(e.into()));
-            }
-        }
-
-        self.bind(&params);
-        let err = self.inner.step();
-        match err as u32 {
-            crate::ffi::SQLITE_DONE => Ok(self.conn.changes()),
-            crate::ffi::SQLITE_ROW => Err(Error::ExecuteReturnedRows),
-            _ => Err(Error::SqliteFailure(
-                errors::extended_error_code(self.conn.raw),
-                errors::error_from_handle(self.conn.raw),
-            )),
-        }
     }
 
     pub fn execute(&self, params: &Params) -> Result<u64> {
