@@ -20,6 +20,7 @@ pub use transaction::Transaction;
 enum DbType {
     Memory,
     File { path: String },
+    Sync { path: String, url: String, token: String },
     Remote { url: String },
 }
 
@@ -42,13 +43,23 @@ impl Database {
         })
     }
 
+    pub fn open_with_sync(db_path: impl Into<String>, url: impl Into<String>, token: impl Into<String>) -> Result<Database> {
+        Ok(Database {
+            db_type: DbType::Sync {
+                path: db_path.into(),
+                url: url.into(),
+                token: token.into(),
+            },
+        })
+    }
+
     pub fn open_remote(url: impl Into<String>) -> Result<Self> {
         Ok(Database {
             db_type: DbType::Remote { url: url.into() },
         })
     }
 
-    pub fn connect(&self) -> Result<Connection> {
+    pub async fn connect(&self) -> Result<Connection> {
         match &self.db_type {
             DbType::Memory => {
                 let db = crate::Database::open(":memory:")?;
@@ -61,6 +72,16 @@ impl Database {
 
             DbType::File { path } => {
                 let db = crate::Database::open(path)?;
+                let conn = db.connect()?;
+
+                let conn = Arc::new(LibsqlConnection { conn });
+
+                Ok(Connection { conn })
+            }
+
+            DbType::Sync { path, url, token } => {
+                let opts = crate::Opts::with_http_sync(url, token);
+                let db = crate::Database::open_with_opts(path, opts).await?;
                 let conn = db.connect()?;
 
                 let conn = Arc::new(LibsqlConnection { conn });
@@ -86,6 +107,8 @@ trait Conn {
     async fn prepare(&self, sql: &str) -> Result<Statement>;
 
     async fn transaction(&self, tx_behavior: TransactionBehavior) -> Result<Transaction>;
+
+    fn last_insert_rowid(&self) -> i64;
 }
 
 #[derive(Clone)]
@@ -126,6 +149,10 @@ impl Connection {
     ) -> Result<Transaction> {
         self.conn.transaction(tx_behavior).await
     }
+
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.conn.last_insert_rowid()
+    }
 }
 
 #[derive(Clone)]
@@ -162,5 +189,9 @@ impl Conn for LibsqlConnection {
                 conn: Arc::new(self.clone()),
             },
         })
+    }
+
+    fn last_insert_rowid(&self) -> i64 {
+        self.conn.last_insert_rowid()
     }
 }

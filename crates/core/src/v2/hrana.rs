@@ -12,7 +12,7 @@ use hyper::StatusCode;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 
 // use crate::client::Config;
-use crate::{Params, Result};
+use crate::{Column, Params, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -288,6 +288,10 @@ impl Conn for Client {
     async fn transaction(&self, _tx_behavior: crate::TransactionBehavior) -> Result<Transaction> {
         todo!()
     }
+
+    fn last_insert_rowid(&self) -> i64 {
+        todo!()
+    }
 }
 
 pub struct Statement {
@@ -330,6 +334,10 @@ impl super::statement::Stmt for Statement {
     fn parameter_name(&self, _idx: i32) -> Option<&str> {
         todo!()
     }
+
+    fn columns(&self) -> Vec<Column> {
+        todo!()
+    }
 }
 
 pub struct Rows {
@@ -350,6 +358,14 @@ impl RowsInner for Rows {
         Ok(Some(super::Row {
             inner: Box::new(row),
         }))
+    }
+
+    fn column_count(&self) -> i32 {
+        self.cols.len() as i32
+    }
+
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        todo!();
     }
 }
 
