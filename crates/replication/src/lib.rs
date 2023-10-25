@@ -137,10 +137,11 @@ impl Replicator {
         Ok(meta)
     }
 
+    // Return the number of frames that will be applied
     pub fn update_metadata_from_snapshot_header(
         &self,
         path: impl AsRef<std::path::Path>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
         // FIXME: I guess we should consider allowing async reads here
         use std::io::Read;
         let path = path.as_ref();
@@ -153,27 +154,31 @@ impl Replicator {
         let mut meta = self.meta.lock();
 
         if let Some(meta) = &*meta {
-            if meta.post_commit_frame_no != snapshot_header.start_frame_no {
-                tracing::warn!(
-                    "Snapshot header frame number {} does not match post-commit frame number {}",
+            let expected_frame_no = meta.post_commit_frame_no + 1;
+
+            if snapshot_header.start_frame_no < expected_frame_no {
+                tracing::trace!("Received snapshot header with old frame number {} but expected frame number {}",
                     snapshot_header.start_frame_no,
-                    meta.post_commit_frame_no
+                    expected_frame_no
+                );
+                return Ok(0);
+            } else if snapshot_header.start_frame_no > expected_frame_no {
+                tracing::warn!(
+                    "Snapshot header frame number {} does not match expected post-commit frame number {}",
+                    snapshot_header.start_frame_no,
+                    meta.post_commit_frame_no + 1
                 );
                 anyhow::bail!(
-                    "Snapshot header frame number {} does not match post-commit frame number {}",
+                    "Snapshot header frame number {} does not match expected post-commit frame number {}",
                     snapshot_header.start_frame_no,
-                    meta.post_commit_frame_no
+                    meta.post_commit_frame_no + 1
                 )
             }
         } else if snapshot_header.start_frame_no != 0 {
-            tracing::warn!(
-                "Cannot initialize metadata from snapshot header with frame number {} instead of 0",
+            tracing::info!(
+                "Initializing metadata from snapshot header with frame number {}. Make sure your snapshots are applied in order",
                 snapshot_header.start_frame_no
             );
-            anyhow::bail!(
-                "Cannot initialize metadata from snapshot header with frame number {} instead of 0",
-                snapshot_header.start_frame_no
-            )
         }
         // Metadata is loaded straight from the snapshot header and overwrites any previous values
         *meta = Some(replica::meta::WalIndexMeta {
@@ -182,7 +187,7 @@ impl Replicator {
             generation_id: 1, // FIXME: where to obtain generation id from? Do we need it?
             database_id: snapshot_header.db_id,
         });
-        Ok(())
+        Ok(snapshot_header.frame_count as usize)
     }
 
     pub fn writer(&self) -> anyhow::Result<Writer> {
@@ -194,17 +199,24 @@ impl Replicator {
         Ok(Writer { client })
     }
 
-    pub fn sync(&self, frames: Frames) -> anyhow::Result<()> {
-        if let Frames::Snapshot(snapshot) = &frames {
-            tracing::debug!(
-                "Updating metadata from snapshot header {}",
-                snapshot.path().display()
-            );
-            self.update_metadata_from_snapshot_header(snapshot.path())?;
+    pub fn sync(&self, frames: Frames) -> anyhow::Result<usize> {
+        let frames_to_apply = match &frames {
+            Frames::Snapshot(snapshot) => {
+                tracing::debug!(
+                    "Updating metadata from snapshot header {}",
+                    snapshot.path().display()
+                );
+                self.update_metadata_from_snapshot_header(snapshot.path())?
+            }
+            Frames::Vec(v) => v.len(),
+        };
+        if frames_to_apply == 0 {
+            tracing::debug!("Skipping snapshot sync - frames already applied");
+            return Ok(0);
         }
         let _ = self.frames_sender.blocking_send(frames);
         self.injector.step()?;
-        Ok(())
+        Ok(frames_to_apply)
     }
 
     // Syncs frames from HTTP, returns how many frames were applied

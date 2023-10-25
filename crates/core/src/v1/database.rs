@@ -1,3 +1,5 @@
+use std::sync::Once;
+
 use crate::v1::connection::Connection;
 use crate::OpenFlags;
 use crate::{Error::ConnectionFailed, Result};
@@ -5,6 +7,7 @@ use crate::{Error::ConnectionFailed, Result};
 use libsql_replication::Replicator;
 #[cfg(feature = "replication")]
 pub use libsql_replication::{Frames, TempSnapshot};
+use libsql_sys::ffi;
 
 #[cfg(feature = "replication")]
 pub struct ReplicationContext {
@@ -87,13 +90,6 @@ impl Database {
                 });
             }
             Sync::Frame => {
-                // NOTICE: the snapshot file used in sync_frames() contains metadata, it will be updated there
-                *replicator.meta.lock() = Some(libsql_replication::replica::meta::WalIndexMeta {
-                    pre_commit_frame_no: 0,
-                    post_commit_frame_no: 0,
-                    generation_id: 0,
-                    database_id: 0,
-                });
                 db.replication_ctx = Some(ReplicationContext {
                     replicator,
                     endpoint: "".to_string(),
@@ -105,6 +101,29 @@ impl Database {
     }
 
     pub fn new(db_path: String, flags: OpenFlags) -> Database {
+        static LIBSQL_INIT: Once = Once::new();
+
+        LIBSQL_INIT.call_once(|| {
+            // Ensure that we are configured with the correct threading model
+            // if this config is not set correctly the entire api is unsafe.
+            unsafe {
+                assert_eq!(
+                    ffi::sqlite3_config(ffi::SQLITE_CONFIG_SERIALIZED as i32),
+                    ffi::SQLITE_OK as i32,
+                    "libsql was configured with an incorrect threading configuration and
+                the api is not safe to use. Please check that no multi-thread options have
+                been set. If nothing was configured then please open an issue at:
+                https://github.com/libsql/libsql"
+                );
+
+                assert_eq!(
+                    ffi::sqlite3_initialize(),
+                    ffi::SQLITE_OK as i32,
+                    "libsql failed to initialize"
+                );
+            }
+        });
+
         Database {
             db_path,
             flags,
@@ -164,7 +183,7 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
-    pub fn sync_frames(&self, frames: Frames) -> Result<()> {
+    pub fn sync_frames(&self, frames: Frames) -> Result<usize> {
         if let Some(ctx) = self.replication_ctx.as_ref() {
             ctx.replicator
                 .sync(frames)
