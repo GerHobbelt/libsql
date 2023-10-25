@@ -2,6 +2,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
+use ::libsql as libsql_core;
+
 fn to_py_err(error: libsql_core::errors::Error) -> PyErr {
     PyValueError::new_err(format!("{}", error))
 }
