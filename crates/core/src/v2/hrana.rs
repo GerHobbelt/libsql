@@ -14,6 +14,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 // use crate::client::Config;
 use crate::{Column, Params, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::rows::{RowInner, RowsInner};
@@ -35,6 +36,7 @@ pub struct Client {
     cookies: Arc<RwLock<HashMap<u64, Cookie>>>,
     url_for_queries: String,
     auth: String,
+    last_insert_rowid: Arc<AtomicI64>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +104,8 @@ impl Client {
 
         let token = token.into();
         let url = url.into();
+        // The `libsql://` protocol is an alias for `https://`.
+        let url = url.replace("libsql://", "https://");
         // Auto-update the URL to start with https:// if no protocol was specified
         let base_url = if !url.contains("://") {
             format!("https://{}", &url)
@@ -114,6 +118,7 @@ impl Client {
             cookies: Arc::new(RwLock::new(HashMap::new())),
             url_for_queries,
             auth: format!("Bearer {token}"),
+            last_insert_rowid: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -290,7 +295,7 @@ impl Conn for Client {
     }
 
     fn last_insert_rowid(&self) -> i64 {
-        todo!()
+        self.last_insert_rowid.load(Ordering::SeqCst)
     }
 }
 
@@ -306,6 +311,9 @@ impl super::statement::Stmt for Statement {
         bind_params(params.clone(), &mut stmt);
 
         let v = self.client.execute_inner(stmt, 0).await?;
+        if let Some(last_insert_rowid) = v.last_insert_rowid {
+            self.client.last_insert_rowid.store(last_insert_rowid, Ordering::SeqCst);
+        }
         Ok(v.affected_row_count as usize)
     }
 
@@ -324,7 +332,6 @@ impl super::statement::Stmt for Statement {
     }
 
     fn reset(&self) {
-        todo!()
     }
 
     fn parameter_count(&self) -> usize {
@@ -365,7 +372,11 @@ impl RowsInner for Rows {
     }
 
     fn column_name(&self, idx: i32) -> Option<&str> {
-        todo!();
+        self.cols
+            .get(idx as usize)
+            .map(|c| c.name.as_ref())
+            .flatten()
+            .map(|s| s.as_str())
     }
 }
 
