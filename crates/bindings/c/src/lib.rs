@@ -1,3 +1,4 @@
+#![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
 mod errors;
@@ -18,7 +19,7 @@ pub unsafe extern "C" fn libsql_open_ext(url: *const std::ffi::c_char) -> libsql
             return libsql_database_t::null();
         }
     };
-    let db = libsql::Database::open(url);
+    let db = libsql_core::Database::open(url.to_string());
     let db = Box::leak(Box::new(libsql_database { db }));
     libsql_database_t::from(db)
 }
@@ -34,7 +35,14 @@ pub unsafe extern "C" fn libsql_close(db: libsql_database_t) {
 
 #[no_mangle]
 pub unsafe extern "C" fn libsql_connect(db: libsql_database_t) -> libsql_connection_t {
-    let conn = libsql::Connection {};
+    let db = db.get_ref();
+    let conn = match db.connect() {
+        Ok(conn) => conn,
+        Err(err) => {
+            println!("error: {}", err);
+            return libsql_connection_t::null();
+        }
+    };
     let conn = Box::leak(Box::new(libsql_connection { conn }));
     libsql_connection_t::from(conn)
 }
@@ -50,23 +58,35 @@ pub unsafe extern "C" fn libsql_disconnect(conn: libsql_connection_t) {
 
 #[no_mangle]
 pub unsafe extern "C" fn libsql_execute(
-    _conn: libsql_connection_t,
-    _sql: *const std::ffi::c_char,
+    conn: libsql_connection_t,
+    sql: *const std::ffi::c_char,
 ) -> libsql_result_t {
-    let result = libsql::Result {};
+    let sql = unsafe { std::ffi::CStr::from_ptr(sql) };
+    let sql = match sql.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            todo!("bad string");
+        }
+    };
+    let conn = conn.get_ref();
+    let result = conn.execute(sql.to_string());
     let result = Box::leak(Box::new(libsql_result { result }));
     libsql_result_t::from(result)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libsql_wait_result(_res: libsql_result_t) {}
+pub unsafe extern "C" fn libsql_wait_result(res: libsql_result_t) {
+    let res = res.get_ref_mut();
+    res.wait().unwrap();
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn libsql_free_result(res: libsql_result_t) {
     if res.is_null() {
         return;
     }
-    let _ = unsafe { Box::from_raw(res.get_ref_mut()) };
+    let mut res = unsafe { Box::from_raw(res.get_ref_mut()) };
+    res.wait().unwrap();
 }
 
 #[no_mangle]
