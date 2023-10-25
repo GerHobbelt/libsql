@@ -1,4 +1,8 @@
+use std::ffi::c_char;
+
 use libsql_sys::ValueType;
+
+use crate::{Error, Result};
 
 pub enum Params {
     None,
@@ -24,6 +28,37 @@ macro_rules! named_params {
     ($($param_name:literal: $value:expr),* $(,)?) => {
         $crate::Params::Named(vec![$(($param_name.to_string(), $crate::params::Value::from($value))),*])
     };
+}
+
+/// Convert an owned iterator into Params.
+///
+/// # Example
+///
+/// ```rust
+/// # use libsql::{Connection, params_from_iter, Rows};
+/// # fn run(conn: &Connection) -> libsql::Result<Option<Rows>> {
+///
+/// let iter = vec![1, 2, 3];
+///
+/// conn.query(
+///     "SELECT * FROM users WHERE id IN (?1, ?2, ?3)",
+///     params_from_iter(iter)?
+/// )
+/// # }
+/// ```
+pub fn params_from_iter<I>(iter: I) -> Result<Params>
+where
+    I: IntoIterator,
+    I::Item: TryInto<Value>,
+    <I::Item as TryInto<Value>>::Error: Into<crate::BoxError>,
+{
+    let vec = iter
+        .into_iter()
+        .map(|i| i.try_into())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::ToSqlConversionFailure(e.into()))?;
+
+    Ok(Params::Positional(vec))
 }
 
 impl From<()> for Params {
@@ -81,7 +116,7 @@ impl From<libsql_sys::Value> for Value {
                 if v.is_null() {
                     Value::Null
                 } else {
-                    let v = unsafe { std::ffi::CStr::from_ptr(v as *const i8) };
+                    let v = unsafe { std::ffi::CStr::from_ptr(v as *const c_char) };
                     let v = v.to_str().unwrap();
                     Value::Text(v.to_owned())
                 }
@@ -183,7 +218,7 @@ impl<'a> From<libsql_sys::Value> for ValueRef<'a> {
                 if v.is_null() {
                     ValueRef::Null
                 } else {
-                    let v = unsafe { std::ffi::CStr::from_ptr(v as *const i8) };
+                    let v = unsafe { std::ffi::CStr::from_ptr(v as *const c_char) };
                     ValueRef::Text(v.to_bytes())
                 }
             }

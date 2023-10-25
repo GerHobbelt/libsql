@@ -1,20 +1,20 @@
-use crate::{errors, Connection, Error, Params, Result, Value};
+use crate::{errors, Connection, Statement, Error, Params, Result, Value};
 use libsql_sys::ValueType;
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::ffi::c_char;
 
 /// Query result rows.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Rows {
-    pub(crate) stmt: Arc<libsql_sys::Statement>,
+    pub(crate) stmt: Statement,
     pub(crate) err: RefCell<Option<i32>>,
 }
 
 unsafe impl Send for Rows {} // TODO: is this safe?
 
 impl Rows {
-    pub fn new(stmt: Arc<libsql_sys::Statement>) -> Rows {
+    pub fn new(stmt: Statement) -> Rows {
         Rows {
             stmt,
             err: RefCell::new(None),
@@ -24,7 +24,7 @@ impl Rows {
     pub fn next(&self) -> Result<Option<Row>> {
         let err = match self.err.take() {
             Some(err) => err,
-            None => self.stmt.step(),
+            None => self.stmt.inner.step(),
         };
         match err as u32 {
             libsql_sys::ffi::SQLITE_OK => Ok(None),
@@ -37,15 +37,19 @@ impl Rows {
     }
 
     pub fn column_count(&self) -> i32 {
-        self.stmt.column_count()
+        self.stmt.inner.column_count()
     }
 
     pub fn column_name(&self, idx: i32) -> &str {
-        self.stmt.column_name(idx)
+        self.stmt.inner.column_name(idx)
     }
 
     pub fn column_type(&self, idx: i32) -> i32 {
-        self.stmt.column_type(idx)
+        self.stmt.inner.column_type(idx)
+    }
+
+    pub fn as_ref(&self) -> &Statement {
+        &self.stmt
     }
 }
 
@@ -75,7 +79,13 @@ impl futures::Future for RowsFuture {
 }
 
 pub struct Row {
-    pub(crate) stmt: Arc<libsql_sys::Statement>,
+    pub(crate) stmt: Statement,
+}
+
+impl AsRef<Statement> for Row {
+    fn as_ref(&self) -> &Statement {
+        &self.stmt
+    }
 }
 
 impl Row {
@@ -83,17 +93,17 @@ impl Row {
     where
         T: FromValue,
     {
-        let val = self.stmt.column_value(idx);
+        let val = self.stmt.inner.column_value(idx);
         T::from_sql(val)
     }
 
     pub fn get_value(&self, idx: i32) -> Result<Value> {
-        let val = self.stmt.column_value(idx);
+        let val = self.stmt.inner.column_value(idx);
         Ok(val.into())
     }
 
     pub fn column_type(&self, idx: i32) -> Result<ValueType> {
-        let val = self.stmt.column_type(idx);
+        let val = self.stmt.inner.column_type(idx);
         match val as u32 {
             libsql_sys::ffi::SQLITE_INTEGER => Ok(ValueType::Integer),
             libsql_sys::ffi::SQLITE_FLOAT => Ok(ValueType::Real),
@@ -105,11 +115,11 @@ impl Row {
     }
 
     pub fn column_name(&self, idx: i32) -> &str {
-        self.stmt.column_name(idx)
+        self.stmt.inner.column_name(idx)
     }
 
     pub fn get_ref(&self, idx: i32) -> Result<crate::params::ValueRef<'_>> {
-        Ok(crate::Statement::value_ref(&self.stmt, idx as usize))
+        Ok(crate::Statement::value_ref(&self.stmt.inner, idx as usize))
     }
 }
 
@@ -171,7 +181,7 @@ impl FromValue for String {
         if ret.is_null() {
             return Err(Error::NullValue);
         }
-        let ret = unsafe { std::ffi::CStr::from_ptr(ret as *const i8) };
+        let ret = unsafe { std::ffi::CStr::from_ptr(ret as *const c_char) };
         let ret = ret.to_str().unwrap();
         Ok(ret.to_string())
     }
@@ -194,7 +204,7 @@ impl FromValue for &str {
         if ret.is_null() {
             return Err(Error::NullValue);
         }
-        let ret = unsafe { std::ffi::CStr::from_ptr(ret as *const i8) };
+        let ret = unsafe { std::ffi::CStr::from_ptr(ret as *const c_char) };
         let ret = ret.to_str().unwrap();
         Ok(ret)
     }

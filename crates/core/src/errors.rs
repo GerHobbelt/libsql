@@ -2,8 +2,8 @@
 pub enum Error {
     #[error("Failed to connect to database: `{0}`")]
     ConnectionFailed(String),
-    #[error("Failed to prepare statement `{0}`: `{1}`")]
-    PrepareFailed(String, String),
+    #[error("Failed to prepare statement `{1}`: `{2}`")]
+    PrepareFailed(i32, String, String),
     #[error("Failed to fetch row: `{0}`")]
     FetchRowFailed(String),
     #[error("Unknown value type for column `{0}`: `{1}`")]
@@ -20,6 +20,8 @@ pub enum Error {
     QueryReturnedNoRows,
     #[error("Execute returned rows")]
     ExecuteReturnedRows,
+    #[error("unable to convert to sql: `{0}`")]
+    ToSqlConversionFailure(crate::BoxError),
 }
 
 pub(crate) fn error_from_handle(raw: *mut libsql_sys::ffi::sqlite3) -> String {

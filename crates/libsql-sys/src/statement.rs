@@ -50,9 +50,9 @@ impl Statement {
             crate::ffi::sqlite3_bind_text(
                 self.raw_stmt,
                 idx,
-                value.as_ptr() as *const i8,
+                value.as_ptr() as *const c_char,
                 value.len() as i32,
-                None,
+                SQLITE_TRANSIENT(),
             );
         }
     }
@@ -64,7 +64,7 @@ impl Statement {
                 idx,
                 value.as_ptr() as *const std::ffi::c_void,
                 value.len() as i32,
-                None,
+                SQLITE_TRANSIENT(),
             );
         }
     }
@@ -92,7 +92,7 @@ impl Statement {
 
     pub fn column_name(&self, idx: i32) -> &str {
         let raw_name = unsafe { crate::ffi::sqlite3_column_name(self.raw_stmt, idx) };
-        let raw_name = unsafe { std::ffi::CStr::from_ptr(raw_name as *const i8) };
+        let raw_name = unsafe { std::ffi::CStr::from_ptr(raw_name as *const c_char) };
         let raw_name = raw_name.to_str().unwrap();
         raw_name
     }
@@ -144,7 +144,7 @@ pub unsafe fn prepare_stmt(raw: *mut crate::ffi::sqlite3, sql: &str) -> Result<S
     let err = unsafe {
         crate::ffi::sqlite3_prepare_v2(
             raw,
-            sql.as_ptr() as *const i8,
+            sql.as_ptr() as *const c_char,
             sql.len() as i32,
             &mut raw_stmt,
             &mut c_tail,
@@ -197,4 +197,10 @@ fn len_as_c_int(len: usize) -> Result<c_int> {
     } else {
         Ok(len as c_int)
     }
+}
+
+#[must_use]
+#[allow(non_snake_case)]
+pub fn SQLITE_TRANSIENT() -> crate::ffi::sqlite3_destructor_type {
+    Some(unsafe { std::mem::transmute(-1_isize) })
 }

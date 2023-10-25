@@ -6,9 +6,10 @@ use std::ffi::c_int;
 use std::sync::Arc;
 
 /// A prepared statement.
+#[derive(Debug, Clone)]
 pub struct Statement {
     conn: Connection,
-    inner: Arc<libsql_sys::Statement>,
+    pub(crate) inner: Arc<libsql_sys::Statement>,
 }
 
 impl Statement {
@@ -22,7 +23,8 @@ impl Statement {
                 conn,
                 inner: Arc::new(stmt),
             }),
-            Err(libsql_sys::Error::LibError(_err)) => Err(Error::PrepareFailed(
+            Err(libsql_sys::Error::LibError(err)) => Err(Error::PrepareFailed(
+                err,
                 sql.to_string(),
                 errors::error_from_handle(raw),
             )),
@@ -45,7 +47,7 @@ impl Statement {
         self.bind(params);
         let err = self.inner.step();
         Ok(Rows {
-            stmt: self.inner.clone(),
+            stmt: self.clone(),
             err: RefCell::new(Some(err)),
         })
     }
@@ -101,7 +103,10 @@ impl Statement {
         match err as u32 {
             crate::ffi::SQLITE_DONE => Ok(self.conn.changes()),
             crate::ffi::SQLITE_ROW => Err(Error::ExecuteReturnedRows),
-            _ => Err(Error::LibError(err, errors::error_from_handle(self.conn.raw))),
+            _ => Err(Error::LibError(
+                err,
+                errors::error_from_handle(self.conn.raw),
+            )),
         }
     }
 
