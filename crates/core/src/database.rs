@@ -1,42 +1,87 @@
-use crate::{connection::Connection, Result};
+use crate::{connection::Connection, errors::Error::ConnectionFailed, Result};
 #[cfg(feature = "replication")]
 use libsql_replication::Replicator;
 #[cfg(feature = "replication")]
-pub use libsql_replication::{Frames, TempSnapshot};
+pub use libsql_replication::{rpc, Client, Frames, TempSnapshot};
+
+#[cfg(feature = "replication")]
+pub struct ReplicationContext {
+    pub replicator: Replicator,
+    pub client: Option<Client>,
+}
+
+#[cfg(feature = "replication")]
+pub(crate) enum Sync {
+    Frame,
+    Rpc { url: String },
+}
+
+#[cfg(feature = "replication")]
+pub struct Opts {
+    pub(crate) sync: Sync,
+}
+
+#[cfg(feature = "replication")]
+impl Opts {
+    pub fn with_sync() -> Opts {
+        Opts { sync: Sync::Frame }
+    }
+
+    pub fn with_rpc_sync(url: impl Into<String>) -> Opts {
+        Opts {
+            sync: Sync::Rpc { url: url.into() },
+        }
+    }
+}
 
 // A libSQL database.
 pub struct Database {
-    pub url: String,
+    pub db_path: String,
     #[cfg(feature = "replication")]
-    pub replicator: Option<Replicator>,
+    pub replication_ctx: Option<ReplicationContext>,
 }
 
 impl Database {
-    pub fn open<S: Into<String>>(url: S) -> Database {
-        let url = url.into();
-        if url.starts_with("libsql:") {
-            let url = url.replace("libsql:", "http:");
-            tracing::info!("Absolutely ignoring libsql URL: {url}");
-            let filename = "data.libsql/data".to_string();
-            Database::new(filename)
+    /// Open a local database file.
+    pub fn open<S: Into<String>>(db_path: S) -> Result<Database> {
+        let db_path = db_path.into();
+        if db_path.starts_with("libsql:") || db_path.starts_with("http:") {
+            Err(ConnectionFailed(format!(
+                "Unable to open remote database {db_path} with Database::open()"
+            )))
         } else {
-            Database::new(url)
-        }
-    }
-
-    pub fn new(url: String) -> Database {
-        Database {
-            url,
-            #[cfg(feature = "replication")]
-            replicator: None,
+            Ok(Database::new(db_path))
         }
     }
 
     #[cfg(feature = "replication")]
-    pub fn with_replicator(url: impl Into<String>) -> Database {
-        let url = url.into();
-        let replicator = Some(Replicator::new(&url).unwrap());
-        Database { url, replicator }
+    pub async fn open_with_opts(db_path: impl Into<String>, opts: Opts) -> Result<Database> {
+        let db_path = db_path.into();
+        let mut db = Database::open(&db_path)?;
+        let replicator = Replicator::new(db_path).map_err(|e| ConnectionFailed(format!("{e}")))?;
+        let client = match opts.sync {
+            Sync::Rpc { url } => {
+                let (client, meta) = Replicator::connect_to_rpc(
+                    rpc::Endpoint::from_shared(url.clone())
+                        .map_err(|e| ConnectionFailed(format!("{e}")))?,
+                )
+                .await
+                .map_err(|e| ConnectionFailed(format!("{e}")))?;
+                *replicator.meta.lock() = Some(meta);
+                Some(client)
+            }
+            Sync::Frame => None,
+        };
+        db.replication_ctx = Some(ReplicationContext { replicator, client });
+        Ok(db)
+    }
+
+    pub fn new(db_path: String) -> Database {
+        Database {
+            db_path,
+            #[cfg(feature = "replication")]
+            replication_ctx: None,
+        }
     }
 
     pub fn close(&self) {}
@@ -46,11 +91,29 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
-    pub fn sync(&mut self, frames: Frames) -> Result<()> {
-        if let Some(replicator) = &mut self.replicator {
-            replicator
+    pub fn sync(&mut self) -> Result<()> {
+        if let Some(ctx) = &mut self.replication_ctx {
+            if let Some(client) = &mut ctx.client {
+                ctx.replicator
+                    .sync_from_rpc(client)
+                    .map_err(|e| ConnectionFailed(format!("{e}")))
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(crate::errors::Error::Misuse(
+                "No replicator available. Use Database::with_replicator() to enable replication"
+                    .to_string(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "replication")]
+    pub fn sync_frames(&mut self, frames: Frames) -> Result<()> {
+        if let Some(ctx) = &mut self.replication_ctx {
+            ctx.replicator
                 .sync(frames)
-                .map_err(|e| crate::errors::Error::ConnectionFailed(format!("{e}")))
+                .map_err(|e| ConnectionFailed(format!("{e}")))
         } else {
             Err(crate::errors::Error::Misuse(
                 "No replicator available. Use Database::with_replicator() to enable replication"

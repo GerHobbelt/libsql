@@ -1,10 +1,12 @@
 use libsql::Database;
 use libsql_replication::{Frames, TempSnapshot};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt::init();
 
-    let mut db = Database::with_replicator("test.db");
+    let opts = libsql::Opts::with_sync();
+    let mut db = Database::open_with_opts("test.db", opts).await.unwrap();
     let conn = db.connect().unwrap();
 
     let args = std::env::args().collect::<Vec<String>>();
@@ -15,7 +17,7 @@ fn main() {
     let snapshot_path = args.get(1).unwrap();
     let snapshot = TempSnapshot::from_snapshot_file(snapshot_path.as_ref()).unwrap();
 
-    db.sync(Frames::Snapshot(snapshot)).unwrap();
+    db.sync_frames(Frames::Snapshot(snapshot)).unwrap();
 
     let rows = conn
         .execute("SELECT * FROM sqlite_master", ())
