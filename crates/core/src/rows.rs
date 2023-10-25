@@ -85,7 +85,7 @@ impl Row {
         let val = self.stmt.column_type(idx);
         match val as u32 {
             libsql_sys::ffi::SQLITE_INTEGER => Ok(ValueType::Integer),
-            libsql_sys::ffi::SQLITE_FLOAT => Ok(ValueType::Float),
+            libsql_sys::ffi::SQLITE_FLOAT => Ok(ValueType::Real),
             libsql_sys::ffi::SQLITE_BLOB => Ok(ValueType::Blob),
             libsql_sys::ffi::SQLITE_TEXT => Ok(ValueType::Text),
             libsql_sys::ffi::SQLITE_NULL => Ok(ValueType::Null),
@@ -107,6 +107,54 @@ pub trait FromValue {
 impl FromValue for i32 {
     fn from_sql(val: libsql_sys::Value) -> Result<Self> {
         let ret = val.int();
+        Ok(ret)
+    }
+}
+
+impl FromValue for i64 {
+    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
+        let ret = val.int64();
+        Ok(ret)
+    }
+}
+
+impl FromValue for f64 {
+    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
+        let ret = val.double();
+        Ok(ret)
+    }
+}
+
+impl FromValue for Vec<u8> {
+    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
+        let ret = val.blob();
+        if ret.is_null() {
+            return Err(Error::NullValue);
+        }
+        let ret = unsafe { std::slice::from_raw_parts(ret as *const u8, val.bytes() as usize) };
+        Ok(ret.to_vec())
+    }
+}
+
+impl FromValue for String {
+    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
+        let ret = val.text();
+        if ret.is_null() {
+            return Err(Error::NullValue);
+        }
+        let ret = unsafe { std::ffi::CStr::from_ptr(ret as *const i8) };
+        let ret = ret.to_str().unwrap();
+        Ok(ret.to_string())
+    }
+}
+
+impl FromValue for &[u8] {
+    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
+        let ret = val.blob();
+        if ret.is_null() {
+            return Err(Error::NullValue);
+        }
+        let ret = unsafe { std::slice::from_raw_parts(ret as *const u8, val.bytes() as usize) };
         Ok(ret)
     }
 }
