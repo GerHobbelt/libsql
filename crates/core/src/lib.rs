@@ -1,6 +1,6 @@
-//! # LibSQL API for Rust
+//! # libSQL API for Rust
 //!
-//! LibSQL is an embeddable SQL database engine based on SQLite.
+//! libSQL is an embeddable SQL database engine based on SQLite.
 //! This Rust API is a batteries-included wrapper around the SQLite C API to support transparent replication while retaining compatibility with the SQLite ecosystem, such as the SQL dialect and extensions. If you are building an application in Rust, this is the crate you should use.
 //! There are also libSQL language bindings of this Rust crate to other languages such as [JavaScript](), Python, Go, and C.
 //!
@@ -22,28 +22,16 @@
 //! Embedded replica is libSQL database that's running in your application process, which keeps a local copy of a remote database.
 //! They are useful if you want to move data in the memory space of your application for fast access.
 //!
-//! You can open an embedded read-only replica by instantiating a [`Replicator`] and setting it up to replicate a remote database:
+//! You can open an embedded read-only replica by using the [`Database::with_replicator`] constructor:
 //!
 //! ```rust,no_run
 //! use libsql_core::Database;
-//! use libsql_replication::{Context, Frame, Frames, Replicator};
+//! use libsql_replication::{Frame, Frames, Replicator};
 //!
-//! let db = Database::open("/tmp/test.db");
-//! let Context {
-//!     mut hook_ctx,
-//!     frames_sender,
-//!     current_frame_no_notifier,
-//!     meta: _,
-//! } = Replicator::create_context("data.libsql").unwrap();
+//! let mut db = Database::with_replicator("/tmp/test.db");
 //!
-//! let mut replicator = libsql_replication::Replicator::new(
-//!     "data.libsql",
-//!     &mut hook_ctx,
-//!     frames_sender,
-//!     current_frame_no_notifier,
-//! ).unwrap();
 //! let frames: Frames = Frames::Vec(vec![]);
-//! replicator.sync(frames).unwrap();
+//! db.sync(frames).unwrap();
 //! let conn = db.connect().unwrap();
 //! conn.execute("SELECT * FROM users", ()).unwrap();
 //! ```
