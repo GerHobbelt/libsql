@@ -5,7 +5,9 @@ use std::sync::Arc;
 use libsql_sys::ValueType;
 use parking_lot::Mutex;
 
-use crate::replication::pb::{execute_results::State as RemoteState, query_result::RowResult, describe_result, DescribeResult};
+use crate::replication::pb::{
+    describe_result, execute_results::State as RemoteState, query_result::RowResult, DescribeResult,
+};
 use crate::rows::{RowInner, RowsInner};
 use crate::statement::Stmt;
 use crate::transaction::Tx;
@@ -44,7 +46,6 @@ impl RemoteConnection {
     }
 
     fn is_state_init(&self) -> bool {
-        println!("State is {:?}", self.state.lock());
         matches!(self.state.lock().remote_state, RemoteState::Init)
     }
 
@@ -127,15 +128,17 @@ impl Conn for RemoteConnection {
         let res = self.execute_program(stmts, params).await?;
 
         let result = res
-            .results.first()
+            .results
+            .into_iter()
+            .next()
             .expect("Expected atleast one result");
 
-        let affected_row_count = match &result.row_result {
+        let affected_row_count = match result.row_result {
             Some(RowResult::Row(row)) => {
-                self.update_state(row);
+                self.update_state(&row);
                 row.affected_row_count
             }
-            Some(RowResult::Error(e)) => todo!("error: {:?}", e),
+            Some(RowResult::Error(e)) => return Err(Error::RemoteSqliteFailure(e.code, e.message)),
             None => panic!("unexpected empty result row"),
         };
 
@@ -156,9 +159,11 @@ impl Conn for RemoteConnection {
         let res = self.execute_program(stmts, Params::None).await?;
 
         for result in res.results {
-            match &result.row_result {
-                Some(RowResult::Row(row)) => self.update_state(row),
-                Some(RowResult::Error(e)) => todo!("error: {:?}", e),
+            match result.row_result {
+                Some(RowResult::Row(row)) => self.update_state(&row),
+                Some(RowResult::Error(e)) => {
+                    return Err(Error::RemoteSqliteFailure(e.code, e.message))
+                }
                 None => panic!("unexpected empty result row"),
             };
         }
@@ -272,33 +277,37 @@ impl RemoteStatement {
             conn,
             stmts,
             local_statement: None,
-            metas
+            metas,
         })
-
     }
 }
 
 async fn fetch_meta(conn: &RemoteConnection, stmt: &parser::Statement) -> Result<StatementMeta> {
     tracing::trace!("Fetching metadata of statement {}", stmt.stmt);
-    match conn
-        .describe(&stmt.stmt)
-        .await? {
-            DescribeResult{ describe_result: Some(describe_result::DescribeResult::Description(d)) } => {
-                Ok(StatementMeta {
-                    columns: d.column_descriptions.into_iter().map(|c| c.into()).collect(),
-                    param_names: d.param_names.into_iter().collect(),
-                    param_count: d.param_count,
-                })
-            },
-            DescribeResult{ describe_result: Some(describe_result::DescribeResult::Error(e))} => {
-                Err(Error::SqliteFailure(e.code, e.message))
-            },
-            _ => Err(Error::Misuse("unexpected describe result".into()))
-        }
+    match conn.describe(&stmt.stmt).await? {
+        DescribeResult {
+            describe_result: Some(describe_result::DescribeResult::Description(d)),
+        } => Ok(StatementMeta {
+            columns: d
+                .column_descriptions
+                .into_iter()
+                .map(|c| c.into())
+                .collect(),
+            param_names: d.param_names.into_iter().collect(),
+            param_count: d.param_count,
+        }),
+        DescribeResult {
+            describe_result: Some(describe_result::DescribeResult::Error(e)),
+        } => Err(Error::SqliteFailure(e.code, e.message)),
+        _ => Err(Error::Misuse("unexpected describe result".into())),
+    }
 }
 
 // FIXME(sarna): do we ever want to fetch metadata about multiple statements at one go?
-async fn fetch_metas(conn: &RemoteConnection, stmts: &[parser::Statement]) -> Result<Vec<StatementMeta>> {
+async fn fetch_metas(
+    conn: &RemoteConnection,
+    stmts: &[parser::Statement],
+) -> Result<Vec<StatementMeta>> {
     let mut metas = vec![];
     for stmt in stmts {
         let meta = fetch_meta(conn, stmt).await?;
@@ -322,15 +331,17 @@ impl Stmt for RemoteStatement {
             .await?;
 
         let result = res
-            .results.first()
+            .results
+            .into_iter()
+            .next()
             .expect("Expected atleast one result");
 
-        let affected_row_count = match &result.row_result {
+        let affected_row_count = match result.row_result {
             Some(RowResult::Row(row)) => {
-                self.conn.update_state(row);
+                self.conn.update_state(&row);
                 row.affected_row_count
             }
-            Some(RowResult::Error(e)) => todo!("error: {:?}", e),
+            Some(RowResult::Error(e)) => return Err(Error::RemoteSqliteFailure(e.code, e.message)),
             None => panic!("unexpected empty result row"),
         };
 
@@ -358,7 +369,7 @@ impl Stmt for RemoteStatement {
                 self.conn.update_state(&row);
                 row
             }
-            Some(RowResult::Error(e)) => todo!("error: {:?}", e),
+            Some(RowResult::Error(e)) => return Err(Error::RemoteSqliteFailure(e.code, e.message)),
             None => panic!("unexpected empty result row"),
         };
 
@@ -388,13 +399,17 @@ impl Stmt for RemoteStatement {
     fn columns(&self) -> Vec<Column> {
         // FIXME: we need to decide if we keep RemoteStatement as a single statement, or else how to handle this
         match self.metas.first() {
-            Some(meta) => meta.columns.iter().map(|c| Column {
-                name: &c.name,
-                origin_name: c.origin_name.as_deref(),
-                database_name: c.database_name.as_deref(),
-                table_name: c.table_name.as_deref(),
-                decl_type: c.decl_type.as_deref()
-            }).collect()             ,
+            Some(meta) => meta
+                .columns
+                .iter()
+                .map(|c| Column {
+                    name: &c.name,
+                    origin_name: c.origin_name.as_deref(),
+                    database_name: c.database_name.as_deref(),
+                    table_name: c.table_name.as_deref(),
+                    decl_type: c.decl_type.as_deref(),
+                })
+                .collect(),
             None => vec![],
         }
     }
@@ -441,7 +456,8 @@ impl RowsInner for RemoteRows {
 
     fn column_type(&self, idx: i32) -> Result<ValueType> {
         let col = self.0.column_descriptions.get(idx as usize).unwrap();
-        col.decltype.as_deref()
+        col.decltype
+            .as_deref()
             .and_then(ValueType::from_str)
             .ok_or(Error::InvalidColumnType)
     }
@@ -472,7 +488,8 @@ impl RowInner for RemoteRow {
 
     fn column_type(&self, idx: i32) -> Result<ValueType> {
         let col = self.1.get(idx as usize).unwrap();
-        col.decltype.as_deref()
+        col.decltype
+            .as_deref()
             .and_then(ValueType::from_str)
             .ok_or(Error::InvalidColumnType)
     }
