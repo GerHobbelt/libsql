@@ -9,12 +9,14 @@
 //! To get started, you first need to create a [`Database`] object and then open a [`Connection`] to it, which you use to query:
 //!
 //! ```rust,no_run
+//! # async fn run() {
 //! use libsql::Database;
 //!
-//! let db = Database::open(":memory:").unwrap();
-//! let conn = db.connect().unwrap();
-//! conn.execute("CREATE TABLE IF NOT EXISTS users (email TEXT)", ()) .unwrap();
-//! conn.execute("INSERT INTO users (email) VALUES ('alice@example.org')", ()).unwrap();
+//! let db = Database::open_in_memory().unwrap();
+//! let conn = db.connect().await.unwrap();
+//! conn.execute("CREATE TABLE IF NOT EXISTS users (email TEXT)", ()).await.unwrap();
+//! conn.execute("INSERT INTO users (email) VALUES ('alice@example.org')", ()).await.unwrap();
+//! # }
 //! ```
 //!
 //! ## Embedded Replicas
@@ -29,12 +31,12 @@
 //! use libsql::{Database, Opts};
 //! use libsql_replication::{Frame, Frames, Replicator};
 //!
-//! let mut db = Database::open_with_opts("/tmp/test.db", Opts::with_sync()).await.unwrap();
+//! let mut db = Database::open_with_sync("/tmp/test.db", "http://localhost:8080", "").await.unwrap();
 //!
 //! let frames = Frames::Vec(vec![]);
 //! db.sync_frames(frames).unwrap();
-//! let conn = db.connect().unwrap();
-//! conn.execute("SELECT * FROM users", ()).unwrap();
+//! let conn = db.connect().await.unwrap();
+//! conn.execute("SELECT * FROM users", ()).await.unwrap();
 //! # }
 //! ```
 //!
@@ -42,44 +44,30 @@
 //!
 //! You can find more examples in the [`examples`](https://github.com/penberg/libsql-experimental/tree/libsql-api/crates/core/examples) directory.
 
-pub mod connection;
-pub mod database;
-pub mod errors;
-pub mod params;
-pub mod rows;
-pub mod statement;
-pub mod transaction;
-pub mod v2;
+// Legacy mode, for compatibility with the old libsql API, it is doc hidden so
+// that new users do not use this api as its deprecated in favor of the v2 api.
+mod v1;
+mod v2;
 
-pub type Result<T> = std::result::Result<T, errors::Error>;
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub use v1::{
+    database::Opts,
+    errors,
+    errors::Error,
+    params,
+    params::{params_from_iter, Params, Value, ValueRef},
+    version, version_number, Result, RowsFuture,
+};
+
+pub use v2::{
+    hrana, rows,
+    rows::{Row, Rows},
+    statement,
+    statement::{Column, Statement},
+    transaction,
+    transaction::{Transaction, TransactionBehavior},
+    Connection, Database,
+};
 
 pub use libsql_sys::ffi;
-pub use libsql_sys::ValueType;
 
-pub use connection::Connection;
-pub use database::Database;
-#[cfg(feature = "replication")]
-pub use database::Opts;
-pub use errors::Error;
-pub use params::Params;
-pub use params::{params_from_iter, Value, ValueRef};
-pub use rows::Row;
-pub use rows::Rows;
-pub use rows::RowsFuture;
-pub use statement::{Column, Statement};
-pub use transaction::{Transaction, TransactionBehavior};
-
-/// Return the version of the underlying SQLite library as a number.
-pub fn version_number() -> i32 {
-    unsafe { ffi::sqlite3_libversion_number() }
-}
-
-/// Return the version of the underlying SQLite library as a string.
-pub fn version() -> &'static str {
-    unsafe {
-        std::ffi::CStr::from_ptr(ffi::sqlite3_libversion())
-            .to_str()
-            .unwrap()
-    }
-}
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
