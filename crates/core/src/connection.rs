@@ -1,9 +1,10 @@
-use crate::{errors::Error, Database, Result};
+use crate::{Database, Error, Result, RowsFuture, Statement};
 
 use std::ffi::c_int;
 
+/// A connection to a libSQL database.
 pub struct Connection {
-    raw: *mut libsql_sys::sqlite3,
+    pub(crate) raw: *mut libsql_sys::sqlite3,
 }
 
 unsafe impl Send for Connection {} // TODO: is this safe?
@@ -37,66 +38,26 @@ impl Connection {
         }
     }
 
-    pub fn execute<S: Into<String>>(&self, sql: S) -> Result<ResultSet> {
-        let rs = ResultSet {
-            raw: self.raw,
-            sql: sql.into(),
-        };
-        rs.execute()?;
-        Ok(rs)
+    pub fn prepare<S: Into<String>>(&self, sql: S) -> Result<Statement> {
+        Statement::prepare(self.raw, sql.into().as_str())
     }
 
-    pub fn execute_async<S: Into<String>>(&self, sql: S) -> ResultSet {
-        ResultSet {
+    pub fn execute<S: Into<String>>(&self, sql: S) -> Result<()> {
+        let stmt = Statement::prepare(self.raw, sql.into().as_str())?;
+        let rows = stmt.execute()?;
+        loop {
+            match rows.next()? {
+                Some(_) => {}
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    pub fn execute_async<S: Into<String>>(&self, sql: S) -> RowsFuture {
+        RowsFuture {
             raw: self.raw,
             sql: sql.into(),
         }
-    }
-}
-
-pub struct ResultSet {
-    raw: *mut libsql_sys::sqlite3,
-    sql: String,
-}
-
-impl futures::Future for ResultSet {
-    type Output = Result<()>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let ret = self.execute();
-        std::task::Poll::Ready(ret)
-    }
-}
-
-impl ResultSet {
-    fn execute(&self) -> Result<()> {
-        let err = unsafe {
-            libsql_sys::sqlite3_exec(
-                self.raw,
-                self.sql.as_ptr() as *const i8,
-                None,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        match err as u32 {
-            libsql_sys::SQLITE_OK => Ok(()),
-            _ => Err(Error::QueryFailed(self.sql.to_owned())),
-        }
-    }
-
-    pub fn wait(&mut self) -> Result<()> {
-        futures::executor::block_on(self)
-    }
-
-    pub fn row_count(&self) -> i32 {
-        0
-    }
-
-    pub fn column_count(&self) -> i32 {
-        0
     }
 }
