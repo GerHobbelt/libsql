@@ -6,9 +6,11 @@ members = [
   "bindings/js",
   "bindings/python",
   "replication",
+  "libsql-sys",
+  "libsql-shell",
+  "wasmtime-bindings",
 ]
 
 [profile.release]
 codegen-units = 1
 panic = "abort"
-strip = true
