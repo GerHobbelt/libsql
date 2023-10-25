@@ -101,7 +101,7 @@ impl Statement {
         match err as u32 {
             crate::ffi::SQLITE_DONE => Ok(self.conn.changes()),
             crate::ffi::SQLITE_ROW => Err(Error::ExecuteReturnedRows),
-            _ => Err(Error::LibError(err)),
+            _ => Err(Error::LibError(err, errors::error_from_handle(self.conn.raw))),
         }
     }
 
@@ -190,6 +190,16 @@ impl Statement {
             }
             _ => unreachable!("sqlite3_column_type returned invalid value"),
         }
+    }
+
+    pub(crate) fn step(&self) -> Result<()> {
+        // TODO(lucio): Handle error from step
+        self.inner.step();
+        Ok(())
+    }
+
+    pub(crate) fn tail(&self) -> usize {
+        self.inner.tail()
     }
 }
 
