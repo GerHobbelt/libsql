@@ -7,13 +7,24 @@ const SQLITE_DIR: &str = "../../../libsql-sqlite3";
 const LIB_NAME: &str = "libsql";
 
 fn run_make() {
-    Command::new(format!("{SQLITE_DIR}/configure")).output().unwrap();
-    Command::new("make").args(&["-C", SQLITE_DIR]).output().unwrap();
+    if Path::new(SQLITE_DIR).join("sqlite3.c").exists() {
+        return;
+    }
+
+    Command::new(format!("./configure"))
+        .current_dir(SQLITE_DIR)
+        .output()
+        .unwrap();
+    Command::new("make")
+        .current_dir(SQLITE_DIR)
+        .output()
+        .unwrap();
 }
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
+    println!("cargo:rerun-if-changed={SQLITE_DIR}/src/");
     run_make();
     build_bundled(&out_dir, &out_path);
 }
@@ -21,10 +32,7 @@ fn main() {
 pub fn build_bundled(out_dir: &str, out_path: &Path) {
     let header = HeaderLocation::FromPath(dbg!(format!("{SQLITE_DIR}/sqlite3.h")));
     bindings::write_to_out_dir(header, out_path);
-    // println!("cargo:rerun-if-changed=sqlite3/sqlite3.c");
-    // println!("cargo:rerun-if-changed=sqlcipher/sqlite3.c");
     println!("cargo:rerun-if-changed={SQLITE_DIR}/sqlite3.c");
-    println!("cargo:rerun-if-changed={SQLITE_DIR}/wasm32-wasi-vfs.c");
     let mut cfg = cc::Build::new();
     cfg.file(format!("{SQLITE_DIR}/sqlite3.c"))
         .flag("-DSQLITE_CORE")
