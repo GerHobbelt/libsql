@@ -1,6 +1,7 @@
 mod pipeline;
 mod proto;
 
+use hyper::header::AUTHORIZATION;
 use pipeline::{
     ClientMsg, Response, ServerMsg, StreamBatchReq, StreamExecuteReq, StreamRequest,
     StreamResponse, StreamResponseError, StreamResponseOk,
@@ -13,7 +14,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 
 // use crate::client::Config;
 use crate::{Column, Params, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -56,15 +57,20 @@ impl InnerClient {
         Self { inner }
     }
 
-    async fn send(&self, url: String, _auth: String, body: String) -> Result<ServerMsg> {
+    async fn send(&self, url: String, auth: String, body: String) -> Result<ServerMsg> {
         let req = hyper::Request::post(url)
+            .header(AUTHORIZATION, auth)
             .body(hyper::Body::from(body))
             .unwrap();
 
         let res = self.inner.request(req).await.map_err(HranaError::from)?;
 
         if res.status() != StatusCode::OK {
-            // TODO(lucio): Error branch!
+            let body = hyper::body::to_bytes(res.into_body())
+                .await
+                .map_err(HranaError::from)?;
+            let body = String::from_utf8(body.into()).unwrap();
+            return Err(HranaError::Api(body).into());
         }
 
         let body = hyper::body::to_bytes(res.into_body())
@@ -91,6 +97,8 @@ pub enum HranaError {
     Json(#[from] serde_json::Error),
     #[error("http error: `{0}`")]
     Http(#[from] hyper::Error),
+    #[error("api error: `{0}`")]
+    Api(String),
 }
 
 impl Client {
@@ -312,7 +320,9 @@ impl super::statement::Stmt for Statement {
 
         let v = self.client.execute_inner(stmt, 0).await?;
         if let Some(last_insert_rowid) = v.last_insert_rowid {
-            self.client.last_insert_rowid.store(last_insert_rowid, Ordering::SeqCst);
+            self.client
+                .last_insert_rowid
+                .store(last_insert_rowid, Ordering::SeqCst);
         }
         Ok(v.affected_row_count as usize)
     }
@@ -331,8 +341,7 @@ impl super::statement::Stmt for Statement {
         })
     }
 
-    fn reset(&self) {
-    }
+    fn reset(&self) {}
 
     fn parameter_count(&self) -> usize {
         todo!()
@@ -349,12 +358,12 @@ impl super::statement::Stmt for Statement {
 
 pub struct Rows {
     cols: Arc<Vec<Col>>,
-    rows: Vec<Vec<proto::Value>>,
+    rows: VecDeque<Vec<proto::Value>>,
 }
 
 impl RowsInner for Rows {
     fn next(&mut self) -> Result<Option<super::Row>> {
-        let row = match self.rows.pop() {
+        let row = match self.rows.pop_front() {
             Some(row) => Row {
                 cols: self.cols.clone(),
                 inner: row,
@@ -397,6 +406,10 @@ impl RowInner for Row {
             .map(|c| c.name.as_ref())
             .flatten()
             .map(|s| s.as_str())
+    }
+
+    fn column_str(&self, idx: i32) -> Result<&str> {
+        todo!()
     }
 }
 

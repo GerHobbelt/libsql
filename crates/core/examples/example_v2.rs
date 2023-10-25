@@ -3,7 +3,14 @@ use libsql::v2::Database;
 #[tokio::main]
 async fn main() {
     let db = if let Ok(url) = std::env::var("LIBSQL_HRANA_URL") {
-        Database::open_remote(url).unwrap()
+        let token = std::env::var("TURSO_AUTH_TOKEN").unwrap_or_else(|_| {
+            println!("TURSO_AUTH_TOKEN not set, using empty token...");
+            "".to_string()
+        });
+
+        Database::open_with_sync("db.sqld", url, token)
+            .await
+            .unwrap()
     } else {
         Database::open_in_memory().unwrap()
     };
@@ -22,6 +29,8 @@ async fn main() {
     stmt.execute(&libsql::params!["foo@example.com"])
         .await
         .unwrap();
+
+    db.sync().await.unwrap();
 
     let stmt = conn
         .prepare("SELECT * FROM users WHERE email = ?1")
