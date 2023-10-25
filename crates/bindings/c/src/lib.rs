@@ -128,10 +128,10 @@ pub unsafe extern "C" fn libsql_free_rows(res: libsql_rows_t) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libsql_execute_async<'a>(
-    conn: &'a libsql_connection_t,
+pub unsafe extern "C" fn libsql_execute_async(
+    conn: &libsql_connection_t,
     sql: *const std::ffi::c_char,
-) -> libsql_rows_future_t<'a> {
+) -> libsql_rows_future_t {
     let sql = unsafe { std::ffi::CStr::from_ptr(sql) };
     let sql = match sql.to_str() {
         Ok(sql) => sql,
@@ -317,16 +317,33 @@ pub unsafe extern "C" fn libsql_get_int(
 pub unsafe extern "C" fn libsql_get_float(
     res: libsql_row_t,
     col: std::ffi::c_int,
-) -> std::ffi::c_double {
+    out_value: *mut std::ffi::c_double,
+    out_err_msg: *mut *const std::ffi::c_char,
+) -> std::ffi::c_int {
     let res = res.get_ref();
     match res.get_value(col) {
-        Ok(libsql::params::Value::Real(f)) => f,
-        _ => 0.0,
+        Ok(libsql::params::Value::Real(f)) => {
+            *out_value = f;
+            0
+        }
+        Ok(_) => {
+            set_err_msg(format!("Value not a float"), out_err_msg);
+            1
+        }
+        Err(e) => {
+            set_err_msg(format!("Error fetching value: {}", e), out_err_msg);
+            2
+        }
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn libsql_get_blob(res: libsql_row_t, col: std::ffi::c_int) -> blob {
+pub unsafe extern "C" fn libsql_get_blob(
+    res: libsql_row_t,
+    col: std::ffi::c_int,
+    out_blob: *mut blob,
+    out_err_msg: *mut *const std::ffi::c_char,
+) -> std::ffi::c_int {
     let res = res.get_ref();
     match res.get_value(col) {
         Ok(libsql::params::Value::Blob(v)) => {
@@ -334,15 +351,20 @@ pub unsafe extern "C" fn libsql_get_blob(res: libsql_row_t, col: std::ffi::c_int
             let buf = v.into_boxed_slice();
             let data = buf.as_ptr();
             std::mem::forget(buf);
-            blob {
+            *out_blob = blob {
                 ptr: data as *const i8,
                 len,
-            }
+            };
+            0
         }
-        _ => blob {
-            ptr: std::ptr::null(),
-            len: 0,
-        },
+        Ok(_) => {
+            set_err_msg(format!("Value not a float"), out_err_msg);
+            1
+        }
+        Err(e) => {
+            set_err_msg(format!("Error fetching value: {}", e), out_err_msg);
+            2
+        }
     }
 }
 

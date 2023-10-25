@@ -255,9 +255,20 @@ func (r *rows) Next(dest []driver.Value) error {
 			}
 			dest[i] = int64(value)
 		case TYPE_FLOAT:
-			dest[i] = float64(C.libsql_get_float(row, C.int(i)))
+			var value C.double
+			var errMsg *C.char
+			statusCode := C.libsql_get_float(row, C.int(i), &value, &errMsg)
+			if statusCode != 0 {
+				return libsqlError(fmt.Sprint("failed to get float for column ", i), statusCode, errMsg)
+			}
+			dest[i] = float64(value)
 		case TYPE_BLOB:
-			nativeBlob := C.libsql_get_blob(row, C.int(i))
+			var nativeBlob C.blob
+			var errMsg *C.char
+			statusCode := C.libsql_get_blob(row, C.int(i), &nativeBlob, &errMsg)
+			if statusCode != 0 {
+				return libsqlError(fmt.Sprint("failed to get blob for column ", i), statusCode, errMsg)
+			}
 			dest[i] = C.GoBytes(unsafe.Pointer(nativeBlob.ptr), C.int(nativeBlob.len))
 			C.libsql_free_blob(nativeBlob)
 		case TYPE_TEXT:
