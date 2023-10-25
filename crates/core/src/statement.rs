@@ -13,6 +13,10 @@ pub struct Statement {
 }
 
 impl Statement {
+    pub(crate) fn finalize(&self) {
+        self.inner.finalize();
+    }
+
     pub(crate) fn prepare(
         conn: Connection,
         raw: *mut libsql_sys::ffi::sqlite3,
@@ -134,7 +138,7 @@ impl Statement {
                 self.inner.bind_text(i, value);
             }
             ValueRef::Blob(value) => {
-                self.inner.bind_blob(i, &value[..]);
+                self.inner.bind_blob(i, value);
             }
         }
     }

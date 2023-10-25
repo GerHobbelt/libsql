@@ -316,6 +316,10 @@ impl Conn for Client {
     fn last_insert_rowid(&self) -> i64 {
         self.last_insert_rowid.load(Ordering::SeqCst)
     }
+
+    fn close(&self) {
+        todo!()
+    }
 }
 
 pub struct Statement {
@@ -325,6 +329,9 @@ pub struct Statement {
 
 #[async_trait::async_trait]
 impl super::statement::Stmt for Statement {
+    fn finalize(&self) {
+    }
+
     async fn execute(&self, params: &Params) -> Result<usize> {
         let mut stmt = self.inner.clone();
         bind_params(params.clone(), &mut stmt);
@@ -396,8 +403,7 @@ impl RowsInner for Rows {
     fn column_name(&self, idx: i32) -> Option<&str> {
         self.cols
             .get(idx as usize)
-            .map(|c| c.name.as_ref())
-            .flatten()
+            .and_then(|c| c.name.as_ref())
             .map(|s| s.as_str())
     }
 
@@ -420,12 +426,11 @@ impl RowInner for Row {
     fn column_name(&self, idx: i32) -> Option<&str> {
         self.cols
             .get(idx as usize)
-            .map(|c| c.name.as_ref())
-            .flatten()
+            .and_then(|c| c.name.as_ref())
             .map(|s| s.as_str())
     }
 
-    fn column_str(&self, idx: i32) -> Result<&str> {
+    fn column_str(&self, _idx: i32) -> Result<&str> {
         todo!()
     }
 

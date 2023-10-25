@@ -111,7 +111,7 @@ impl From<libsql_sys::Value> for Value {
     fn from(value: libsql_sys::Value) -> Value {
         match value.value_type() {
             ValueType::Null => Value::Null,
-            ValueType::Integer => Value::Integer(value.int().into()),
+            ValueType::Integer => Value::Integer(value.int64().into()),
             ValueType::Real => Value::Real(value.double()),
             ValueType::Text => {
                 let v = value.text();
@@ -132,7 +132,7 @@ impl From<libsql_sys::Value> for Value {
 
                 let slice: &[u8] =
                     unsafe { std::slice::from_raw_parts(blob as *const u8, len as usize) };
-                v.extend_from_slice(&slice);
+                v.extend_from_slice(slice);
                 Value::Blob(v)
             }
         }
@@ -213,7 +213,7 @@ impl<'a> From<libsql_sys::Value> for ValueRef<'a> {
     fn from(value: libsql_sys::Value) -> ValueRef<'a> {
         match value.value_type() {
             ValueType::Null => ValueRef::Null,
-            ValueType::Integer => ValueRef::Integer(value.int().into()),
+            ValueType::Integer => ValueRef::Integer(value.int64().into()),
             ValueType::Real => todo!(),
             ValueType::Text => {
                 let v = value.text();
