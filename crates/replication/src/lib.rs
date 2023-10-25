@@ -14,7 +14,6 @@ pub use frame::{Frame, FrameHeader};
 pub use replica::hook::{Frames, InjectorHookCtx};
 use replica::snapshot::SnapshotFileHeader;
 pub use replica::snapshot::TempSnapshot;
-use tokio::sync::watch::Receiver;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -265,5 +264,25 @@ impl Writer {
             write_frame_no
         );
         Ok(rows_affected)
+    }
+
+    pub async fn query(
+        &self,
+        sql: &str,
+        params: impl Into<pb::query::Params> + Send,
+    ) -> anyhow::Result<pb::ResultRows> {
+        let (write_frame_no, rows) = self.client.query(sql, params.into()).await?;
+
+        tracing::trace!(
+            "statement executed on remote waiting for frame_no: {}",
+            write_frame_no
+        );
+
+        Ok(rows)
+    }
+
+    pub async fn execute_batch(&self, sql: Vec<String>) -> anyhow::Result<()> {
+        self.client.execute_batch(sql).await?;
+        Ok(())
     }
 }

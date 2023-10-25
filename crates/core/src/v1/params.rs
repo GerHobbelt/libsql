@@ -217,7 +217,7 @@ impl<'a> From<libsql_sys::Value> for ValueRef<'a> {
         match value.value_type() {
             ValueType::Null => ValueRef::Null,
             ValueType::Integer => ValueRef::Integer(value.int64()),
-            ValueType::Real => todo!(),
+            ValueType::Real => ValueRef::Real(value.double()),
             ValueType::Text => {
                 let v = value.text();
                 if v.is_null() {
@@ -259,7 +259,27 @@ impl From<Params> for libsql_replication::pb::query::Params {
                     .collect::<Vec<_>>();
                 pb::query::Params::Positional(pb::Positional { values })
             }
-            Params::Named(_) => todo!(),
+            Params::Named(values) => {
+                let (names, values) = values
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let data = bincode::serialize(&value).unwrap();
+                        let value = pb::Value { data };
+                        (name, value)
+                    })
+                    .unzip();
+
+                pb::query::Params::Named(pb::Named { names, values })
+            }
         }
+    }
+}
+
+#[cfg(feature = "replication")]
+impl TryFrom<libsql_replication::pb::Value> for Value {
+    type Error = Error;
+
+    fn try_from(value: libsql_replication::pb::Value) -> Result<Self> {
+        bincode::deserialize(&value.data[..]).map_err(Error::from)
     }
 }

@@ -1,4 +1,5 @@
 use crate::v1::connection::Connection;
+use crate::OpenFlags;
 use crate::{Error::ConnectionFailed, Result};
 #[cfg(feature = "replication")]
 use libsql_replication::Replicator;
@@ -46,57 +47,71 @@ impl Opts {
 // A libSQL database.
 pub struct Database {
     pub db_path: String,
+    pub flags: OpenFlags,
     #[cfg(feature = "replication")]
     pub replication_ctx: Option<ReplicationContext>,
 }
 
 impl Database {
     /// Open a local database file.
-    pub fn open<S: Into<String>>(db_path: S) -> Result<Database> {
+    pub fn open<S: Into<String>>(db_path: S, flags: OpenFlags) -> Result<Database> {
         let db_path = db_path.into();
         if db_path.starts_with("libsql:") || db_path.starts_with("http:") {
             Err(ConnectionFailed(format!(
                 "Unable to open remote database {db_path} with Database::open()"
             )))
         } else {
-            Ok(Database::new(db_path))
+            Ok(Database::new(db_path, flags))
         }
     }
 
     #[cfg(feature = "replication")]
     pub async fn open_with_opts(db_path: impl Into<String>, opts: Opts) -> Result<Database> {
         let db_path = db_path.into();
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open(&db_path, OpenFlags::default())?;
         let mut replicator =
             Replicator::new(db_path).map_err(|e| ConnectionFailed(format!("{e}")))?;
-        if let Sync::Http {
-            endpoint,
-            auth_token,
-        } = opts.sync
-        {
-            let meta = replicator
-                .init_metadata(&endpoint, &auth_token)
-                .await
-                .map_err(|e| ConnectionFailed(format!("{e}")))?;
-            *replicator.meta.lock() = Some(meta);
-            db.replication_ctx = Some(ReplicationContext {
-                replicator,
+        match opts.sync {
+            Sync::Http {
                 endpoint,
-            });
-        };
+                auth_token,
+            } => {
+                let meta = replicator
+                    .init_metadata(&endpoint, &auth_token)
+                    .await
+                    .map_err(|e| ConnectionFailed(format!("{e}")))?;
+                *replicator.meta.lock() = Some(meta);
+                db.replication_ctx = Some(ReplicationContext {
+                    replicator,
+                    endpoint,
+                });
+            }
+            Sync::Frame => {
+                // NOTICE: the snapshot file used in sync_frames() contains metadata, it will be updated there
+                *replicator.meta.lock() = Some(libsql_replication::replica::meta::WalIndexMeta {
+                    pre_commit_frame_no: 0,
+                    post_commit_frame_no: 0,
+                    generation_id: 0,
+                    database_id: 0,
+                });
+                db.replication_ctx = Some(ReplicationContext {
+                    replicator,
+                    endpoint: "".to_string(),
+                });
+            }
+        }
 
         Ok(db)
     }
 
-    pub fn new(db_path: String) -> Database {
+    pub fn new(db_path: String, flags: OpenFlags) -> Database {
         Database {
             db_path,
+            flags,
             #[cfg(feature = "replication")]
             replication_ctx: None,
         }
     }
-
-    pub fn close(&self) {}
 
     pub fn connect(&self) -> Result<Connection> {
         Connection::connect(self)
@@ -105,6 +120,9 @@ impl Database {
     #[cfg(feature = "replication")]
     pub fn writer(&self) -> Result<Option<libsql_replication::Writer>> {
         if let Some(ctx) = &self.replication_ctx {
+            if ctx.endpoint.is_empty() {
+                return Ok(None);
+            }
             Ok(ctx
                 .replicator
                 .writer()
