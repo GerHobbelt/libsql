@@ -8,20 +8,20 @@ async fn main() {
             "".to_string()
         });
 
-        Database::open_with_sync("db.sqld", url, token)
+        Database::open_with_remote_sync("db.sqld", url, token)
             .await
             .unwrap()
     } else {
         Database::open_in_memory().unwrap()
     };
 
-    let conn = db.connect().await.unwrap();
+    let conn = db.connect().unwrap();
 
     conn.execute("CREATE TABLE IF NOT EXISTS users (email TEXT)", ())
         .await
         .unwrap();
 
-    let stmt = conn
+    let mut stmt = conn
         .prepare("INSERT INTO users (email) VALUES (?1)")
         .await
         .unwrap();
@@ -32,7 +32,7 @@ async fn main() {
 
     db.sync().await.unwrap();
 
-    let stmt = conn
+    let mut stmt = conn
         .prepare("SELECT * FROM users WHERE email = ?1")
         .await
         .unwrap();

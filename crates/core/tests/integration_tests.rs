@@ -2,7 +2,7 @@ use libsql::{named_params, params, Connection, Database, Params, Value};
 
 async fn setup() -> Connection {
     let db = Database::open(":memory:").unwrap();
-    let conn = db.connect().await.unwrap();
+    let conn = db.connect().unwrap();
     let _ = conn
         .execute("CREATE TABLE users (id INTEGER, name TEXT)", ())
         .await;
@@ -12,7 +12,7 @@ async fn setup() -> Connection {
 #[tokio::test]
 async fn connection_drops_before_statements() {
     let db = Database::open(":memory:").unwrap();
-    let conn = db.connect().await.unwrap();
+    let conn = db.connect().unwrap();
     let _stmt = conn.prepare("SELECT 1").await.unwrap();
     drop(conn);
 }
@@ -111,7 +111,7 @@ async fn statement_query() {
 
     let params = Params::from(vec![libsql::Value::from(2)]);
 
-    let stmt = conn
+    let mut stmt = conn
         .prepare("SELECT * FROM users WHERE id = ?1")
         .await
         .unwrap();

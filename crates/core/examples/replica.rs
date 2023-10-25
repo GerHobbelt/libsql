@@ -10,14 +10,14 @@ async fn main() {
 
     let auth_token = std::env::var("TURSO_AUTH_TOKEN").expect("Expected a TURSO_AUTH_TOKEN");
 
-    let db = Database::open_with_sync(
+    let db = Database::open_with_remote_sync(
         db_file.path().to_str().unwrap(),
         "http://localhost:8080",
         auth_token,
     )
     .await
     .unwrap();
-    let conn = db.connect().await.unwrap();
+    let conn = db.connect().unwrap();
 
     let f = db.sync().await.unwrap();
     println!("inital sync complete, frame no: {}", f);

@@ -5,7 +5,8 @@ pub mod transaction;
 
 use std::sync::Arc;
 
-use crate::v1::{Params, Result, TransactionBehavior};
+use crate::v1::{Params, TransactionBehavior};
+use crate::Result;
 pub use hrana::{Client, HranaError};
 
 pub use rows::{Row, Rows};
@@ -43,7 +44,19 @@ impl Database {
         })
     }
 
-    pub async fn open_with_sync(
+    /// Open a local database file with the ability to sync from snapshots from local filesystem.
+    #[cfg(feature = "replication")]
+    pub async fn open_with_local_sync(db_path: impl Into<String>) -> Result<Database> {
+        let opts = crate::Opts::with_sync();
+        let db = crate::v1::Database::open_with_opts(db_path, opts).await?;
+        Ok(Database {
+            db_type: DbType::Sync { db },
+        })
+    }
+
+    /// Open a local database file with the ability to sync from a remote database.
+    #[cfg(feature = "replication")]
+    pub async fn open_with_remote_sync(
         db_path: impl Into<String>,
         url: impl Into<String>,
         token: impl Into<String>,
@@ -64,7 +77,7 @@ impl Database {
         })
     }
 
-    pub async fn connect(&self) -> Result<Connection> {
+    pub fn connect(&self) -> Result<Connection> {
         match &self.db_type {
             DbType::Memory => {
                 let db = crate::v1::Database::open(":memory:")?;
@@ -160,7 +173,7 @@ impl Connection {
     }
 
     pub async fn query(&self, sql: &str, params: impl Into<Params>) -> Result<Rows> {
-        let stmt = self.prepare(sql).await?;
+        let mut stmt = self.prepare(sql).await?;
 
         stmt.query(&params.into()).await
     }
@@ -217,7 +230,7 @@ impl Conn for LibsqlConnection {
         let stmt = self.conn.prepare(sql)?;
 
         Ok(Statement {
-            inner: Arc::new(LibsqlStmt(stmt)),
+            inner: Box::new(LibsqlStmt(stmt)),
         })
     }
 
