@@ -7,6 +7,8 @@ typedef struct libsql_connection libsql_connection;
 
 typedef struct libsql_database libsql_database;
 
+typedef struct libsql_row libsql_row;
+
 typedef struct libsql_rows libsql_rows;
 
 typedef struct libsql_rows_future libsql_rows_future;
@@ -19,19 +21,26 @@ typedef const libsql_rows *libsql_rows_t;
 
 typedef const libsql_rows_future *libsql_rows_future_t;
 
+typedef const libsql_row *libsql_row_t;
+
+typedef struct {
+  const char *ptr;
+  int len;
+} blob;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
 
-libsql_database_t libsql_open_ext(const char *url);
+int libsql_open_ext(const char *url, libsql_database_t *out_db, const char **out_err_msg);
 
 void libsql_close(libsql_database_t db);
 
-libsql_connection_t libsql_connect(libsql_database_t db);
+int libsql_connect(libsql_database_t db, libsql_connection_t *out_conn, const char **out_err_msg);
 
 void libsql_disconnect(libsql_connection_t conn);
 
-void libsql_execute(libsql_connection_t conn, const char *sql);
+int libsql_execute(libsql_connection_t conn, const char *sql, libsql_rows_t *out_rows, const char **out_err_msg);
 
 void libsql_free_rows(libsql_rows_t res);
 
@@ -43,7 +52,25 @@ void libsql_wait_result(libsql_rows_future_t res);
 
 int libsql_column_count(libsql_rows_t res);
 
-const char *libsql_value_text(libsql_rows_t _res, int _row, int _col);
+int libsql_column_name(libsql_rows_t res, int col, const char **out_name, const char **out_err_msg);
+
+int libsql_column_type(libsql_rows_t res, int col, int *out_type, const char **out_err_msg);
+
+int libsql_next_row(libsql_rows_t res, libsql_row_t *out_row, const char **out_err_msg);
+
+void libsql_free_row(libsql_row_t res);
+
+int libsql_get_string(libsql_row_t res, int col, const char **out_value, const char **out_err_msg);
+
+void libsql_free_string(const char *ptr);
+
+int libsql_get_int(libsql_row_t res, int col, long long *out_value, const char **out_err_msg);
+
+double libsql_get_float(libsql_row_t res, int col);
+
+blob libsql_get_blob(libsql_row_t res, int col);
+
+void libsql_free_blob(blob b);
 
 #ifdef __cplusplus
 } // extern "C"
