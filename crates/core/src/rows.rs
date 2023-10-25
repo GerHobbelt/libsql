@@ -1,12 +1,13 @@
-use crate::{errors, raw, Error, Params, Result, Statement};
+use crate::{errors, Error, Params, Result, Statement, Value};
+use libsql_sys::ValueType;
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Query result rows.
 #[derive(Debug)]
 pub struct Rows {
-    pub(crate) stmt: Rc<raw::Statement>,
+    pub(crate) stmt: Arc<libsql_sys::Statement>,
     pub(crate) err: RefCell<Option<i32>>,
 }
 
@@ -30,6 +31,10 @@ impl Rows {
 
     pub fn column_count(&self) -> i32 {
         self.stmt.column_count()
+    }
+
+    pub fn column_name(&self, idx: i32) -> &str {
+        self.stmt.column_name(idx)
     }
 }
 
@@ -59,7 +64,7 @@ impl futures::Future for RowsFuture {
 }
 
 pub struct Row {
-    pub(crate) stmt: Rc<raw::Statement>,
+    pub(crate) stmt: Arc<libsql_sys::Statement>,
 }
 
 impl Row {
@@ -69,6 +74,11 @@ impl Row {
     {
         let val = self.stmt.column_value(idx);
         T::from_sql(val)
+    }
+
+    pub fn get_value(&self, idx: i32) -> Result<Value> {
+        let val = self.stmt.column_value(idx);
+        Ok(val.into())
     }
 
     pub fn column_type(&self, idx: i32) -> Result<ValueType> {
@@ -82,31 +92,27 @@ impl Row {
             _ => Err(Error::UnknownColumnType(idx, val)),
         }
     }
-}
 
-pub enum ValueType {
-    Integer,
-    Float,
-    Blob,
-    Text,
-    Null,
+    pub fn column_name(&self, idx: i32) -> &str {
+        self.stmt.column_name(idx)
+    }
 }
 
 pub trait FromValue {
-    fn from_sql(val: raw::Value) -> Result<Self>
+    fn from_sql(val: libsql_sys::Value) -> Result<Self>
     where
         Self: Sized;
 }
 
 impl FromValue for i32 {
-    fn from_sql(val: raw::Value) -> Result<Self> {
+    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
         let ret = val.int();
         Ok(ret)
     }
 }
 
 impl FromValue for &str {
-    fn from_sql(val: raw::Value) -> Result<Self> {
+    fn from_sql(val: libsql_sys::Value) -> Result<Self> {
         let ret = val.text();
         if ret.is_null() {
             return Err(Error::NullValue);
