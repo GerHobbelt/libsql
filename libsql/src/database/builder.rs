@@ -1,3 +1,6 @@
+cfg_core! {
+    use crate::EncryptionConfig;
+}
 use crate::{Database, Result};
 
 use super::DbType;
@@ -14,6 +17,12 @@ use super::DbType;
 ///     includes the ability to delegate writes to a remote primary.
 /// - `new_remote`/`Remote` creates a database that does not create anything locally but will
 ///     instead run all queries on the remote database. This is essentially the pure HTTP api.
+///
+/// # Note
+///
+/// Embedded replica's require a clean database (no database file) or a previously synced database or else it will
+/// throw an error to prevent any misuse. To work around this error a user can delete the database
+/// and let it resync and create the wal_index metadata file.
 pub struct Builder<T = ()> {
     inner: T,
 }
@@ -26,7 +35,7 @@ impl Builder<()> {
                 inner: Local {
                     path: path.as_ref().to_path_buf(),
                     flags: crate::OpenFlags::default(),
-                    encryption_key: None,
+                    encryption_config: None,
                 },
             }
         }
@@ -48,9 +57,10 @@ impl Builder<()> {
                         connector: None,
                         version: None,
                     },
-                    encryption_key: None,
-                    read_your_writes: false,
-                    periodic_sync: None
+                    encryption_config: None,
+                    read_your_writes: true,
+                    sync_interval: None,
+                    http_request_callback: None
                 },
             }
         }
@@ -62,7 +72,8 @@ impl Builder<()> {
                     path: path.as_ref().to_path_buf(),
                     flags: crate::OpenFlags::default(),
                     remote: None,
-                    encryption_key: None,
+                    encryption_config: None,
+                    http_request_callback: None
                 },
             }
         }
@@ -98,7 +109,7 @@ cfg_core! {
     pub struct Local {
         path: std::path::PathBuf,
         flags: crate::OpenFlags,
-        encryption_key: Option<bytes::Bytes>,
+        encryption_config: Option<EncryptionConfig>,
     }
 
     impl Builder<Local> {
@@ -108,12 +119,12 @@ cfg_core! {
             self
         }
 
-        /// Set an encryption key that will encrypt the local database.
-        pub fn encryption_key(
+        /// Set an encryption config that will encrypt the local database.
+        pub fn encryption_config(
             mut self,
-            encryption_key: impl Into<bytes::Bytes>,
+            encryption_config: EncryptionConfig,
         ) -> Builder<Local> {
-            self.inner.encryption_key = Some(encryption_key.into());
+            self.inner.encryption_config = Some(encryption_config);
             self
         }
 
@@ -135,7 +146,7 @@ cfg_core! {
                     db_type: DbType::File {
                         path,
                         flags: self.inner.flags,
-                        encryption_key: self.inner.encryption_key,
+                        encryption_config: self.inner.encryption_config,
                     },
                 }
             };
@@ -150,9 +161,10 @@ cfg_replication! {
     pub struct RemoteReplica {
         path: std::path::PathBuf,
         remote: Remote,
-        encryption_key: Option<bytes::Bytes>,
+        encryption_config: Option<EncryptionConfig>,
         read_your_writes: bool,
-        periodic_sync: Option<std::time::Duration>,
+        sync_interval: Option<std::time::Duration>,
+        http_request_callback: Option<crate::util::HttpRequestCallback>,
     }
 
     /// Local replica configuration type in [`Builder`].
@@ -160,7 +172,8 @@ cfg_replication! {
         path: std::path::PathBuf,
         flags: crate::OpenFlags,
         remote: Option<Remote>,
-        encryption_key: Option<bytes::Bytes>,
+        encryption_config: Option<EncryptionConfig>,
+        http_request_callback: Option<crate::util::HttpRequestCallback>,
     }
 
     impl Builder<RemoteReplica> {
@@ -177,16 +190,20 @@ cfg_replication! {
         }
 
         /// Set an encryption key that will encrypt the local database.
-        pub fn encryption_key(
+        pub fn encryption_config(
             mut self,
-            encryption_key: impl Into<bytes::Bytes>,
+            encryption_config: EncryptionConfig,
         ) -> Builder<RemoteReplica> {
-            self.inner.encryption_key = Some(encryption_key.into());
+            self.inner.encryption_config = Some(encryption_config.into());
             self
         }
 
         /// Set weather you want writes to be visible locally before the write query returns. This
         /// means that you will be able to read your own writes if this is set to `true`.
+        ///
+        /// # Default
+        ///
+        /// This defaults to `true`.
         pub fn read_your_writes(mut self, read_your_writes: bool) -> Builder<RemoteReplica> {
             self.inner.read_your_writes = read_your_writes;
             self
@@ -195,9 +212,18 @@ cfg_replication! {
         /// Set the duration at which the replicator will automatically call `sync` in the
         /// background. The sync will continue for the duration that the resulted `Database`
         /// type is alive for, once it is dropped the background task will get dropped and stop.
-        pub fn periodic_sync(mut self, duration: std::time::Duration) -> Builder<RemoteReplica> {
-            self.inner.periodic_sync = Some(duration);
+        pub fn sync_interval(mut self, duration: std::time::Duration) -> Builder<RemoteReplica> {
+            self.inner.sync_interval = Some(duration);
             self
+        }
+
+        pub fn http_request_callback<F>(mut self, f: F) -> Builder<RemoteReplica>
+        where
+            F: Fn(&mut http::Request<()>) + Send + Sync + 'static
+        {
+            self.inner.http_request_callback = Some(std::sync::Arc::new(f));
+            self
+
         }
 
         #[doc(hidden)]
@@ -217,9 +243,10 @@ cfg_replication! {
                         connector,
                         version,
                     },
-                encryption_key,
+                encryption_config,
                 read_your_writes,
-                periodic_sync
+                sync_interval,
+                http_request_callback
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
@@ -244,13 +271,14 @@ cfg_replication! {
                 auth_token,
                 version,
                 read_your_writes,
-                encryption_key.clone(),
-                periodic_sync
+                encryption_config.clone(),
+                sync_interval,
+                http_request_callback
             )
             .await?;
 
             Ok(Database {
-                db_type: DbType::Sync { db, encryption_key },
+                db_type: DbType::Sync { db, encryption_config },
             })
         }
     }
@@ -262,13 +290,23 @@ cfg_replication! {
             self
         }
 
+        pub fn http_request_callback<F>(mut self, f: F) -> Builder<LocalReplica>
+        where
+            F: Fn(&mut http::Request<()>) + Send + Sync + 'static
+        {
+            self.inner.http_request_callback = Some(std::sync::Arc::new(f));
+            self
+
+        }
+
         /// Build the local embedded replica database.
         pub async fn build(self) -> Result<Database> {
             let LocalReplica {
                 path,
                 flags,
                 remote,
-                encryption_key,
+                encryption_config,
+                http_request_callback
             } = self.inner;
 
             let path = path.to_str().ok_or(crate::Error::InvalidUTF8Path)?.to_owned();
@@ -300,15 +338,16 @@ cfg_replication! {
                     auth_token,
                     version,
                     flags,
-                    encryption_key.clone(),
+                    encryption_config.clone(),
+                    http_request_callback
                 )
                 .await?
             } else {
-                crate::local::Database::open_local_sync(path, flags, encryption_key.clone()).await?
+                crate::local::Database::open_local_sync(path, flags, encryption_config.clone()).await?
             };
 
             Ok(Database {
-                db_type: DbType::Sync { db, encryption_key },
+                db_type: DbType::Sync { db, encryption_config },
             })
         }
     }

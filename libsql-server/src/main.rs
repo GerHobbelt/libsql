@@ -9,6 +9,7 @@ use anyhow::{bail, Context as _, Result};
 use bytesize::ByteSize;
 use clap::Parser;
 use hyper::client::HttpConnector;
+use libsql_server::auth::{parse_http_basic_auth_arg, parse_jwt_key, user_auth_strategies, Auth};
 // use mimalloc::MiMalloc;
 use tokio::sync::Notify;
 use tokio::time::Duration;
@@ -17,12 +18,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 use libsql_server::config::{
-    AdminApiConfig, DbConfig, HeartbeatConfig, MetaStoreConfig, RpcClientConfig, RpcServerConfig,
-    TlsConfig, UserApiConfig,
+    AdminApiConfig, BottomlessConfig, DbConfig, HeartbeatConfig, MetaStoreConfig, RpcClientConfig,
+    RpcServerConfig, TlsConfig, UserApiConfig,
 };
 use libsql_server::net::AddrIncoming;
 use libsql_server::Server;
 use libsql_server::{connection::dump::exporter::export_dump, version::Version};
+use libsql_sys::{Cipher, EncryptionConfig};
 
 // Use system allocator for now, seems like we are getting too much fragmentation.
 // #[global_allocator]
@@ -202,35 +204,44 @@ struct Cli {
     max_active_namespaces: usize,
 
     /// Enable backup for the metadata store
-    #[clap(long)]
+    #[clap(long, env = "SQLD_BACKUP_META_STORE")]
     backup_meta_store: bool,
     /// S3 access key ID for the meta store backup
-    #[clap(long)]
+    #[clap(long, env = "SQLD_META_STORE_ACCESS_KEY_ID")]
     meta_store_access_key_id: Option<String>,
     /// S3 secret access key for the meta store backup
-    #[clap(long)]
+    #[clap(long, env = "SQLD_META_STORE_SECRET_ACCESS")]
     meta_store_secret_access_key: Option<String>,
     /// S3 region for the metastore backup
-    #[clap(long)]
+    #[clap(long, env = "SQLD_META_STORE_REGION")]
     meta_store_region: Option<String>,
     /// Id for the meta store backup
-    #[clap(long)]
+    #[clap(long, env = "SQLD_META_STORE_BACKUP_ID")]
     meta_store_backup_id: Option<String>,
     /// S3 bucket name for the meta store backup
-    #[clap(long)]
+    #[clap(long, env = "SQLD_META_STORE_BUCKET_NAME")]
     meta_store_bucket_name: Option<String>,
     /// Interval at which to perform backups of the meta store
-    #[clap(long)]
+    #[clap(long, env = "SQLD_META_STORE_BACKUP_INTERVAL_S")]
     meta_store_backup_interval_s: Option<usize>,
     /// S3 endpoint for the meta store backups
-    #[clap(long)]
+    #[clap(long, env = "SQLD_META_STORE_BUCKET_ENDPOINT")]
     meta_store_bucket_endpoint: Option<String>,
+
     /// encryption_key for encryption at rest
     #[clap(long, env = "SQLD_ENCRYPTION_KEY")]
     encryption_key: Option<bytes::Bytes>,
 
-    #[clap(long, default_value = "128")]
+    #[clap(long, default_value = "128", env = "SQLD_MAX_CONCURRENT_CONNECTIONS")]
     max_concurrent_connections: usize,
+    // max number of concurrent requests across all connections
+    #[clap(long, default_value = "128", env = "SQLD_MAX_CONCURRENT_REQUESTS")]
+    max_concurrent_requests: u64,
+
+    /// Allow meta store to recover config from filesystem from older version, if meta store is
+    /// empty on startup
+    #[clap(long, env = "SQLD_ALLOW_METASTORE_RECOVERY")]
+    allow_metastore_recovery: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -332,14 +343,18 @@ fn enable_libsql_logging() {
 }
 
 fn make_db_config(config: &Cli) -> anyhow::Result<DbConfig> {
+    let encryption_config = config.encryption_key.as_ref().map(|key| EncryptionConfig {
+        cipher: Cipher::Aes256Cbc,
+        encryption_key: key.clone(),
+    });
     let mut bottomless_replication = config
         .enable_bottomless_replication
         .then(bottomless::replicator::Options::from_env)
         .transpose()?;
     // Inherit encryption key for bottomless from the db config, if not specified.
     if let Some(ref mut bottomless_replication) = bottomless_replication {
-        if bottomless_replication.encryption_key.is_none() {
-            bottomless_replication.encryption_key = config.encryption_key.clone();
+        if bottomless_replication.encryption_config.is_none() {
+            bottomless_replication.encryption_config = encryption_config.clone();
         }
     }
     Ok(DbConfig {
@@ -354,11 +369,23 @@ fn make_db_config(config: &Cli) -> anyhow::Result<DbConfig> {
         snapshot_exec: config.snapshot_exec.clone(),
         checkpoint_interval: config.checkpoint_interval_s.map(Duration::from_secs),
         snapshot_at_shutdown: config.snapshot_at_shutdown,
-        encryption_key: config.encryption_key.clone(),
+        encryption_config: encryption_config.clone(),
+        max_concurrent_requests: config.max_concurrent_requests,
     })
 }
 
-async fn make_user_api_config(config: &Cli) -> anyhow::Result<UserApiConfig> {
+async fn make_user_auth_strategy(config: &Cli) -> anyhow::Result<Auth> {
+    if let Some(http_auth) = config.http_auth.as_deref() {
+        tracing::info!("Using legacy HTTP basic authentication");
+
+        let credential =
+            parse_http_basic_auth_arg(http_auth)?.expect("Invalid HTTP Basic configuration");
+
+        return Ok(Auth::new(user_auth_strategies::HttpBasic::new(
+            credential.into(),
+        )));
+    }
+
     let auth_jwt_key = if let Some(ref file_path) = config.auth_jwt_key_file {
         let data = tokio::fs::read_to_string(file_path)
             .await
@@ -373,6 +400,18 @@ async fn make_user_api_config(config: &Cli) -> anyhow::Result<UserApiConfig> {
             }
         }
     };
+
+    if let Some(jwt_key) = auth_jwt_key.as_deref() {
+        let jwt_key: jsonwebtoken::DecodingKey =
+            parse_jwt_key(jwt_key).context("Could not parse JWT decoding key")?;
+        tracing::info!("Using JWT-based authentication");
+        return Ok(Auth::new(user_auth_strategies::Jwt::new(jwt_key)));
+    }
+
+    Ok(Auth::new(user_auth_strategies::Disabled::new()))
+}
+
+async fn make_user_api_config(config: &Cli) -> anyhow::Result<UserApiConfig> {
     let http_acceptor =
         AddrIncoming::new(tokio::net::TcpListener::bind(config.http_listen_addr).await?);
     tracing::info!(
@@ -394,13 +433,14 @@ async fn make_user_api_config(config: &Cli) -> anyhow::Result<UserApiConfig> {
         None => None,
     };
 
+    let auth_strategy = make_user_auth_strategy(&config).await?;
+
     Ok(UserApiConfig {
         http_acceptor: Some(http_acceptor),
         hrana_ws_acceptor,
         enable_http_console: config.enable_http_console,
         self_url: config.http_self_url.clone(),
-        http_auth: config.http_auth.clone(),
-        auth_jwt_key,
+        auth_strategy,
     })
 }
 
@@ -518,9 +558,9 @@ async fn shutdown_signal() -> Result<&'static str> {
     Ok(signal)
 }
 
-fn make_meta_store_config(config: &Cli) -> anyhow::Result<Option<MetaStoreConfig>> {
-    if config.backup_meta_store {
-        Ok(Some(MetaStoreConfig {
+fn make_meta_store_config(config: &Cli) -> anyhow::Result<MetaStoreConfig> {
+    let bottomless = if config.backup_meta_store {
+        Some(BottomlessConfig {
             access_key_id: config
                 .meta_store_access_key_id
                 .clone()
@@ -550,10 +590,15 @@ fn make_meta_store_config(config: &Cli) -> anyhow::Result<Option<MetaStoreConfig
                 .meta_store_bucket_endpoint
                 .clone()
                 .context("missing meta store bucket name")?,
-        }))
+        })
     } else {
-        Ok(None)
-    }
+        None
+    };
+
+    Ok(MetaStoreConfig {
+        bottomless,
+        allow_recover_from_fs: config.allow_metastore_recovery,
+    })
 }
 
 async fn build_server(config: &Cli) -> anyhow::Result<Server> {

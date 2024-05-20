@@ -57,6 +57,9 @@ Use ".open FILENAME" to reopen on a persistent database.
 libsql>
 ```
 
+### Docker
+To run libSQL using docker, refer to the [Docker Docs](docs/DOCKER.md)
+
 ## Why a fork?
 
 SQLite has solidified its place in modern technology stacks, embedded in nearly any computing device you can think of. Its open source nature and public domain availability make it a popular choice for modification to meet specific use cases.
@@ -67,7 +70,7 @@ There have been other forks in the past, but they all focus on a specific techni
 
 We want to see a world where everyone can benefit from all of the great ideas and hard work that the SQLite community contributes back to the codebase. Community contributions work well, because we’ve done it before. If this was possible, what do you think SQLite could become?
 
-You can read more about our goals an motivation in our [product vision](https://turso.tech/libsql-manifesto) and our [announcement article](https://glaubercosta-11125.medium.com/sqlite-qemu-all-over-again-aedad19c9a1c)
+You can read more about our goals and motivation in our [product vision](https://turso.tech/libsql-manifesto) and our [announcement article](https://glaubercosta-11125.medium.com/sqlite-qemu-all-over-again-aedad19c9a1c)
 
 ## Compatibility with SQLite
 

@@ -1,10 +1,13 @@
 use std::ffi::{c_int, c_void};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use libsql_sys::wal::wrapper::{WrapWal, WrappedWal};
 use libsql_sys::wal::{BusyHandler, CheckpointCallback, Wal, WalManager};
-use metrics::{histogram, increment_counter};
+use libsql_sys::EncryptionConfig;
+use metrics::histogram;
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::ffi::SQLITE_BUSY;
@@ -12,23 +15,21 @@ use rusqlite::{DatabaseName, ErrorCode, OpenFlags, StatementStatus, TransactionS
 use tokio::sync::{watch, Notify};
 use tokio::time::{Duration, Instant};
 
-use crate::auth::{Authenticated, Authorized, Permission};
+use crate::auth::Permission;
 use crate::connection::TXN_TIMEOUT;
 use crate::error::Error;
 use crate::metrics::{
-    DESCRIBE_COUNT, PROGRAM_EXEC_COUNT, READ_QUERY_COUNT, VACUUM_COUNT, WAL_CHECKPOINT_COUNT,
-    WRITE_QUERY_COUNT, WRITE_TXN_DURATION,
+    DESCRIBE_COUNT, PROGRAM_EXEC_COUNT, VACUUM_COUNT, WAL_CHECKPOINT_COUNT, WRITE_TXN_DURATION,
 };
 use crate::namespace::meta_store::MetaStoreHandle;
-use crate::query::Query;
 use crate::query_analysis::{StmtKind, TxnStatus};
 use crate::query_result_builder::{QueryBuilderConfig, QueryResultBuilder};
 use crate::replication::FrameNo;
-use crate::stats::Stats;
+use crate::stats::{Stats, StatsUpdateMessage};
 use crate::Result;
 
-use super::program::{Cond, DescribeCol, DescribeParam, DescribeResponse};
-use super::{MakeConnection, Program, Step};
+use super::program::{DescribeCol, DescribeParam, DescribeResponse, Vm};
+use super::{MakeConnection, Program, RequestContext};
 
 pub struct MakeLibSqlConn<T: WalManager> {
     db_path: PathBuf,
@@ -44,7 +45,8 @@ pub struct MakeLibSqlConn<T: WalManager> {
     /// In wal mode, closing the last database takes time, and causes other databases creation to
     /// return sqlite busy. To mitigate that, we hold on to one connection
     _db: Option<LibSqlConnection<T::Wal>>,
-    encryption_key: Option<bytes::Bytes>,
+    encryption_config: Option<EncryptionConfig>,
+    block_writes: Arc<AtomicBool>,
 }
 
 impl<T> MakeLibSqlConn<T>
@@ -63,7 +65,8 @@ where
         max_total_response_size: u64,
         auto_checkpoint: u32,
         current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
-        encryption_key: Option<bytes::Bytes>,
+        encryption_config: Option<EncryptionConfig>,
+        block_writes: Arc<AtomicBool>,
     ) -> Result<Self> {
         let mut this = Self {
             db_path,
@@ -77,7 +80,8 @@ where
             _db: None,
             state: Default::default(),
             wal_manager,
-            encryption_key,
+            encryption_config,
+            block_writes,
         };
 
         let db = this.try_create_db().await?;
@@ -126,10 +130,11 @@ where
                 max_size: Some(self.max_response_size),
                 max_total_size: Some(self.max_total_response_size),
                 auto_checkpoint: self.auto_checkpoint,
-                encryption_key: self.encryption_key.clone(),
+                encryption_config: self.encryption_config.clone(),
             },
             self.current_frame_no_receiver.clone(),
             self.state.clone(),
+            self.block_writes.clone(),
         )
         .await
     }
@@ -235,24 +240,17 @@ pub fn open_conn<T>(
     path: &Path,
     wal_manager: T,
     flags: Option<OpenFlags>,
-    encryption_key: Option<bytes::Bytes>,
+    encryption_config: Option<EncryptionConfig>,
 ) -> Result<libsql_sys::Connection<InhibitCheckpoint<T::Wal>>, rusqlite::Error>
 where
     T: WalManager,
 {
-    let flags = flags.unwrap_or(
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    );
-
-    libsql_sys::Connection::open(
-        path.join("data"),
-        flags,
+    open_conn_active_checkpoint(
+        path,
         wal_manager.wrap(InhibitCheckpointWalWrapper::new(false)),
+        flags,
         u32::MAX,
-        encryption_key,
+        encryption_config,
     )
 }
 
@@ -262,7 +260,7 @@ pub fn open_conn_active_checkpoint<T>(
     wal_manager: T,
     flags: Option<OpenFlags>,
     auto_checkpoint: u32,
-    encryption_key: Option<bytes::Bytes>,
+    encryption_config: Option<EncryptionConfig>,
 ) -> Result<libsql_sys::Connection<T::Wal>, rusqlite::Error>
 where
     T: WalManager,
@@ -279,7 +277,7 @@ where
         flags,
         wal_manager,
         auto_checkpoint,
-        encryption_key,
+        encryption_config,
     )
 }
 
@@ -296,11 +294,11 @@ where
         builder_config: QueryBuilderConfig,
         current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
         state: Arc<TxnState<W>>,
+        block_writes: Arc<AtomicBool>,
     ) -> crate::Result<Self>
     where
         T: WalManager<Wal = W> + Send + 'static,
     {
-        let max_db_size = config_store.get().max_db_pages;
         let conn = tokio::task::spawn_blocking(move || -> crate::Result<_> {
             let conn = Connection::new(
                 path.as_ref(),
@@ -311,9 +309,8 @@ where
                 builder_config,
                 current_frame_no_receiver,
                 state,
+                block_writes,
             )?;
-            conn.conn
-                .pragma_update(None, "max_page_count", max_db_size)?;
             let namespace = path
                 .as_ref()
                 .file_name()
@@ -346,6 +343,14 @@ where
             .transaction_state(Some(DatabaseName::Main))?
             .into())
     }
+
+    pub fn with_raw<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut libsql_sys::Connection<W>) -> R,
+    {
+        let mut inner = self.inner.lock();
+        f(&mut inner.conn)
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +365,7 @@ impl LibSqlConnection<libsql_sys::wal::Sqlite3Wal> {
             MetaStoreHandle::new_test(),
             QueryBuilderConfig::default(),
             rcv,
+            Default::default(),
             Default::default(),
         )
         .unwrap();
@@ -380,6 +386,7 @@ struct Connection<T> {
     state: Arc<TxnState<T>>,
     // current txn slot if any
     slot: Option<Arc<TxnSlot<T>>>,
+    block_writes: Arc<AtomicBool>,
 }
 
 impl<T> std::fmt::Debug for Connection<T> {
@@ -542,17 +549,6 @@ unsafe extern "C" fn busy_handler<T: Wal>(state: *mut c_void, retries: c_int) ->
     })
 }
 
-fn value_size(val: &rusqlite::types::ValueRef) -> usize {
-    use rusqlite::types::ValueRef;
-    match val {
-        ValueRef::Null => 0,
-        ValueRef::Integer(_) => 8,
-        ValueRef::Real(_) => 8,
-        ValueRef::Text(s) => s.len(),
-        ValueRef::Blob(b) => b.len(),
-    }
-}
-
 impl From<TransactionState> for TxnStatus {
     fn from(value: TransactionState) -> Self {
         match value {
@@ -561,6 +557,20 @@ impl From<TransactionState> for TxnStatus {
             _ => unreachable!(),
         }
     }
+}
+
+fn update_stats(stats: &Stats, sql: String, stmt: &rusqlite::Statement, elapsed: Duration) {
+    let rows_read = stmt.get_status(StatementStatus::RowsRead) as u64;
+    let rows_written = stmt.get_status(StatementStatus::RowsWritten) as u64;
+    let mem_used = stmt.get_status(StatementStatus::MemUsed) as u64;
+
+    stats.send(StatsUpdateMessage {
+        sql,
+        elapsed,
+        rows_read,
+        rows_written,
+        mem_used,
+    });
 }
 
 impl<W: Wal> Connection<W> {
@@ -573,15 +583,22 @@ impl<W: Wal> Connection<W> {
         builder_config: QueryBuilderConfig,
         current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
         state: Arc<TxnState<W>>,
+        block_writes: Arc<AtomicBool>,
     ) -> Result<Self> {
         let conn = open_conn_active_checkpoint(
             path,
             wal_manager,
             None,
             builder_config.auto_checkpoint,
-            builder_config.encryption_key.clone(),
+            builder_config.encryption_config.clone(),
         )?;
 
+        let config = config_store.get();
+        conn.pragma_update(None, "max_page_count", config.max_db_pages)?;
+        conn.set_limit(
+            rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+            config.max_row_size as i32,
+        );
         // register the lock-stealing busy handler
         unsafe {
             let ptr = Arc::as_ptr(&state) as *mut _;
@@ -596,6 +613,7 @@ impl<W: Wal> Connection<W> {
             current_frame_no_receiver,
             state,
             slot: None,
+            block_writes,
         };
 
         for ext in extensions.iter() {
@@ -605,7 +623,7 @@ impl<W: Wal> Connection<W> {
                     tracing::error!("failed to load extension: {}", ext.display());
                     Err(e)?;
                 }
-                tracing::debug!("Loaded extension {}", ext.display());
+                tracing::trace!("Loaded extension {}", ext.display());
             }
         }
 
@@ -617,22 +635,52 @@ impl<W: Wal> Connection<W> {
         pgm: Program,
         mut builder: B,
     ) -> Result<B> {
-        let txn_timeout = this
-            .lock()
-            .config_store
-            .get()
-            .txn_timeout
-            .unwrap_or(TXN_TIMEOUT);
+        let (config, stats, block_writes, previous_state) = {
+            let lock = this.lock();
+            let config = lock.config_store.get();
+            let stats = lock.stats.clone();
+            let block_writes = lock.block_writes.clone();
+            let previous_state = lock.conn.transaction_state(Some(DatabaseName::Main));
 
-        let mut results = Vec::with_capacity(pgm.steps.len());
+            (config, stats, block_writes, previous_state)
+        };
+
+        let txn_timeout = config.txn_timeout.unwrap_or(TXN_TIMEOUT);
+
         builder.init(&this.lock().builder_config)?;
-        let mut previous_state = this
-            .lock()
-            .conn
-            .transaction_state(Some(DatabaseName::Main))?;
+        let mut previous_state = previous_state?;
+
+        let mut vm = Vm::new(
+            builder,
+            &pgm,
+            move |stmt_kind| {
+                let should_block = match stmt_kind {
+                    StmtKind::Read | StmtKind::TxnBegin => config.block_reads,
+                    StmtKind::Write => {
+                        config.block_reads
+                            || config.block_writes
+                            || block_writes.load(Ordering::SeqCst)
+                    }
+                    StmtKind::DDL => {
+                        config.block_reads || config.block_writes || config.block_ddl()
+                    }
+                    StmtKind::TxnEnd
+                    | StmtKind::Release
+                    | StmtKind::Savepoint
+                    | StmtKind::Detach
+                    | StmtKind::Attach(_) => false,
+                };
+
+                (
+                    should_block,
+                    should_block.then(|| config.block_reason.clone()).flatten(),
+                )
+            },
+            move |sql, stmt, elapsed| update_stats(&stats, sql, stmt, elapsed),
+        );
 
         let mut has_timeout = false;
-        for step in pgm.steps() {
+        while !vm.finished() {
             let mut lock = this.lock();
 
             if !has_timeout {
@@ -652,28 +700,28 @@ impl<W: Wal> Connection<W> {
             // once there was a timeout, invalidate all the program steps
             if has_timeout {
                 lock.slot = None;
-                builder.begin_step()?;
-                builder.step_error(Error::LibSqlTxTimeout)?;
-                builder.finish_step(0, None)?;
+                vm.builder().begin_step()?;
+                vm.builder().step_error(Error::LibSqlTxTimeout)?;
+                vm.builder().finish_step(0, None)?;
+                vm.advance();
                 continue;
             }
 
-            let ret = lock.execute_step(step, &results, &mut builder);
+            let conn = lock.conn.deref();
+            let ret = vm.step(conn);
             // /!\ always make sure that the state is updated before returning
             previous_state = lock.update_state(this.clone(), previous_state, txn_timeout)?;
-            let res = ret?;
-
-            results.push(res);
+            ret?;
         }
 
         {
             let mut lock = this.lock();
             let is_autocommit = lock.conn.is_autocommit();
             let current_fno = *lock.current_frame_no_receiver.borrow_and_update();
-            builder.finish(current_fno, is_autocommit)?;
+            vm.builder().finish(current_fno, is_autocommit)?;
         }
 
-        Ok(builder)
+        Ok(vm.into_builder())
     }
 
     fn update_state(
@@ -723,128 +771,6 @@ impl<W: Wal> Connection<W> {
         Ok(new_state)
     }
 
-    fn execute_step(
-        &mut self,
-        step: &Step,
-        results: &[bool],
-        builder: &mut impl QueryResultBuilder,
-    ) -> Result<bool> {
-        builder.begin_step()?;
-
-        let mut enabled = match step.cond.as_ref() {
-            Some(cond) => match eval_cond(cond, results, self.is_autocommit()) {
-                Ok(enabled) => enabled,
-                Err(e) => {
-                    builder.step_error(e).unwrap();
-                    false
-                }
-            },
-            None => true,
-        };
-
-        let (affected_row_count, last_insert_rowid) = if enabled {
-            match self.execute_query(&step.query, builder) {
-                // builder error interrupt the execution of query. we should exit immediately.
-                Err(e @ Error::BuilderError(_)) => return Err(e),
-                Err(mut e) => {
-                    if let Error::RusqliteError(err) = e {
-                        let extended_code =
-                            unsafe { rusqlite::ffi::sqlite3_extended_errcode(self.conn.handle()) };
-
-                        e = Error::RusqliteErrorExtended(err, extended_code as i32);
-                    };
-
-                    builder.step_error(e)?;
-                    enabled = false;
-                    (0, None)
-                }
-                Ok(x) => x,
-            }
-        } else {
-            (0, None)
-        };
-
-        builder.finish_step(affected_row_count, last_insert_rowid)?;
-
-        Ok(enabled)
-    }
-
-    fn execute_query(
-        &self,
-        query: &Query,
-        builder: &mut impl QueryResultBuilder,
-    ) -> Result<(u64, Option<i64>)> {
-        tracing::trace!("executing query: {}", query.stmt.stmt);
-
-        increment_counter!("libsql_server_libsql_query_execute");
-
-        let start = Instant::now();
-        let config = self.config_store.get();
-
-        let blocked = match query.stmt.kind {
-            StmtKind::Read | StmtKind::TxnBegin | StmtKind::Other => config.block_reads,
-            StmtKind::Write => config.block_reads || config.block_writes,
-            StmtKind::TxnEnd | StmtKind::Release | StmtKind::Savepoint => false,
-        };
-        if blocked {
-            return Err(Error::Blocked(config.block_reason.clone()));
-        }
-
-        let mut stmt = self.conn.prepare(&query.stmt.stmt)?;
-        if stmt.readonly() {
-            READ_QUERY_COUNT.increment(1);
-        } else {
-            WRITE_QUERY_COUNT.increment(1);
-        }
-
-        let cols = stmt.columns();
-        let cols_count = cols.len();
-        builder.cols_description(cols.iter())?;
-        drop(cols);
-
-        query
-            .params
-            .bind(&mut stmt)
-            .map_err(Error::LibSqlInvalidQueryParams)?;
-
-        let mut qresult = stmt.raw_query();
-
-        let mut values_total_bytes = 0;
-        builder.begin_rows()?;
-        while let Some(row) = qresult.next()? {
-            builder.begin_row()?;
-            for i in 0..cols_count {
-                let val = row.get_ref(i)?;
-                values_total_bytes += value_size(&val);
-                builder.add_row_value(val)?;
-            }
-            builder.finish_row()?;
-        }
-        histogram!("libsql_server_returned_bytes", values_total_bytes as f64);
-
-        builder.finish_rows()?;
-
-        // sqlite3_changes() is only modified for INSERT, UPDATE or DELETE; it is not reset for SELECT,
-        // but we want to return 0 in that case.
-        let affected_row_count = match query.stmt.is_iud {
-            true => self.conn.changes(),
-            false => 0,
-        };
-
-        // sqlite3_last_insert_rowid() only makes sense for INSERTs into a rowid table. we can't detect
-        // a rowid table, but at least we can detect an INSERT
-        let last_insert_rowid = match query.stmt.is_insert {
-            true => Some(self.conn.last_insert_rowid()),
-            false => None,
-        };
-
-        drop(qresult);
-
-        self.update_stats(query.stmt.stmt.clone(), &stmt, Instant::now() - start);
-
-        Ok((affected_row_count, last_insert_rowid))
-    }
-
     fn rollback(&self) {
         if let Err(e) = self.conn.execute("ROLLBACK", ()) {
             tracing::error!("failed to rollback: {e}");
@@ -872,56 +798,10 @@ impl<W: Wal> Connection<W> {
             tracing::info!("Vacuuming: pages={page_count} freelist={freelist_count}");
             self.conn.execute("VACUUM", ())?;
         } else {
-            tracing::debug!("Not vacuuming: pages={page_count} freelist={freelist_count}");
+            tracing::trace!("Not vacuuming: pages={page_count} freelist={freelist_count}");
         }
         VACUUM_COUNT.increment(1);
         Ok(())
-    }
-
-    fn update_stats(&self, sql: String, stmt: &rusqlite::Statement, elapsed: Duration) {
-        histogram!("libsql_server_statement_execution_time", elapsed);
-        let elapsed = elapsed.as_millis() as u64;
-        let rows_read = stmt.get_status(StatementStatus::RowsRead) as u64;
-        let rows_written = stmt.get_status(StatementStatus::RowsWritten) as u64;
-
-        if rows_read >= 10_000 || rows_written >= 1_000 {
-            tracing::info!(
-                "high read ({}) or write ({}) query: {}",
-                rows_read,
-                rows_written,
-                sql
-            );
-        }
-
-        let mem_used = stmt.get_status(StatementStatus::MemUsed) as u64;
-        histogram!("libsql_server_statement_mem_used_bytes", mem_used as f64);
-        let rows_read = if rows_read == 0 && rows_written == 0 {
-            1
-        } else {
-            rows_read
-        };
-        self.stats.inc_rows_read(rows_read);
-        self.stats.inc_rows_written(rows_written);
-        let weight = rows_read + rows_written;
-        if self.stats.qualifies_as_top_query(weight) {
-            self.stats.add_top_query(crate::stats::TopQuery::new(
-                sql.clone(),
-                rows_read,
-                rows_written,
-            ));
-        }
-        if self.stats.qualifies_as_slowest_query(elapsed) {
-            self.stats
-                .add_slowest_query(crate::stats::SlowestQuery::new(
-                    sql.clone(),
-                    elapsed,
-                    rows_read,
-                    rows_written,
-                ));
-        }
-
-        self.stats
-            .update_query_metrics(rows_read, rows_written, mem_used, elapsed)
     }
 
     fn describe(&self, sql: &str) -> crate::Result<DescribeResponse> {
@@ -959,62 +839,37 @@ impl<W: Wal> Connection<W> {
     }
 }
 
-fn eval_cond(cond: &Cond, results: &[bool], is_autocommit: bool) -> Result<bool> {
-    let get_step_res = |step: usize| -> Result<bool> {
-        let res = results.get(step).ok_or(Error::InvalidBatchStep(step))?;
-        Ok(*res)
-    };
-
-    Ok(match cond {
-        Cond::Ok { step } => get_step_res(*step)?,
-        Cond::Err { step } => !get_step_res(*step)?,
-        Cond::Not { cond } => !eval_cond(cond, results, is_autocommit)?,
-        Cond::And { conds } => conds.iter().try_fold(true, |x, cond| {
-            eval_cond(cond, results, is_autocommit).map(|y| x & y)
-        })?,
-        Cond::Or { conds } => conds.iter().try_fold(false, |x, cond| {
-            eval_cond(cond, results, is_autocommit).map(|y| x | y)
-        })?,
-        Cond::IsAutocommit => is_autocommit,
-    })
-}
-
-fn check_program_auth(auth: Authenticated, pgm: &Program) -> Result<()> {
+fn check_program_auth(ctx: &RequestContext, pgm: &Program) -> Result<()> {
     for step in pgm.steps() {
-        let query = &step.query;
-        match (query.stmt.kind, &auth) {
-            (_, Authenticated::Anonymous) => {
-                return Err(Error::NotAuthorized(
-                    "anonymous access not allowed".to_string(),
-                ));
+        match step.query.stmt.kind {
+            StmtKind::TxnBegin
+            | StmtKind::TxnEnd
+            | StmtKind::Read
+            | StmtKind::Savepoint
+            | StmtKind::Release => {
+                ctx.auth.has_right(&ctx.namespace, Permission::Read)?;
             }
-            (StmtKind::Read, Authenticated::Authorized(_)) => (),
-            (StmtKind::TxnBegin, _) | (StmtKind::TxnEnd, _) => (),
-            (
-                _,
-                Authenticated::Authorized(Authorized {
-                    permission: Permission::FullAccess,
-                    ..
-                }),
-            ) => (),
-            _ => {
-                return Err(Error::NotAuthorized(format!(
-                    "Current session is not authorized to run: {}",
-                    query.stmt.stmt
-                )));
+            StmtKind::DDL | StmtKind::Write => {
+                ctx.auth.has_right(&ctx.namespace, Permission::Write)?;
             }
+            StmtKind::Attach(ref ns) => {
+                ctx.auth.has_right(ns, Permission::AttachRead)?;
+                if !ctx.meta_store.handle(ns.clone()).get().allow_attach {
+                    return Err(Error::NotAuthorized(format!(
+                        "Namespace `{ns}` doesn't allow attach"
+                    )));
+                }
+            }
+            StmtKind::Detach => (),
         }
     }
+
     Ok(())
 }
 
-fn check_describe_auth(auth: Authenticated) -> Result<()> {
-    match auth {
-        Authenticated::Anonymous => {
-            Err(Error::NotAuthorized("anonymous access not allowed".into()))
-        }
-        Authenticated::Authorized(_) => Ok(()),
-    }
+fn check_describe_auth(ctx: RequestContext) -> Result<()> {
+    ctx.auth().has_right(ctx.namespace(), Permission::Read)?;
+    Ok(())
 }
 
 /// We use a different runtime to run the connection, because long running tasks block turmoil
@@ -1033,13 +888,13 @@ where
     async fn execute_program<B: QueryResultBuilder>(
         &self,
         pgm: Program,
-        auth: Authenticated,
+        ctx: RequestContext,
         builder: B,
         _replication_index: Option<FrameNo>,
     ) -> Result<B> {
         PROGRAM_EXEC_COUNT.increment(1);
 
-        check_program_auth(auth, &pgm)?;
+        check_program_auth(&ctx, &pgm)?;
         let conn = self.inner.clone();
         CONN_RT
             .spawn_blocking(move || Connection::run(conn, pgm, builder))
@@ -1050,11 +905,11 @@ where
     async fn describe(
         &self,
         sql: String,
-        auth: Authenticated,
+        ctx: RequestContext,
         _replication_index: Option<FrameNo>,
     ) -> Result<crate::Result<DescribeResponse>> {
         DESCRIBE_COUNT.increment(1);
-        check_describe_auth(auth)?;
+        check_describe_auth(ctx)?;
         let conn = self.inner.clone();
         let res = tokio::task::spawn_blocking(move || conn.lock().describe(&sql))
             .await
@@ -1102,7 +957,10 @@ mod test {
     use tempfile::tempdir;
     use tokio::task::JoinSet;
 
+    use crate::auth::Authenticated;
     use crate::connection::Connection as _;
+    use crate::namespace::meta_store::{metastore_connection_maker, MetaStore};
+    use crate::namespace::NamespaceName;
     use crate::query_result_builder::test::{test_driver, TestBuilder};
     use crate::query_result_builder::QueryResultBuilder;
     use crate::DEFAULT_AUTO_CHECKPOINT;
@@ -1118,6 +976,7 @@ mod test {
             current_frame_no_receiver: watch::channel(None).1,
             state: Default::default(),
             slot: None,
+            block_writes: Default::default(),
         };
 
         let conn = Arc::new(Mutex::new(conn));
@@ -1152,6 +1011,7 @@ mod test {
             DEFAULT_AUTO_CHECKPOINT,
             watch::channel(None).1,
             None,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -1194,6 +1054,7 @@ mod test {
             DEFAULT_AUTO_CHECKPOINT,
             watch::channel(None).1,
             None,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -1241,6 +1102,7 @@ mod test {
             DEFAULT_AUTO_CHECKPOINT,
             watch::channel(None).1,
             None,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -1320,31 +1182,36 @@ mod test {
             DEFAULT_AUTO_CHECKPOINT,
             watch::channel(None).1,
             None,
+            Default::default(),
         )
         .await
         .unwrap();
-        let auth = Authenticated::Authorized(Authorized {
-            namespace: None,
-            permission: Permission::FullAccess,
-        });
 
         let conn = make_conn.make_connection().await.unwrap();
+        let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let ctx = RequestContext::new(
+            Authenticated::FullAccess,
+            NamespaceName::default(),
+            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
+                .await
+                .unwrap(),
+        );
         conn.execute_program(
             Program::seq(&["CREATE TABLE test (x)"]),
-            auth.clone(),
+            ctx.clone(),
             TestBuilder::default(),
             None,
         )
         .await
         .unwrap();
         let run_conn = |maker: Arc<MakeLibSqlConn<Sqlite3WalManager>>| {
-            let auth = auth.clone();
+            let ctx = ctx.clone();
             async move {
                 for _ in 0..1000 {
                     let conn = maker.make_connection().await.unwrap();
                     let pgm = Program::seq(&["BEGIN IMMEDIATE", "INSERT INTO test VALUES (42)"]);
                     let res = conn
-                        .execute_program(pgm, auth.clone(), TestBuilder::default(), None)
+                        .execute_program(pgm, ctx.clone(), TestBuilder::default(), None)
                         .await
                         .unwrap()
                         .into_ret();
@@ -1355,7 +1222,7 @@ mod test {
                     if rand::thread_rng().gen_range(0..100) > 1 {
                         let pgm = Program::seq(&["INSERT INTO test VALUES (43)", "COMMIT"]);
                         let res = conn
-                            .execute_program(pgm, auth.clone(), TestBuilder::default(), None)
+                            .execute_program(pgm, ctx.clone(), TestBuilder::default(), None)
                             .await
                             .unwrap()
                             .into_ret();

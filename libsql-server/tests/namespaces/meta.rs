@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use libsql::Database;
 use serde_json::json;
 use tempfile::tempdir;
@@ -9,7 +11,9 @@ use super::make_primary;
 
 #[test]
 fn replicated_config() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     crate::cluster::make_cluster(&mut sim, 1, false);
 
@@ -65,7 +69,9 @@ fn replicated_config() {
 
 #[test]
 fn meta_store() {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
     let tmp = tempdir().unwrap();
     make_primary(&mut sim, tmp.path().to_path_buf());
 
@@ -135,6 +141,82 @@ fn meta_store() {
             let foo_conn = foo.connect()?;
 
             foo_conn.execute("select 1", ()).await.unwrap();
+        }
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn meta_attach() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+
+        // STEP 1: create namespace and check that it can be read from
+        client
+            .post(
+                "http://primary:9090/v1/namespaces/foo/create",
+                json!({
+                    "max_db_size": "5mb"
+                }),
+            )
+            .await?;
+
+        {
+            let foo = Database::open_remote_with_connector(
+                "http://foo.primary:8080",
+                "",
+                TurmoilConnector,
+            )?;
+            let foo_conn = foo.connect()?;
+
+            foo_conn.execute("select 1", ()).await.unwrap();
+        }
+
+        // STEP 2: try attaching a database
+        {
+            let foo = Database::open_remote_with_connector(
+                "http://foo.primary:8080",
+                "",
+                TurmoilConnector,
+            )?;
+            let foo_conn = foo.connect()?;
+
+            foo_conn.execute("attach foo as foo", ()).await.unwrap_err();
+        }
+
+        // STEP 3: update config to allow attaching databases
+        client
+            .post(
+                "http://primary:9090/v1/namespaces/foo/config",
+                json!({
+                    "block_reads": false,
+                    "block_writes": false,
+                    "allow_attach": true,
+                }),
+            )
+            .await?;
+
+        {
+            let foo = Database::open_remote_with_connector(
+                "http://foo.primary:8080",
+                "",
+                TurmoilConnector,
+            )?;
+            let foo_conn = foo.connect()?;
+
+            foo_conn
+                .execute_batch("attach foo as foo; select * from foo.sqlite_master")
+                .await
+                .unwrap();
         }
 
         Ok(())

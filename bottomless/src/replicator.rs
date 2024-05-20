@@ -1,4 +1,5 @@
 use crate::backup::WalCopier;
+use crate::completion_progress::{CompletionProgress, SavepointTracker};
 use crate::read::BatchReader;
 use crate::uuid_utils::decode_unix_timestamp;
 use crate::wal::WalFileReader;
@@ -15,13 +16,16 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
 use bytes::{Buf, Bytes};
 use chrono::{NaiveDateTime, TimeZone, Utc};
+use libsql_sys::{Cipher, EncryptionConfig};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::Duration;
@@ -59,10 +63,12 @@ pub struct Replicator {
     pub db_name: String,
 
     use_compression: CompressionKind,
-    encryption_key: Option<Bytes>,
+    encryption_config: Option<EncryptionConfig>,
     max_frames_per_batch: usize,
     s3_upload_max_parallelism: usize,
     join_set: JoinSet<()>,
+    upload_progress: Arc<Mutex<CompletionProgress>>,
+    last_uploaded_frame_no: Receiver<u32>,
 }
 
 #[derive(Debug)]
@@ -85,7 +91,7 @@ pub struct Options {
     pub verify_crc: bool,
     /// Kind of compression algorithm used on the WAL frames to be sent to S3.
     pub use_compression: CompressionKind,
-    pub encryption_key: Option<Bytes>,
+    pub encryption_config: Option<EncryptionConfig>,
     pub aws_endpoint: Option<String>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
@@ -181,6 +187,7 @@ impl Options {
         let use_compression =
             CompressionKind::parse(&env_var_or("LIBSQL_BOTTOMLESS_COMPRESSION", "zstd"))
                 .map_err(|e| anyhow!("unknown compression kind: {}", e))?;
+        let encryption_cipher = env_var("LIBSQL_BOTTOMLESS_ENCRYPTION_CIPHER").ok();
         let encryption_key = env_var("LIBSQL_BOTTOMLESS_ENCRYPTION_KEY")
             .map(Bytes::from)
             .ok();
@@ -196,12 +203,20 @@ impl Options {
             ),
         };
         let s3_max_retries = env_var_or("LIBSQL_BOTTOMLESS_S3_MAX_RETRIES", 10).parse::<u32>()?;
+        let cipher = match encryption_cipher {
+            Some(cipher) => Cipher::from_str(&cipher)?,
+            None => Cipher::default(),
+        };
+        let encryption_config = match encryption_key {
+            Some(key) => Some(EncryptionConfig::new(cipher, key)),
+            None => None,
+        };
         Ok(Options {
             db_id,
             create_bucket_if_not_exists: true,
             verify_crc,
             use_compression,
-            encryption_key,
+            encryption_config,
             max_batch_interval,
             max_frames_per_batch,
             s3_upload_max_parallelism,
@@ -306,27 +321,31 @@ impl Replicator {
             })
         };
 
+        let (upload_progress, last_uploaded_frame_no) = CompletionProgress::new(0);
+        let upload_progress = Arc::new(Mutex::new(upload_progress));
         let _s3_upload = {
             let client = client.clone();
             let bucket = options.bucket_name.clone();
             let max_parallelism = options.s3_upload_max_parallelism;
+            let upload_progress = upload_progress.clone();
             join_set.spawn(async move {
                 let sem = Arc::new(tokio::sync::Semaphore::new(max_parallelism));
                 let mut join_set = JoinSet::new();
-                while let Some(fdesc) = frames_inbox.recv().await {
-                    tracing::trace!("Received S3 upload request: {}", fdesc);
+                while let Some(req) = frames_inbox.recv().await {
+                    tracing::trace!("Received S3 upload request: {}", req.path);
                     let start = Instant::now();
                     let sem = sem.clone();
                     let permit = sem.acquire_owned().await.unwrap();
                     let client = client.clone();
                     let bucket = bucket.clone();
+                    let upload_progress = upload_progress.clone();
                     join_set.spawn(async move {
-                        let fpath = format!("{}/{}", bucket, fdesc);
+                        let fpath = format!("{}/{}", bucket, req.path);
                         let body = ByteStream::from_path(&fpath).await.unwrap();
                         if let Err(e) = client
                             .put_object()
                             .bucket(bucket)
-                            .key(fdesc)
+                            .key(req.path)
                             .body(body)
                             .send()
                             .await
@@ -337,9 +356,15 @@ impl Replicator {
                             let elapsed = Instant::now() - start;
                             tracing::debug!("Uploaded to S3: {} in {:?}", fpath, elapsed);
                         }
+                        if let Some(frames) = req.frames {
+                            let mut up = upload_progress.lock().await;
+                            up.update(*frames.start(), *frames.end());
+                        }
                         drop(permit);
                     });
                 }
+
+                while join_set.join_next().await.is_some() {}
             })
         };
         let (snapshot_notifier, snapshot_waiter) = channel(Ok(None));
@@ -358,10 +383,12 @@ impl Replicator {
             snapshot_waiter,
             snapshot_notifier: Arc::new(snapshot_notifier),
             use_compression: options.use_compression,
-            encryption_key: options.encryption_key,
+            encryption_config: options.encryption_config,
             max_frames_per_batch: options.max_frames_per_batch,
             s3_upload_max_parallelism: options.s3_upload_max_parallelism,
             join_set,
+            upload_progress,
+            last_uploaded_frame_no,
         })
     }
 
@@ -451,6 +478,24 @@ impl Replicator {
         } else {
             Ok(false)
         }
+    }
+
+    async fn reset_wal_tracker(&self) {
+        let mut lock = self.upload_progress.lock().await;
+        lock.reset();
+    }
+
+    pub fn savepoint(&self) -> SavepointTracker {
+        if let Some(tx) = &self.flush_trigger {
+            let _ = tx.send(());
+        }
+        SavepointTracker::new(
+            self.generation.clone(),
+            self.snapshot_waiter.clone(),
+            self.next_frame_no.clone(),
+            self.last_uploaded_frame_no.clone(),
+            self.db_path.clone(),
+        )
     }
 
     /// Waits until the commit for a given frame_no or higher was given.
@@ -543,7 +588,8 @@ impl Replicator {
     }
 
     // Starts a new generation for this replicator instance
-    pub fn new_generation(&mut self) -> Option<Uuid> {
+    pub async fn new_generation(&mut self) -> Option<Uuid> {
+        self.reset_wal_tracker().await;
         let curr = Self::generate_generation();
         let prev = self.set_generation(curr);
         if let Some(prev) = prev {
@@ -697,13 +743,17 @@ impl Replicator {
             flags,
             Sqlite3WalManager::new(),
             libsql_sys::connection::NO_AUTOCHECKPOINT, // no checkpointing
-            self.encryption_key.clone(),
+            self.encryption_config.clone(),
         )?;
         Ok(conn)
     }
 
     // Tries to read the local change counter from the given database file
     fn read_change_counter(&self) -> Result<[u8; 4]> {
+        if !<str as AsRef<Path>>::as_ref(self.db_path.as_str()).try_exists()? {
+            return Ok([0; 4]);
+        }
+
         let conn = self.open_db()?;
         let change_counter = conn.db_change_counter().map_err(|rc| {
             anyhow::anyhow!(
@@ -1194,6 +1244,10 @@ impl Replicator {
         }
 
         db.shutdown().await?;
+        {
+            let mut guard = self.upload_progress.lock().await;
+            guard.update(1, last_frame);
+        }
 
         if applied_wal_frame {
             tracing::info!("WAL file has been applied onto database file in generation {}. Requesting snapshot.", generation);
@@ -1323,12 +1377,12 @@ impl Replicator {
         utc_time: Option<NaiveDateTime>,
         db_path: &Path,
     ) -> Result<bool> {
-        let encryption_key = self.encryption_key.clone();
+        let encryption_config = self.encryption_config.clone();
         let mut injector = libsql_replication::injector::Injector::new(
             db_path,
             4096,
             libsql_sys::connection::NO_AUTOCHECKPOINT,
-            encryption_key,
+            encryption_config,
         )?;
         let prefix = format!("{}-{}/", self.db_name, generation);
         let mut page_buf = {

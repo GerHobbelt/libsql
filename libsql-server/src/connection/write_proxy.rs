@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use futures_core::future::BoxFuture;
@@ -7,21 +8,18 @@ use libsql_replication::rpc::proxy::proxy_client::ProxyClient;
 use libsql_replication::rpc::proxy::{
     exec_req, exec_resp, ExecReq, ExecResp, StreamDescribeReq, StreamProgramReq,
 };
-use libsql_replication::rpc::replication::NAMESPACE_METADATA_KEY;
 use libsql_sys::wal::{Sqlite3Wal, Sqlite3WalManager};
+use libsql_sys::EncryptionConfig;
 use parking_lot::Mutex as PMutex;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_stream::StreamExt;
-use tonic::metadata::BinaryMetadataValue;
 use tonic::transport::Channel;
 use tonic::{Request, Streaming};
 
-use crate::auth::Authenticated;
 use crate::connection::program::{DescribeCol, DescribeParam};
 use crate::error::Error;
 use crate::metrics::{REPLICA_LOCAL_EXEC_MISPREDICT, REPLICA_LOCAL_PROGRAM_EXEC};
 use crate::namespace::meta_store::MetaStoreHandle;
-use crate::namespace::NamespaceName;
 use crate::query_analysis::TxnStatus;
 use crate::query_result_builder::{QueryBuilderConfig, QueryResultBuilder};
 use crate::replication::FrameNo;
@@ -30,7 +28,7 @@ use crate::{Result, DEFAULT_AUTO_CHECKPOINT};
 
 use super::libsql::{LibSqlConnection, MakeLibSqlConn};
 use super::program::DescribeResponse;
-use super::Connection;
+use super::{Connection, RequestContext};
 use super::{MakeConnection, Program};
 
 pub type RpcStream = Streaming<ExecResp>;
@@ -41,10 +39,9 @@ pub struct MakeWriteProxyConn {
     applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
     max_response_size: u64,
     max_total_response_size: u64,
-    namespace: NamespaceName,
     primary_replication_index: Option<FrameNo>,
     make_read_only_conn: MakeLibSqlConn<Sqlite3WalManager>,
-    encryption_key: Option<bytes::Bytes>,
+    encryption_config: Option<EncryptionConfig>,
 }
 
 impl MakeWriteProxyConn {
@@ -59,9 +56,8 @@ impl MakeWriteProxyConn {
         applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
         max_response_size: u64,
         max_total_response_size: u64,
-        namespace: NamespaceName,
         primary_replication_index: Option<FrameNo>,
-        encryption_key: Option<bytes::Bytes>,
+        encryption_config: Option<EncryptionConfig>,
     ) -> crate::Result<Self> {
         let client = ProxyClient::with_origin(channel, uri);
         let make_read_only_conn = MakeLibSqlConn::new(
@@ -74,7 +70,8 @@ impl MakeWriteProxyConn {
             max_total_response_size,
             DEFAULT_AUTO_CHECKPOINT,
             applied_frame_no_receiver.clone(),
-            encryption_key.clone(),
+            encryption_config.clone(),
+            Arc::new(AtomicBool::new(false)), // this is always false for write proxy
         )
         .await?;
 
@@ -84,10 +81,9 @@ impl MakeWriteProxyConn {
             applied_frame_no_receiver,
             max_response_size,
             max_total_response_size,
-            namespace,
             make_read_only_conn,
             primary_replication_index,
-            encryption_key,
+            encryption_config,
         })
     }
 }
@@ -104,9 +100,8 @@ impl MakeConnection for MakeWriteProxyConn {
                 max_size: Some(self.max_response_size),
                 max_total_size: Some(self.max_total_response_size),
                 auto_checkpoint: DEFAULT_AUTO_CHECKPOINT,
-                encryption_key: self.encryption_key.clone(),
+                encryption_config: self.encryption_config.clone(),
             },
-            self.namespace.clone(),
             self.primary_replication_index,
             self.make_read_only_conn.create().await?,
         )?)
@@ -126,7 +121,6 @@ pub struct WriteProxyConnection<R> {
     applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
     builder_config: QueryBuilderConfig,
     stats: Arc<Stats>,
-    namespace: NamespaceName,
 
     remote_conn: Mutex<Option<RemoteConnection<R>>>,
     /// the primary replication index when the namespace was loaded
@@ -140,7 +134,6 @@ impl WriteProxyConnection<RpcStream> {
         stats: Arc<Stats>,
         applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
         builder_config: QueryBuilderConfig,
-        namespace: NamespaceName,
         primary_replication_index: Option<u64>,
         read_conn: LibSqlConnection<Sqlite3Wal>,
     ) -> Result<Self> {
@@ -152,7 +145,6 @@ impl WriteProxyConnection<RpcStream> {
             applied_frame_no_receiver,
             builder_config,
             stats,
-            namespace,
             remote_conn: Default::default(),
             primary_replication_index,
         })
@@ -160,7 +152,7 @@ impl WriteProxyConnection<RpcStream> {
 
     async fn with_remote_conn<F, Ret>(
         &self,
-        auth: Authenticated,
+        ctx: RequestContext,
         builder_config: QueryBuilderConfig,
         cb: F,
     ) -> crate::Result<Ret>
@@ -171,13 +163,8 @@ impl WriteProxyConnection<RpcStream> {
         if remote_conn.is_some() {
             cb(remote_conn.as_mut().unwrap()).await
         } else {
-            let conn = RemoteConnection::connect(
-                self.write_proxy.clone(),
-                self.namespace.clone(),
-                auth,
-                builder_config,
-            )
-            .await?;
+            let conn =
+                RemoteConnection::connect(self.write_proxy.clone(), ctx, builder_config).await?;
             let conn = remote_conn.insert(conn);
             cb(conn).await
         }
@@ -187,13 +174,13 @@ impl WriteProxyConnection<RpcStream> {
         &self,
         pgm: Program,
         status: &mut TxnStatus,
-        auth: Authenticated,
+        ctx: RequestContext,
         builder: B,
     ) -> Result<B> {
         self.stats.inc_write_requests_delegated();
         *status = TxnStatus::Invalid;
         let res = self
-            .with_remote_conn(auth, self.builder_config.clone(), |conn| {
+            .with_remote_conn(ctx, self.builder_config.clone(), |conn| {
                 Box::pin(conn.execute(pgm, builder))
             })
             .await;
@@ -277,18 +264,14 @@ struct RemoteConnection<R = Streaming<ExecResp>> {
 impl RemoteConnection {
     async fn connect(
         mut client: ProxyClient<Channel>,
-        namespace: NamespaceName,
-        auth: Authenticated,
+        ctx: RequestContext,
         builder_config: QueryBuilderConfig,
     ) -> crate::Result<Self> {
         let (request_sender, receiver) = mpsc::channel(1);
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(receiver);
         let mut req = Request::new(stream);
-        let namespace = BinaryMetadataValue::from_bytes(namespace.as_slice());
-        req.metadata_mut()
-            .insert_bin(NAMESPACE_METADATA_KEY, namespace);
-        auth.upgrade_grpc_request(&mut req);
+        ctx.upgrade_grpc_request(&mut req);
         let response_stream = client.stream_exec(req).await?.into_inner();
 
         Ok(Self {
@@ -460,14 +443,14 @@ impl Connection for WriteProxyConnection<RpcStream> {
     async fn execute_program<B: QueryResultBuilder>(
         &self,
         pgm: Program,
-        auth: Authenticated,
+        ctx: RequestContext,
         builder: B,
         replication_index: Option<FrameNo>,
     ) -> Result<B> {
         let mut state = self.state.lock().await;
 
         if self.should_proxy() {
-            self.execute_remote(pgm, &mut state, auth, builder).await
+            self.execute_remote(pgm, &mut state, ctx, builder).await
         } else if *state == TxnStatus::Init && pgm.is_read_only() {
             // set the state to invalid before doing anything, and set it to a valid state after.
             *state = TxnStatus::Invalid;
@@ -477,31 +460,31 @@ impl Connection for WriteProxyConnection<RpcStream> {
             // transaction, so we rollback the replica, and execute again on the primary.
             let builder = self
                 .read_conn
-                .execute_program(pgm.clone(), auth.clone(), builder, replication_index)
+                .execute_program(pgm.clone(), ctx.clone(), builder, replication_index)
                 .await?;
             let new_state = self.read_conn.txn_status()?;
             if new_state != TxnStatus::Init {
                 REPLICA_LOCAL_EXEC_MISPREDICT.increment(1);
-                self.read_conn.rollback(auth.clone()).await?;
-                self.execute_remote(pgm, &mut state, auth, builder).await
+                self.read_conn.rollback(ctx.clone()).await?;
+                self.execute_remote(pgm, &mut state, ctx, builder).await
             } else {
                 REPLICA_LOCAL_PROGRAM_EXEC.increment(1);
                 *state = new_state;
                 Ok(builder)
             }
         } else {
-            self.execute_remote(pgm, &mut state, auth, builder).await
+            self.execute_remote(pgm, &mut state, ctx, builder).await
         }
     }
 
     async fn describe(
         &self,
         sql: String,
-        auth: Authenticated,
+        ctx: RequestContext,
         replication_index: Option<FrameNo>,
     ) -> Result<Result<DescribeResponse>> {
         self.wait_replication_sync(replication_index).await?;
-        self.read_conn.describe(sql, auth, replication_index).await
+        self.read_conn.describe(sql, ctx, replication_index).await
     }
 
     async fn is_autocommit(&self) -> Result<bool> {

@@ -17,6 +17,10 @@ use libsql_server::config::{AdminApiConfig, UserApiConfig};
 
 use common::net::{init_tracing, TestServer, TurmoilConnector};
 
+mod attach;
+mod auth;
+mod utils;
+
 async fn make_standalone_server() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let tmp = tempdir()?;
@@ -26,6 +30,12 @@ async fn make_standalone_server() -> Result<(), Box<dyn std::error::Error>> {
             hrana_ws_acceptor: None,
             ..Default::default()
         },
+        admin_api_config: Some(AdminApiConfig {
+            acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
+            connector: TurmoilConnector,
+            disable_metrics: true,
+        }),
+        disable_namespaces: false,
         ..Default::default()
     };
 
@@ -36,7 +46,9 @@ async fn make_standalone_server() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn basic_query() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
 
@@ -62,7 +74,9 @@ fn basic_query() {
 
 #[test]
 fn basic_metrics() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
 
@@ -104,7 +118,9 @@ fn basic_metrics() {
 
 #[test]
 fn primary_serializability() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
     let notify = Arc::new(Notify::new());
@@ -149,7 +165,9 @@ fn primary_serializability() {
 #[test]
 #[ignore = "transaction not yet implemented with the libsql client."]
 fn execute_transaction() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
     let notify = Arc::new(Notify::new());
@@ -219,7 +237,9 @@ fn execute_transaction() {
 
 #[test]
 fn basic_query_fail() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
 
@@ -245,7 +265,9 @@ fn basic_query_fail() {
 
 #[test]
 fn begin_commit() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
 
@@ -281,7 +303,9 @@ fn begin_commit() {
 }
 #[test]
 fn begin_rollback() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
 
@@ -318,7 +342,9 @@ fn begin_rollback() {
 
 #[test]
 fn is_autocommit() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
 
@@ -361,7 +387,9 @@ fn is_autocommit() {
 
 #[test]
 fn random_rowid() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", make_standalone_server);
 
@@ -383,7 +411,9 @@ fn random_rowid() {
 
 #[test]
 fn dirty_startup_dont_prevent_namespace_creation() {
-    let mut sim = turmoil::Builder::new().build();
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
 
     sim.host("primary", || async {
         init_tracing();

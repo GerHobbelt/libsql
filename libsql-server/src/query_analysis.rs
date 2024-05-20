@@ -2,17 +2,21 @@ use std::borrow::Cow;
 
 use anyhow::Result;
 use fallible_iterator::FallibleIterator;
-use sqlite3_parser::ast::{Cmd, PragmaBody, QualifiedName, Stmt};
+use sqlite3_parser::ast::{Cmd, Expr, Id, PragmaBody, QualifiedName, Stmt};
 use sqlite3_parser::lexer::sql::{Parser, ParserError};
 
+use crate::namespace::NamespaceName;
+
 /// A group of statements to be executed together.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Statement {
     pub stmt: String,
     pub kind: StmtKind,
     /// Is the statement an INSERT, UPDATE or DELETE?
     pub is_iud: bool,
     pub is_insert: bool,
+    // Optional id and alias associated with the statement (used for attach/detach)
+    pub attach_info: Option<(String, String)>,
 }
 
 impl Default for Statement {
@@ -22,7 +26,7 @@ impl Default for Statement {
 }
 
 /// Classify statement in categories of interest.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum StmtKind {
     /// The beginning of a transaction
     TxnBegin,
@@ -32,7 +36,9 @@ pub enum StmtKind {
     Write,
     Savepoint,
     Release,
-    Other,
+    Attach(NamespaceName),
+    Detach,
+    DDL,
 }
 
 fn is_temp(name: &QualifiedName) -> bool {
@@ -48,12 +54,16 @@ fn write_if_not_reserved(name: &QualifiedName) -> Option<StmtKind> {
     (!is_reserved_tbl(name)).then_some(StmtKind::Write)
 }
 
+fn ddl_if_not_reserved(name: &QualifiedName) -> Option<StmtKind> {
+    (!is_reserved_tbl(name)).then_some(StmtKind::DDL)
+}
+
 impl StmtKind {
     fn kind(cmd: &Cmd) -> Option<Self> {
         match cmd {
             Cmd::Explain(Stmt::Pragma(name, body)) => Self::pragma_kind(name, body.as_ref()),
-            Cmd::Explain(_) => Some(Self::Other),
-            Cmd::ExplainQueryPlan(_) => Some(Self::Other),
+            Cmd::Explain(_) => Some(Self::Read),
+            Cmd::ExplainQueryPlan(_) => Some(Self::Read),
             Cmd::Stmt(Stmt::Begin { .. }) => Some(Self::TxnBegin),
             Cmd::Stmt(
                 Stmt::Commit { .. }
@@ -69,7 +79,7 @@ impl StmtKind {
                     temporary: false,
                     ..
                 },
-            ) if !is_temp(tbl_name) => Some(Self::Write),
+            ) if !is_temp(tbl_name) => Some(Self::DDL),
             Cmd::Stmt(
                 Stmt::Insert {
                     with: _,
@@ -91,8 +101,8 @@ impl StmtKind {
             Cmd::Stmt(Stmt::DropTable {
                 if_exists: _,
                 tbl_name,
-            }) => write_if_not_reserved(tbl_name),
-            Cmd::Stmt(Stmt::AlterTable(tbl_name, _)) => write_if_not_reserved(tbl_name),
+            }) => ddl_if_not_reserved(tbl_name),
+            Cmd::Stmt(Stmt::AlterTable(tbl_name, _)) => ddl_if_not_reserved(tbl_name),
             Cmd::Stmt(
                 Stmt::DropIndex { .. }
                 | Stmt::DropTrigger { .. }
@@ -100,21 +110,35 @@ impl StmtKind {
                     temporary: false, ..
                 }
                 | Stmt::CreateIndex { .. },
-            ) => Some(Self::Write),
+            ) => Some(Self::DDL),
             Cmd::Stmt(Stmt::Select { .. }) => Some(Self::Read),
             Cmd::Stmt(Stmt::Pragma(name, body)) => Self::pragma_kind(name, body.as_ref()),
             // Creating regular views is OK, temporary views are bound to a connection
             // and thus disallowed in sqld.
             Cmd::Stmt(Stmt::CreateView {
                 temporary: false, ..
-            }) => Some(Self::Write),
-            Cmd::Stmt(Stmt::DropView { .. }) => Some(Self::Write),
+            }) => Some(Self::DDL),
+            Cmd::Stmt(Stmt::DropView { .. }) => Some(Self::DDL),
             Cmd::Stmt(Stmt::Savepoint(_)) => Some(Self::Savepoint),
             Cmd::Stmt(Stmt::Release(_))
             | Cmd::Stmt(Stmt::Rollback {
                 savepoint_name: Some(_),
                 ..
             }) => Some(Self::Release),
+            Cmd::Stmt(Stmt::Attach {
+                expr: Expr::Id(Id(db_name)),
+                ..
+            }) => {
+                let db_name = db_name
+                    .strip_prefix('"')
+                    .unwrap_or(db_name)
+                    .strip_suffix('"')
+                    .unwrap_or(db_name);
+                Some(Self::Attach(
+                    NamespaceName::from_string(db_name.to_string()).ok()?,
+                ))
+            }
+            Cmd::Stmt(Stmt::Detach(_)) => Some(Self::Detach),
             _ => None,
         }
     }
@@ -129,6 +153,7 @@ impl StmtKind {
             // special case for `encoding` - it's effectively readonly for connections
             // that already created a database, which is always the case for sqld
             "encoding" => Some(Self::Read),
+            "schema_version" if body.is_none() => Some(Self::Read),
             // always ok to be served by primary
             "defer_foreign_keys" | "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
             | "data_version" | "freelist_count" | "integrity_check" | "legacy_file_format"
@@ -156,7 +181,6 @@ impl StmtKind {
             | "read_uncommitted"
             | "recursive_triggers"
             | "reverse_unordered_selects"
-            | "schema_version"
             | "secure_delete"
             | "soft_heap_limit"
             | "synchronous"
@@ -198,6 +222,14 @@ impl StmtKind {
     pub fn is_release(&self) -> bool {
         matches!(self, Self::Release)
     }
+
+    /// Returns true if this statement is a transaction related statement
+    pub(crate) fn is_txn(&self) -> bool {
+        matches!(
+            self,
+            Self::TxnEnd | Self::TxnBegin | Self::Release | Self::Savepoint
+        )
+    }
 }
 
 fn to_ascii_lower(s: &str) -> Cow<str> {
@@ -220,13 +252,13 @@ pub enum TxnStatus {
 }
 
 impl TxnStatus {
-    pub fn step(&mut self, kind: StmtKind) {
+    pub fn step(&mut self, kind: &StmtKind) {
         *self = match (*self, kind) {
             (TxnStatus::Txn, StmtKind::TxnBegin) | (TxnStatus::Init, StmtKind::TxnEnd) => {
                 TxnStatus::Invalid
             }
             (TxnStatus::Txn, StmtKind::TxnEnd) => TxnStatus::Init,
-            (state, StmtKind::Other | StmtKind::Write | StmtKind::Read) => state,
+            (state, StmtKind::Write | StmtKind::Read | StmtKind::DDL) => state,
             (TxnStatus::Invalid, _) => TxnStatus::Invalid,
             (TxnStatus::Init, StmtKind::TxnBegin) => TxnStatus::Txn,
             _ => TxnStatus::Invalid,
@@ -246,6 +278,7 @@ impl Statement {
             kind: StmtKind::Read,
             is_iud: false,
             is_insert: false,
+            attach_info: None,
         }
     }
 
@@ -267,6 +300,7 @@ impl Statement {
                         kind,
                         is_iud: false,
                         is_insert: false,
+                        attach_info: None,
                     });
                 }
             }
@@ -277,11 +311,20 @@ impl Statement {
             );
             let is_insert = matches!(c, Cmd::Stmt(Stmt::Insert { .. }));
 
+            let attach_info = match &c {
+                Cmd::Stmt(Stmt::Attach {
+                    expr: Expr::Id(Id(expr)),
+                    db_name: Expr::Id(Id(name)),
+                    ..
+                }) => Some((expr.clone(), name.clone())),
+                _ => None,
+            };
             Ok(Statement {
                 stmt: c.to_string(),
                 kind,
                 is_iud,
                 is_insert,
+                attach_info,
             })
         }
         // The parser needs to be boxed because it's large, and you don't want it on the stack.
@@ -330,7 +373,7 @@ pub fn predict_final_state<'a>(
     stmts: impl Iterator<Item = &'a Statement>,
 ) -> TxnStatus {
     for stmt in stmts {
-        state.step(stmt.kind);
+        state.step(&stmt.kind);
     }
     state
 }

@@ -30,6 +30,8 @@ pub enum StmtKind {
     Write,
     Savepoint,
     Release,
+    Attach,
+    Detach,
     Other,
 }
 
@@ -116,6 +118,8 @@ impl StmtKind {
                 savepoint_name: Some(_),
                 ..
             }) => Some(Self::Release),
+            Cmd::Stmt(Stmt::Attach { .. }) => Some(Self::Attach),
+            Cmd::Stmt(Stmt::Detach(_)) => Some(Self::Detach),
             _ => None,
         }
     }
@@ -252,5 +256,45 @@ impl Statement {
             self.kind,
             StmtKind::Read | StmtKind::TxnBeginReadOnly | StmtKind::TxnEnd
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_attach_same_db() {
+        let input = "ATTACH test AS test;";
+        let mut result = Statement::parse(input);
+
+        let stmt = result.next().unwrap().unwrap();
+        assert_eq!(stmt.kind, StmtKind::Attach);
+    }
+
+    #[test]
+    fn test_attach_database() {
+        let input = "ATTACH DATABASE test AS test;";
+        let mut result = Statement::parse(input);
+
+        let stmt = result.next().unwrap().unwrap();
+        assert_eq!(stmt.kind, StmtKind::Attach);
+    }
+
+    #[test]
+    fn test_attach_diff_db() {
+        let input = "ATTACH \"random\" AS test;";
+        let mut result = Statement::parse(input);
+
+        let stmt = result.next().unwrap().unwrap();
+        assert_eq!(stmt.kind, StmtKind::Attach);
+    }
+
+    #[test]
+    fn test_attach_database_diff_db() {
+        let input = "ATTACH DATABASE \"random\" AS test;";
+        let mut result = Statement::parse(input);
+
+        let stmt = result.next().unwrap().unwrap();
+        assert_eq!(stmt.kind, StmtKind::Attach);
     }
 }

@@ -44,7 +44,7 @@ impl Injector {
         path: impl AsRef<Path>,
         capacity: usize,
         auto_checkpoint: u32,
-        encryption_key: Option<bytes::Bytes>,
+        encryption_config: Option<libsql_sys::EncryptionConfig>,
     ) -> Result<Self, Error> {
         let buffer = FrameBuffer::default();
         let wal_manager = InjectorWalManager::new(buffer.clone());
@@ -56,7 +56,7 @@ impl Injector {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             wal_manager,
             auto_checkpoint,
-            encryption_key,
+            encryption_config,
         )?;
 
         Ok(Self {
@@ -162,6 +162,8 @@ impl Injector {
 
     fn begin_txn(&mut self) -> Result<(), Error> {
         let conn = self.connection.lock();
+        conn.pragma_update(None, "writable_schema", "true")?;
+
         let mut stmt = conn.prepare_cached("BEGIN IMMEDIATE")?;
         stmt.execute(())?;
         // we create a dummy table. This table MUST not be persisted, otherwise the replica schema

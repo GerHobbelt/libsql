@@ -1,5 +1,7 @@
 use std::env;
 use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -8,13 +10,23 @@ const BUNDLED_DIR: &str = "bundled";
 const SQLITE_DIR: &str = "../libsql-sqlite3";
 
 fn main() {
+    let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap();
+
+    let is_apple = host.contains("apple") && target.contains("apple");
+    if is_apple {
+        println!("cargo:rustc-link-lib=framework=Security");
+    }
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
 
     println!("cargo:rerun-if-changed={BUNDLED_DIR}/src/sqlite3.c");
-    println!(
-        "cargo:rerun-if-changed={BUNDLED_DIR}/SQLite3MultipleCiphers/build/libsqlite3mc_static.a"
-    );
+
+    if cfg!(feature = "multiple-ciphers") {
+        println!(
+            "cargo:rerun-if-changed={BUNDLED_DIR}/SQLite3MultipleCiphers/build/libsqlite3mc_static.a"
+        );
+    }
 
     if std::env::var("LIBSQL_DEV").is_ok() {
         make_amalgation();
@@ -277,20 +289,93 @@ fn build_multiple_ciphers(out_path: &Path) {
     )
     .unwrap();
 
-    let mut cmd = Command::new("./build_libsqlite3mc.sh");
-    cmd.current_dir(BUNDLED_DIR);
+    let bundled_dir = fs::canonicalize(BUNDLED_DIR).unwrap();
 
+    let build_dir = bundled_dir.join("SQLite3MultipleCiphers").join("build");
+    let _ = fs::remove_dir_all(build_dir.clone());
+    fs::create_dir_all(build_dir.clone()).unwrap();
+
+    let mut cmake_opts: Vec<&str> = vec![];
+
+    let cargo_build_target = env::var("CARGO_BUILD_TARGET").unwrap_or_default();
+    let cross_cc_var_name = format!("CC_{}", cargo_build_target.replace("-", "_"));
+    let cross_cc = env::var(&cross_cc_var_name).ok();
+
+    let cross_cxx_var_name = format!("CXX_{}", cargo_build_target.replace("-", "_"));
+    let cross_cxx = env::var(&cross_cxx_var_name).ok();
+
+    let toolchain_path = build_dir.join("toolchain.cmake");
+    let cmake_toolchain_opt = format!("-DCMAKE_TOOLCHAIN_FILE=toolchain.cmake");
+
+    let mut toolchain_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(toolchain_path.clone())
+        .unwrap();
+
+    if let Some(ref cc) = cross_cc {
+        if cc.contains("aarch64") && cc.contains("linux") {
+            cmake_opts.push(&cmake_toolchain_opt);
+            writeln!(toolchain_file, "set(CMAKE_SYSTEM_NAME \"Linux\")").unwrap();
+            writeln!(toolchain_file, "set(CMAKE_SYSTEM_PROCESSOR \"arm64\")").unwrap();
+        }
+    }
+    if let Some(cc) = cross_cc {
+        writeln!(toolchain_file, "set(CMAKE_C_COMPILER {})", cc).unwrap();
+    }
+    if let Some(cxx) = cross_cxx {
+        writeln!(toolchain_file, "set(CMAKE_CXX_COMPILER {})", cxx).unwrap();
+    }
+
+    cmake_opts.push("-DCMAKE_BUILD_TYPE=Release");
+    cmake_opts.push("-DSQLITE3MC_STATIC=ON");
+    cmake_opts.push("-DCODEC_TYPE=AES256");
+    cmake_opts.push("-DSQLITE3MC_BUILD_SHELL=OFF");
+    cmake_opts.push("-DSQLITE_SHELL_IS_UTF8=OFF");
+    cmake_opts.push("-DSQLITE_USER_AUTHENTICATION=OFF");
+    cmake_opts.push("-DSQLITE_SECURE_DELETE=OFF");
+    cmake_opts.push("-DSQLITE_ENABLE_COLUMN_METADATA=ON");
+    cmake_opts.push("-DSQLITE_USE_URI=ON");
+    cmake_opts.push("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+
+    if cargo_build_target.contains("musl") {
+        cmake_opts.push("-DCMAKE_C_FLAGS=\"-U_FORTIFY_SOURCE\"");
+        cmake_opts.push("-DCMAKE_CXX_FLAGS=\"-U_FORTIFY_SOURCE\"");
+    }
+
+    let mut cmake = Command::new("cmake");
+    cmake.current_dir("bundled/SQLite3MultipleCiphers/build");
+    cmake.args(cmake_opts.clone());
+    cmake.arg("..");
     if cfg!(feature = "wasmtime-bindings") {
-        cmd.arg("-DLIBSQL_ENABLE_WASM_RUNTIME=1");
+        cmake.arg("-DLIBSQL_ENABLE_WASM_RUNTIME=1");
     }
-
     if cfg!(feature = "session") {
-        cmd.arg("-DSQLITE_ENABLE_PREUPDATE_HOOK=ON");
-        cmd.arg("-DSQLITE_ENABLE_SESSION=ON");
+        cmake.arg("-DSQLITE_ENABLE_PREUPDATE_HOOK=ON");
+        cmake.arg("-DSQLITE_ENABLE_SESSION=ON");
+    }
+    println!("Running `cmake` with options: {}", cmake_opts.join(" "));
+    let status = cmake.status().unwrap();
+    if !status.success() {
+        panic!("Failed to run cmake with options: {}", cmake_opts.join(" "));
     }
 
-    let out = cmd.output().unwrap();
-    assert!(out.status.success(), "{:?}", out);
+    let mut make = Command::new("cmake");
+    make.current_dir("bundled/SQLite3MultipleCiphers/build");
+    make.args(&["--build", "."]);
+    make.args(&["--config", "Release"]);
+    if !make.status().unwrap().success() {
+        panic!("Failed to run make");
+    }
+    // The `msbuild` tool puts the output in a different place so let's move it.
+    if Path::exists(&build_dir.join("Release/sqlite3mc_static.lib")) {
+        fs::rename(
+            build_dir.join("Release/sqlite3mc_static.lib"),
+            build_dir.join("libsqlite3mc_static.a"),
+        )
+        .unwrap();
+    }
 }
 
 fn env(name: &str) -> Option<OsString> {
@@ -443,6 +528,16 @@ mod bindings {
         let target_arch = std::env::var("TARGET").unwrap();
         let host_arch = std::env::var("HOST").unwrap();
         let is_cross_compiling = target_arch != host_arch;
+
+        if !cfg!(feature = "wasmtime-bindings") {
+            bindings = bindings
+                .blocklist_function("run_wasm")
+                .blocklist_function("libsql_run_wasm")
+                .blocklist_function("libsql_wasm_engine_new")
+                .blocklist_function("libsql_compile_wasm_module")
+                .blocklist_function("libsql_free_wasm_module")
+                .blocklist_function("libsql_wasm_engine_free");
+        }
 
         // Note that when generating the bundled file, we're essentially always
         // cross compiling.

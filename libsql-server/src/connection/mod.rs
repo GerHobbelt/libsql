@@ -1,15 +1,20 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use libsql_replication::rpc::replication::NAMESPACE_METADATA_KEY;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
 
 use futures::Future;
 use tokio::{sync::Semaphore, time::timeout};
+use tonic::metadata::BinaryMetadataValue;
 
 use crate::auth::Authenticated;
 use crate::error::Error;
 use crate::metrics::{
     CONCCURENT_CONNECTIONS_COUNT, CONNECTION_ALIVE_DURATION, CONNECTION_CREATE_TIME,
 };
+use crate::namespace::meta_store::MetaStore;
+use crate::namespace::NamespaceName;
 use crate::query::{Params, Query};
 use crate::query_analysis::Statement;
 use crate::query_result_builder::{IgnoreResult, QueryResultBuilder};
@@ -29,13 +34,47 @@ const TXN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const TXN_TIMEOUT: Duration = Duration::from_millis(100);
 
+#[derive(Clone)]
+pub struct RequestContext {
+    /// Authentication for this request
+    auth: Authenticated,
+    /// current namespace
+    namespace: NamespaceName,
+    meta_store: MetaStore,
+}
+
+impl RequestContext {
+    pub fn new(auth: Authenticated, namespace: NamespaceName, meta_store: MetaStore) -> Self {
+        Self {
+            auth,
+            namespace,
+            meta_store,
+        }
+    }
+
+    pub fn upgrade_grpc_request<T>(&self, req: &mut tonic::Request<T>) {
+        let namespace = BinaryMetadataValue::from_bytes(self.namespace.as_slice());
+        req.metadata_mut()
+            .insert_bin(NAMESPACE_METADATA_KEY, namespace);
+        self.auth.upgrade_grpc_request(req);
+    }
+
+    pub fn namespace(&self) -> &NamespaceName {
+        &self.namespace
+    }
+
+    pub fn auth(&self) -> &Authenticated {
+        &self.auth
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Connection: Send + Sync + 'static {
     /// Executes a query program
     async fn execute_program<B: QueryResultBuilder>(
         &self,
         pgm: Program,
-        auth: Authenticated,
+        ctx: RequestContext,
         response_builder: B,
         replication_index: Option<FrameNo>,
     ) -> Result<B>;
@@ -46,7 +85,7 @@ pub trait Connection: Send + Sync + 'static {
     async fn execute_batch_or_rollback<B: QueryResultBuilder>(
         &self,
         batch: Vec<Query>,
-        auth: Authenticated,
+        ctx: RequestContext,
         result_builder: B,
         replication_index: Option<FrameNo>,
     ) -> Result<B> {
@@ -74,7 +113,7 @@ pub trait Connection: Send + Sync + 'static {
         // ignore the rollback result
         let builder = result_builder.take(batch_len);
         let builder = self
-            .execute_program(pgm, auth, builder, replication_index)
+            .execute_program(pgm, ctx, builder, replication_index)
             .await?;
 
         Ok(builder.into_inner())
@@ -85,24 +124,24 @@ pub trait Connection: Send + Sync + 'static {
     async fn execute_batch<B: QueryResultBuilder>(
         &self,
         batch: Vec<Query>,
-        auth: Authenticated,
+        ctx: RequestContext,
         result_builder: B,
         replication_index: Option<FrameNo>,
     ) -> Result<B> {
         let steps = make_batch_program(batch);
         let pgm = Program::new(steps);
-        self.execute_program(pgm, auth, result_builder, replication_index)
+        self.execute_program(pgm, ctx, result_builder, replication_index)
             .await
     }
 
-    async fn rollback(&self, auth: Authenticated) -> Result<()> {
+    async fn rollback(&self, ctx: RequestContext) -> Result<()> {
         self.execute_batch(
             vec![Query {
                 stmt: Statement::parse("ROLLBACK").next().unwrap().unwrap(),
                 params: Params::empty(),
                 want_rows: false,
             }],
-            auth,
+            ctx,
             IgnoreResult,
             None,
         )
@@ -115,7 +154,7 @@ pub trait Connection: Send + Sync + 'static {
     async fn describe(
         &self,
         sql: String,
-        auth: Authenticated,
+        ctx: RequestContext,
         replication_index: Option<FrameNo>,
     ) -> Result<Result<DescribeResponse>>;
 
@@ -159,11 +198,55 @@ pub trait MakeConnection: Send + Sync + 'static {
         semaphore: Arc<Semaphore>,
         timeout: Option<Duration>,
         max_total_response_size: u64,
+        max_concurrent_requests: u64,
     ) -> MakeThrottledConnection<Self>
     where
         Self: Sized,
     {
-        MakeThrottledConnection::new(semaphore, self, timeout, max_total_response_size)
+        MakeThrottledConnection::new(
+            semaphore,
+            self,
+            timeout,
+            max_total_response_size,
+            max_concurrent_requests,
+        )
+    }
+
+    fn map<F, T>(self, f: F) -> Map<Self, F>
+    where
+        F: Fn(Self::Connection) -> T + Send + Sync + 'static,
+        Self: Sized,
+    {
+        Map { inner: self, f }
+    }
+}
+
+pub struct Map<T, F> {
+    inner: T,
+    f: F,
+}
+
+#[async_trait::async_trait]
+impl<F, T, O> MakeConnection for Map<T, F>
+where
+    F: Fn(T::Connection) -> O + Send + Sync + 'static,
+    T: MakeConnection,
+    O: Connection,
+{
+    type Connection = O;
+
+    async fn create(&self) -> Result<Self::Connection, Error> {
+        let conn = self.inner.create().await?;
+        Ok((self.f)(conn))
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: MakeConnection> MakeConnection for Arc<T> {
+    type Connection = T::Connection;
+
+    async fn create(&self) -> Result<Self::Connection, Error> {
+        self.as_ref().create().await
     }
 }
 
@@ -190,6 +273,7 @@ pub struct MakeThrottledConnection<F> {
     // will result in reducing concurrency to prevent out-of-memory errors.
     max_total_response_size: u64,
     waiters: AtomicUsize,
+    max_concurrent_requests: u64,
 }
 
 impl<F> MakeThrottledConnection<F> {
@@ -198,6 +282,7 @@ impl<F> MakeThrottledConnection<F> {
         connection_maker: F,
         timeout: Option<Duration>,
         max_total_response_size: u64,
+        max_concurrent_requests: u64,
     ) -> Self {
         Self {
             semaphore,
@@ -205,6 +290,7 @@ impl<F> MakeThrottledConnection<F> {
             timeout,
             max_total_response_size,
             waiters: AtomicUsize::new(0),
+            max_concurrent_requests,
         }
     }
 
@@ -242,14 +328,6 @@ impl Drop for WaitersGuard<'_> {
     }
 }
 
-fn now_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
 #[async_trait::async_trait]
 impl<F: MakeConnection> MakeConnection for MakeThrottledConnection<F> {
     type Connection = TrackedConnection<F::Connection>;
@@ -263,7 +341,7 @@ impl<F: MakeConnection> MakeConnection for MakeThrottledConnection<F> {
         );
         let units = self.units_to_take();
         let waiters_guard = WaitersGuard::new(&self.waiters);
-        if waiters_guard.waiters.load(Ordering::Relaxed) >= 128 {
+        if (waiters_guard.waiters.load(Ordering::Relaxed) as u64) >= self.max_concurrent_requests {
             return Err(Error::TooManyRequests);
         }
         let fut = self.semaphore.clone().acquire_many_owned(units);
@@ -293,7 +371,6 @@ impl<F: MakeConnection> MakeConnection for MakeThrottledConnection<F> {
         Ok(TrackedConnection {
             permit,
             inner,
-            atime: AtomicU64::new(now_millis()),
             created_at: Instant::now(),
         })
     }
@@ -304,7 +381,6 @@ pub struct TrackedConnection<DB> {
     inner: DB,
     #[allow(dead_code)] // just hold on to it
     permit: tokio::sync::OwnedSemaphorePermit,
-    atime: AtomicU64,
     created_at: Instant,
 }
 
@@ -315,11 +391,11 @@ impl<T> Drop for TrackedConnection<T> {
     }
 }
 
-impl<DB: Connection> TrackedConnection<DB> {
-    pub fn idle_time(&self) -> Duration {
-        let now = now_millis();
-        let atime = self.atime.load(Ordering::Relaxed);
-        Duration::from_millis(now.saturating_sub(atime))
+impl<T> Deref for TrackedConnection<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
@@ -329,13 +405,12 @@ impl<DB: Connection> Connection for TrackedConnection<DB> {
     async fn execute_program<B: QueryResultBuilder>(
         &self,
         pgm: Program,
-        auth: Authenticated,
+        ctx: RequestContext,
         builder: B,
         replication_index: Option<FrameNo>,
     ) -> crate::Result<B> {
-        self.atime.store(now_millis(), Ordering::Relaxed);
         self.inner
-            .execute_program(pgm, auth, builder, replication_index)
+            .execute_program(pgm, ctx, builder, replication_index)
             .await
     }
 
@@ -343,11 +418,10 @@ impl<DB: Connection> Connection for TrackedConnection<DB> {
     async fn describe(
         &self,
         sql: String,
-        auth: Authenticated,
+        ctx: RequestContext,
         replication_index: Option<FrameNo>,
     ) -> crate::Result<crate::Result<DescribeResponse>> {
-        self.atime.store(now_millis(), Ordering::Relaxed);
-        self.inner.describe(sql, auth, replication_index).await
+        self.inner.describe(sql, ctx, replication_index).await
     }
 
     #[inline]
@@ -357,7 +431,6 @@ impl<DB: Connection> Connection for TrackedConnection<DB> {
 
     #[inline]
     async fn checkpoint(&self) -> Result<()> {
-        self.atime.store(now_millis(), Ordering::Relaxed);
         self.inner.checkpoint().await
     }
 
@@ -384,7 +457,7 @@ pub mod test {
         async fn execute_program<B: QueryResultBuilder>(
             &self,
             _pgm: Program,
-            _auth: Authenticated,
+            _ctx: RequestContext,
             _builder: B,
             _replication_index: Option<FrameNo>,
         ) -> crate::Result<B> {
@@ -394,7 +467,7 @@ pub mod test {
         async fn describe(
             &self,
             _sql: String,
-            _auth: Authenticated,
+            _ctx: RequestContext,
             _replication_index: Option<FrameNo>,
         ) -> crate::Result<crate::Result<DescribeResponse>> {
             unreachable!()
@@ -422,6 +495,7 @@ pub mod test {
         let factory = (|| async { Ok(DummyDb) }).throttled(
             Arc::new(Semaphore::new(10)),
             Some(Duration::from_millis(100)),
+            u64::MAX,
             u64::MAX,
         );
 

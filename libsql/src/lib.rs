@@ -65,7 +65,7 @@
 //!
 //! ## Examples
 //!
-//! You can find more examples in the [`examples`](https://github.com/tursodatabase/libsql/tree/main/crates/core/examples) directory.
+//! You can find more examples in the [`examples`](https://github.com/tursodatabase/libsql/tree/main/libsql/examples) directory.
 //!
 //! ## Feature flags
 //!
@@ -99,6 +99,8 @@ cfg_core! {
 
     pub use local::{version, version_number, RowsFuture};
     pub use database::OpenFlags;
+
+    pub use database::{Cipher, EncryptionConfig};
 }
 
 pub mod params;

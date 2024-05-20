@@ -1,0 +1,35 @@
+use super::{UserAuthContext, UserAuthStrategy};
+use crate::auth::{AuthError, Authenticated};
+
+pub struct Disabled {}
+
+impl UserAuthStrategy for Disabled {
+    fn authenticate(&self, _context: UserAuthContext) -> Result<Authenticated, AuthError> {
+        tracing::trace!("executing disabled auth");
+        Ok(Authenticated::FullAccess)
+    }
+}
+
+impl Disabled {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authenticates() {
+        let strategy = Disabled::new();
+        let context = UserAuthContext {
+            user_credential: None,
+        };
+
+        assert!(matches!(
+            strategy.authenticate(context).unwrap(),
+            Authenticated::FullAccess
+        ))
+    }
+}

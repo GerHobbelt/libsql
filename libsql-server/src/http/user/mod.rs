@@ -1,5 +1,6 @@
 pub mod db_factory;
 mod dump;
+mod extract;
 mod hrana_over_http_1;
 mod result_builder;
 mod trace;
@@ -28,15 +29,15 @@ use tonic::transport::Server;
 
 use tower_http::{compression::CompressionLayer, cors};
 
-use crate::auth::{Auth, Authenticated};
-use crate::connection::Connection;
-use crate::database::Database;
+use crate::auth::user_auth_strategies::UserAuthContext;
+use crate::auth::{Auth, Authenticated, Jwt};
+use crate::connection::{Connection, RequestContext};
 use crate::error::Error;
 use crate::hrana;
 use crate::http::user::db_factory::MakeConnectionExtractorPath;
 use crate::http::user::types::HttpQuery;
 use crate::metrics::LEGACY_HTTP_CALL;
-use crate::namespace::{MakeNamespace, NamespaceStore};
+use crate::namespace::NamespaceStore;
 use crate::net::Accept;
 use crate::query::{self, Query};
 use crate::query_analysis::{predict_final_state, Statement, TxnStatus};
@@ -124,9 +125,9 @@ fn parse_queries(queries: Vec<QueryObject>) -> crate::Result<Vec<Query>> {
     Ok(out)
 }
 
-async fn handle_query<C: Connection>(
-    auth: Authenticated,
-    MakeConnectionExtractor(connection_maker): MakeConnectionExtractor<C>,
+async fn handle_query(
+    ctx: RequestContext,
+    MakeConnectionExtractor(connection_maker): MakeConnectionExtractor,
     Json(query): Json<HttpQuery>,
 ) -> Result<axum::response::Response, Error> {
     LEGACY_HTTP_CALL.increment(1);
@@ -136,7 +137,7 @@ async fn handle_query<C: Connection>(
 
     let builder = JsonHttpPayloadBuilder::new();
     let builder = db
-        .execute_batch_or_rollback(batch, auth, builder, query.replication_index)
+        .execute_batch_or_rollback(batch, ctx, builder, query.replication_index)
         .await?;
 
     let res = (
@@ -146,8 +147,8 @@ async fn handle_query<C: Connection>(
     Ok(res.into_response())
 }
 
-async fn show_console<F: MakeNamespace>(
-    AxumState(AppState { enable_console, .. }): AxumState<AppState<F>>,
+async fn show_console(
+    AxumState(AppState { enable_console, .. }): AxumState<AppState>,
 ) -> impl IntoResponse {
     if enable_console {
         Html(std::include_str!("console.html")).into_response()
@@ -161,8 +162,8 @@ async fn handle_health() -> Response<Body> {
     Response::new(Body::empty())
 }
 
-async fn handle_upgrade<F: MakeNamespace>(
-    AxumState(AppState { upgrade_tx, .. }): AxumState<AppState<F>>,
+async fn handle_upgrade(
+    AxumState(AppState { upgrade_tx, .. }): AxumState<AppState>,
     req: Request<Body>,
 ) -> impl IntoResponse {
     if !hyper_tungstenite::is_upgrade_request(&req) {
@@ -196,12 +197,10 @@ async fn handle_fallback() -> impl IntoResponse {
     (StatusCode::NOT_FOUND).into_response()
 }
 
-async fn handle_hrana_pipeline<F: MakeNamespace>(
-    AxumState(state): AxumState<AppState<F>>,
-    MakeConnectionExtractorPath(connection_maker): MakeConnectionExtractorPath<
-        <F::Database as Database>::Connection,
-    >,
-    auth: Authenticated,
+async fn handle_hrana_pipeline(
+    AxumState(state): AxumState<AppState>,
+    MakeConnectionExtractorPath(connection_maker): MakeConnectionExtractorPath,
+    ctx: RequestContext,
     axum::extract::Path((_, version)): axum::extract::Path<(String, String)>,
     req: Request<Body>,
 ) -> Result<Response<Body>, Error> {
@@ -214,7 +213,7 @@ async fn handle_hrana_pipeline<F: MakeNamespace>(
         .hrana_http_srv
         .handle_request(
             connection_maker,
-            auth,
+            ctx,
             req,
             hrana::http::Endpoint::Pipeline,
             hrana_version,
@@ -225,37 +224,23 @@ async fn handle_hrana_pipeline<F: MakeNamespace>(
 
 /// Router wide state that each request has access too via
 /// axum's `State` extractor.
-pub(crate) struct AppState<F: MakeNamespace> {
-    auth: Arc<Auth>,
-    namespaces: NamespaceStore<F>,
+#[derive(Clone)]
+pub(crate) struct AppState {
+    user_auth_strategy: Auth,
+    namespaces: NamespaceStore,
     upgrade_tx: mpsc::Sender<hrana::ws::Upgrade>,
-    hrana_http_srv: Arc<hrana::http::Server<<F::Database as Database>::Connection>>,
+    hrana_http_srv: Arc<hrana::http::Server>,
     enable_console: bool,
     disable_default_namespace: bool,
     disable_namespaces: bool,
     path: Arc<Path>,
 }
 
-impl<F: MakeNamespace> Clone for AppState<F> {
-    fn clone(&self) -> Self {
-        Self {
-            auth: self.auth.clone(),
-            namespaces: self.namespaces.clone(),
-            upgrade_tx: self.upgrade_tx.clone(),
-            hrana_http_srv: self.hrana_http_srv.clone(),
-            enable_console: self.enable_console,
-            disable_default_namespace: self.disable_default_namespace,
-            disable_namespaces: self.disable_namespaces,
-            path: self.path.clone(),
-        }
-    }
-}
-
-pub struct UserApi<M: MakeNamespace, A, P, S> {
-    pub auth: Arc<Auth>,
+pub struct UserApi<A, P, S> {
+    pub user_auth_strategy: Auth,
     pub http_acceptor: Option<A>,
     pub hrana_ws_acceptor: Option<A>,
-    pub namespaces: NamespaceStore<M>,
+    pub namespaces: NamespaceStore,
     pub idle_shutdown_kicker: Option<IdleShutdownKicker>,
     pub proxy_service: P,
     pub replication_service: S,
@@ -268,24 +253,20 @@ pub struct UserApi<M: MakeNamespace, A, P, S> {
     pub shutdown: Arc<Notify>,
 }
 
-impl<M, A, P, S> UserApi<M, A, P, S>
+impl<A, P, S> UserApi<A, P, S>
 where
-    M: MakeNamespace,
     A: Accept,
     P: Proxy,
     S: ReplicationLog,
 {
-    pub fn configure(
-        self,
-        join_set: &mut JoinSet<anyhow::Result<()>>,
-    ) -> Arc<hrana::http::Server<<<M as MakeNamespace>::Database as Database>::Connection>> {
+    pub fn configure(self, join_set: &mut JoinSet<anyhow::Result<()>>) -> Arc<hrana::http::Server> {
         let (hrana_accept_tx, hrana_accept_rx) = mpsc::channel(8);
         let (hrana_upgrade_tx, hrana_upgrade_rx) = mpsc::channel(8);
         let hrana_http_srv = Arc::new(hrana::http::Server::new(self.self_url.clone()));
 
         join_set.spawn({
             let namespaces = self.namespaces.clone();
-            let auth = self.auth.clone();
+            let user_auth_strategy = self.user_auth_strategy.clone();
             let idle_kicker = self
                 .idle_shutdown_kicker
                 .clone()
@@ -295,7 +276,7 @@ where
             let max_response_size = self.max_response_size;
             async move {
                 hrana::ws::serve(
-                    auth,
+                    user_auth_strategy,
                     idle_kicker,
                     max_response_size,
                     hrana_accept_rx,
@@ -326,7 +307,7 @@ where
 
         if let Some(acceptor) = self.http_acceptor {
             let state = AppState {
-                auth: self.auth,
+                user_auth_strategy: self.user_auth_strategy,
                 upgrade_tx: hrana_upgrade_tx,
                 hrana_http_srv: hrana_http_srv.clone(),
                 enable_console: self.enable_console,
@@ -338,19 +319,17 @@ where
 
             macro_rules! handle_hrana {
                 ($endpoint:expr, $version:expr, $encoding:expr,) => {{
-                    async fn handle_hrana<F: MakeNamespace>(
-                        AxumState(state): AxumState<AppState<F>>,
-                        MakeConnectionExtractor(connection_maker): MakeConnectionExtractor<
-                            <F::Database as Database>::Connection,
-                        >,
-                        auth: Authenticated,
+                    async fn handle_hrana(
+                        AxumState(state): AxumState<AppState>,
+                        MakeConnectionExtractor(connection_maker): MakeConnectionExtractor,
+                        ctx: RequestContext,
                         req: Request<Body>,
                     ) -> Result<Response<Body>, Error> {
                         Ok(state
                             .hrana_http_srv
                             .handle_request(
                                 connection_maker,
-                                auth,
+                                ctx,
                                 req,
                                 $endpoint,
                                 $version,
@@ -469,36 +448,41 @@ where
 
 /// Axum authenticated extractor
 #[tonic::async_trait]
-impl<M> FromRequestParts<AppState<M>> for Authenticated
-where
-    M: MakeNamespace,
-{
+impl FromRequestParts<AppState> for Authenticated {
     type Rejection = Error;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState<M>,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let ns = db_factory::namespace_from_headers(
             &parts.headers,
             state.disable_default_namespace,
             state.disable_namespaces,
         )?;
-        let namespace_jwt_key = state.namespaces.with(ns, |ns| ns.jwt_key()).await??;
+
+        let namespace_jwt_key = state
+            .namespaces
+            .with(ns.clone(), |ns| ns.jwt_key())
+            .await??;
+
         let auth_header = parts.headers.get(hyper::header::AUTHORIZATION);
-        let auth = state.auth.authenticate_http(
-            auth_header,
-            state.disable_namespaces,
-            namespace_jwt_key,
-        )?;
+
+        let auth = namespace_jwt_key
+            .map(Jwt::new)
+            .map(Auth::new)
+            .unwrap_or_else(|| state.user_auth_strategy.clone())
+            .authenticate(UserAuthContext {
+                user_credential: auth_header.cloned(),
+            })?;
 
         Ok(auth)
     }
 }
 
-impl<F: MakeNamespace> FromRef<AppState<F>> for Arc<Auth> {
-    fn from_ref(input: &AppState<F>) -> Self {
-        input.auth.clone()
+impl FromRef<AppState> for Auth {
+    fn from_ref(input: &AppState) -> Self {
+        input.user_auth_strategy.clone()
     }
 }
 
