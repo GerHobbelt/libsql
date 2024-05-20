@@ -5,6 +5,8 @@ use metrics::{
 };
 use once_cell::sync::Lazy;
 
+pub static CLIENT_VERSION: &str = "libsql_client_version";
+
 pub static WRITE_QUERY_COUNT: Lazy<Counter> = Lazy::new(|| {
     const NAME: &str = "libsql_server_writes_count";
     describe_counter!(NAME, "number of write statements");
@@ -75,4 +77,35 @@ pub static RETURNED_BYTES: Lazy<Histogram> = Lazy::new(|| {
     const NAME: &str = "libsql_server_returned_bytes";
     describe_histogram!(NAME, "number of bytes of values returned to the client");
     register_histogram!(NAME)
+});
+pub static PROGRAM_EXEC_COUNT: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_libsql_execute_program";
+    describe_counter!(NAME, "number of hrana program executions");
+    register_counter!(NAME)
+});
+pub static REPLICA_LOCAL_EXEC_MISPREDICT: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_replica_exec_mispredict";
+    describe_counter!(
+        NAME,
+        "number of mispredicted hrana program executions on a replica"
+    );
+    register_counter!(NAME)
+});
+pub static REPLICA_LOCAL_PROGRAM_EXEC: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_replica_exec";
+    describe_counter!(
+        NAME,
+        "number of local hrana programs executions on a replica"
+    );
+    register_counter!(NAME)
+});
+pub static DESCRIBE_COUNT: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_describe_count";
+    describe_counter!(NAME, "number of calls to describe");
+    register_counter!(NAME)
+});
+pub static LEGACY_HTTP_CALL: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_legacy_http_call";
+    describe_counter!(NAME, "number of calls to the legacy HTTP API");
+    register_counter!(NAME)
 });

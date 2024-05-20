@@ -148,7 +148,7 @@ impl<C: ReplicatorClient> Replicator<C> {
         }
     }
 
-    async fn try_perform_handshake(&mut self) -> Result<(), Error> {
+    pub async fn try_perform_handshake(&mut self) -> Result<(), Error> {
         let mut error_printed = false;
         for _ in 0..HANDSHAKE_MAX_RETRIES {
             tracing::info!("Attempting to perform handshake with primary.");
@@ -157,7 +157,7 @@ impl<C: ReplicatorClient> Replicator<C> {
                     self.has_handshake = true;
                     return Ok(());
                 }
-                Err(e @ Error::Fatal(_)) => return Err(e),
+                Err(e @ (Error::Fatal(_) | Error::Meta(_))) => return Err(e),
                 Err(e) if !error_printed => {
                     tracing::error!("error connecting to primary. retrying. error: {e}");
                     error_printed = true;

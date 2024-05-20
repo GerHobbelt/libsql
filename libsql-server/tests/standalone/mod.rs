@@ -4,8 +4,9 @@ use crate::common::{net::SimServer, snapshot_metrics};
 
 use super::common;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
+use insta::assert_debug_snapshot;
 use libsql::{Database, Value};
 use tempfile::tempdir;
 use tokio::sync::Notify;
@@ -77,9 +78,20 @@ fn basic_metrics() {
             libsql::Value::Integer(1)
         ));
 
-        snapshot_metrics()
-            .assert_gauge("libsql_server_current_frame_no", 2.0)
-            .assert_counter("libsql_server_libsql_execute_program", 3);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let snapshot = snapshot_metrics();
+        snapshot.assert_counter("libsql_server_libsql_execute_program", 3);
+
+        for (key, (_, _, val)) in snapshot.snapshot() {
+            if key.kind() == metrics_util::MetricKind::Counter
+                && key.key().name() == "libsql_client_version"
+            {
+                assert_eq!(val, &metrics_util::debugging::DebugValue::Counter(3));
+                let label = key.key().labels().next().unwrap();
+                assert!(label.value().starts_with("libsql-remote-"));
+            }
+        }
 
         Ok(())
     });
@@ -197,6 +209,53 @@ fn execute_transaction() {
 
             Ok(())
         }
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn basic_query_fail() {
+    let mut sim = turmoil::Builder::new().build();
+
+    sim.host("primary", make_standalone_server);
+
+    sim.client("test", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
+        let conn = db.connect()?;
+
+        conn.execute("create table test (x)", ()).await?;
+        conn.execute("create unique index test_index on test(x)", ())
+            .await?;
+        conn.execute("insert into test values (12)", ()).await?;
+        assert_debug_snapshot!(conn
+            .execute("insert into test values (12)", ())
+            .await
+            .unwrap_err());
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn random_rowid() {
+    let mut sim = turmoil::Builder::new().build();
+
+    sim.host("primary", make_standalone_server);
+
+    sim.client("test", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
+        let conn = db.connect()?;
+
+        conn.execute(
+            "CREATE TABLE shopping_list(item text, quantity int) RANDOM ROWID",
+            (),
+        )
+        .await?;
+
+        Ok(())
     });
 
     sim.run().unwrap();

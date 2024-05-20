@@ -6,7 +6,6 @@ use bytes::Bytes;
 use rusqlite::types::ValueRef;
 
 use crate::hrana::stmt::{proto_error_from_stmt_error, stmt_error_from_sqld_error};
-use crate::query_analysis::TxnStatus;
 use crate::query_result_builder::{
     Column, QueryBuilderConfig, QueryResultBuilder, QueryResultBuilderError, TOTAL_RESPONSE_SIZE,
 };
@@ -25,7 +24,6 @@ pub struct SingleStatementBuilder {
     current_size: u64,
     max_response_size: u64,
     max_total_response_size: u64,
-    last_frame_no: Option<FrameNo>,
 }
 
 struct SizeFormatter {
@@ -228,10 +226,9 @@ impl QueryResultBuilder for SingleStatementBuilder {
 
     fn finish(
         &mut self,
-        last_frame_no: Option<FrameNo>,
-        _state: TxnStatus,
+        _last_frame_no: Option<FrameNo>,
+        _is_autocommit: bool,
     ) -> Result<(), QueryResultBuilderError> {
-        self.last_frame_no = last_frame_no;
         Ok(())
     }
 
@@ -243,7 +240,6 @@ impl QueryResultBuilder for SingleStatementBuilder {
                 rows: std::mem::take(&mut self.rows),
                 affected_row_count: std::mem::take(&mut self.affected_row_count),
                 last_insert_rowid: std::mem::take(&mut self.last_insert_rowid),
-                replication_index: self.last_frame_no,
             }),
         }
     }
@@ -269,6 +265,7 @@ pub struct HranaBatchProtoBuilder {
     current_size: u64,
     max_response_size: u64,
     step_empty: bool,
+    last_frame_no: Option<FrameNo>,
 }
 
 impl QueryResultBuilder for HranaBatchProtoBuilder {
@@ -351,9 +348,10 @@ impl QueryResultBuilder for HranaBatchProtoBuilder {
 
     fn finish(
         &mut self,
-        _last_frame_no: Option<FrameNo>,
-        _state: TxnStatus,
+        last_frame_no: Option<FrameNo>,
+        _is_autocommit: bool,
     ) -> Result<(), QueryResultBuilderError> {
+        self.last_frame_no = last_frame_no;
         Ok(())
     }
 
@@ -361,6 +359,7 @@ impl QueryResultBuilder for HranaBatchProtoBuilder {
         proto::BatchResult {
             step_results: self.step_results,
             step_errors: self.step_errors,
+            replication_index: self.last_frame_no,
         }
     }
 }

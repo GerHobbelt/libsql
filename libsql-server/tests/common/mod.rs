@@ -38,6 +38,7 @@ impl MetricsSnapshot {
     }
 
     pub fn get_counter(&self, metric_name: &str) -> Option<u64> {
+        println!("{:?}", self.snapshot);
         for (key, (_, _, val)) in &self.snapshot {
             if key.kind() == MetricKind::Counter && key.key().name() == metric_name {
                 match val {
@@ -61,6 +62,12 @@ impl MetricsSnapshot {
         }
 
         None
+    }
+
+    pub fn snapshot(
+        &self,
+    ) -> &HashMap<CompositeKey, (Option<Unit>, Option<SharedString>, DebugValue)> {
+        &self.snapshot
     }
 
     #[track_caller]
