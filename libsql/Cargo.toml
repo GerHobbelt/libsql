@@ -31,7 +31,7 @@ bytes = { version = "1.4.0", features = ["serde"], optional = true }
 uuid = { version = "1.4.0", features = ["v4", "serde"], optional = true }
 tokio-stream = { version = "0.1.14", optional = true }
 tonic = { version = "0.10.2", features = ["tls", "tls-roots", "tls-webpki-roots"], optional = true}
-tonic-web = { version = "0.10.2" , optional = true }
+tonic-web = { version = "0.10.2", optional = true }
 tower-http = { version = "0.4.4", features = ["trace", "set-header", "util"], optional = true }
 http = { version = "0.2", optional = true }
 
@@ -47,10 +47,6 @@ tokio = { version = "1.29.1", features = ["full"] }
 tokio-test = "0.4"
 tracing-subscriber = "0.3"
 tempfile = { version = "3.7.0" }
-
-tonic-build = "0.10"
-prost-build = "0.12"
-
 
 [features]
 default = ["core", "replication", "remote"]
@@ -92,6 +88,7 @@ hrana = [
   "serde",
   "dep:base64",
   "dep:serde_json",
+  "dep:futures"
 ]
 serde = ["dep:serde"]
 remote = [

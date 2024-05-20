@@ -50,6 +50,12 @@
 #  define SQLITE_TCLAPI
 #endif
 
+// NOTICE: libSQL extension: disabled WAL also implies we don't want shared memory via mmap
+#ifdef SQLITE_OMIT_WAL
+# undef SQLITE_OMIT_SHARED_MEM
+# define SQLITE_OMIT_SHARED_MEM 1
+#endif
+
 /*
 ** Include the header file used to customize the compiler options for MSVC.
 ** This should be done first so that it can successfully prevent spurious
@@ -316,16 +322,6 @@
 #      include <cmnintrin.h>
 #    endif
 #  endif
-#endif
-
-/*
-** Enable SQLITE_USE_SEH by default on MSVC builds.  Only omit
-** SEH support if the -DSQLITE_OMIT_SEH option is given.
-*/
-#if defined(_MSC_VER) && !defined(SQLITE_OMIT_SEH)
-# define SQLITE_USE_SEH 1
-#else
-# undef SQLITE_USE_SEH
 #endif
 
 /*
@@ -1798,8 +1794,9 @@ struct sqlite3 {
 #ifdef LIBSQL_ENABLE_WASM_RUNTIME
   libsql_wasm_ctx wasm;        /* WebAssembly runtime context */
 #endif
-  libsql_wal_methods* pWalMethods; /* Custom WAL methods */
-  void* pWalMethodsData;           /* optional data for WAL methods */
+#ifndef SQLITE_OMIT_WAL
+  RefCountCreateWal *create_wal;
+#endif
   void *pCloseArg;                 /* First argument to xCloseCallback */
   void (*xCloseCallback)(          /* Registered using sqlite3_close_hook() */
     void*, sqlite3*
@@ -4879,8 +4876,8 @@ void sqlite3AddCollateType(Parse*, Token*);
 void sqlite3AddGenerated(Parse*,Expr*,Token*);
 void sqlite3EndTable(Parse*,Token*,Token*,u32,Select*);
 void sqlite3AddReturning(Parse*,ExprList*);
-int sqlite3ParseUri(const char*,const char*,const char*,unsigned int*,
-                    sqlite3_vfs**,libsql_wal_methods**,char**,char **);
+int sqlite3ParseUri(const char*,const char*,unsigned int*,
+                    sqlite3_vfs**,char**,char **);
 #define sqlite3CodecQueryParameters(A,B,C) 0
 Btree *sqlite3DbNameToBtree(sqlite3*,const char*);
 

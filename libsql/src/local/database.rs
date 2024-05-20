@@ -105,14 +105,13 @@ impl Database {
             endpoint.as_str().try_into().unwrap(),
             auth_token,
             version.as_ref().map(String::as_str),
-        )
-        .unwrap();
+        ).map_err(|e| crate::errors::Error::ConnectionFailed(e.to_string()))?;
         let path = PathBuf::from(db_path);
-        let client = RemoteClient::new(remote.clone(), &path).await.unwrap();
+        let client = RemoteClient::new(remote.clone(), &path).await.map_err(|e| crate::errors::Error::ConnectionFailed(e.to_string()))?;
         let replicator = Mutex::new(
             Replicator::new(Either::Left(client), path, 1000)
-                .await
-                .unwrap(),
+            .await
+            .map_err(|e| crate::errors::Error::ConnectionFailed(e.to_string()))?
         );
 
         db.replication_ctx = Some(ReplicationContext {
@@ -211,17 +210,30 @@ if let Some(ReplicationContext {
                 ));
             }
 
-            match replicator
-                .replicate()
-                .await {
-                    Err(libsql_replication::replicator::Error::Meta(libsql_replication::meta::Error::LogIncompatible)) => {
-                        // The meta must have been marked as dirty, replicate again from scratch
-                        // this time.
-                        tracing::debug!("re-replicating database after LogIncompatible error");
-                        replicator.replicate().await.map_err(|e| crate::Error::Replication(e.into()))?;
+            // we force a handshake to get the most up to date replication index from the primary.
+            replicator.force_handshake();
+
+            loop {
+                match replicator
+                    .replicate()
+                    .await {
+                        Err(libsql_replication::replicator::Error::Meta(libsql_replication::meta::Error::LogIncompatible)) => {
+                            // The meta must have been marked as dirty, replicate again from scratch
+                            // this time.
+                            tracing::debug!("re-replicating database after LogIncompatible error");
+                            replicator.replicate().await.map_err(|e| crate::Error::Replication(e.into()))?;
+                        }
+                        Err(e) => return Err(crate::Error::Replication(e.into())),
+                        Ok(_) => {
+                            let Either::Left(client) = replicator.client_mut() else { unreachable!() };
+                            let Some(primary_index) = client.last_handshake_replication_index() else { return Ok(None) };
+                            if let Some(replica_index) = replicator.client_mut().committed_frame_no() {
+                                if replica_index >= primary_index {
+                                    break
+                                }
+                            }
+                        },
                     }
-                    Err(e) => return Err(crate::Error::Replication(e.into())),
-                    Ok(_) => (),
             }
 
             Ok(replicator.client_mut().committed_frame_no())

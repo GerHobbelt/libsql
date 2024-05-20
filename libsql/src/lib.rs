@@ -87,6 +87,9 @@ mod statement;
 mod transaction;
 mod value;
 
+#[cfg(feature = "serde")]
+pub mod de;
+
 pub use value::{Value, ValueRef, ValueType};
 
 cfg_hrana! {
