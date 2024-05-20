@@ -5,6 +5,8 @@ use async_lock::RwLock;
 use chrono::NaiveDateTime;
 use futures::TryFutureExt;
 use moka::future::Cache;
+use once_cell::sync::OnceCell;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 
 use crate::auth::Authenticated;
@@ -15,7 +17,8 @@ use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, Nam
 use crate::stats::Stats;
 
 use super::meta_store::{MetaStore, MetaStoreHandle};
-use super::{Namespace, NamespaceConfig, ResetCb, ResetOp, RestoreOption};
+use super::schema_lock::SchemaLocksRegistry;
+use super::{Namespace, NamespaceConfig, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
 type NamespaceEntry = Arc<RwLock<Option<Namespace>>>;
 
@@ -39,6 +42,7 @@ pub struct NamespaceStoreInner {
     has_shutdown: AtomicBool,
     snapshot_at_shutdown: bool,
     pub config: NamespaceConfig,
+    schema_locks: SchemaLocksRegistry,
 }
 
 impl NamespaceStore {
@@ -80,6 +84,7 @@ impl NamespaceStore {
                 has_shutdown: AtomicBool::new(false),
                 snapshot_at_shutdown,
                 config,
+                schema_locks: Default::default(),
             }),
         })
     }
@@ -88,10 +93,19 @@ impl NamespaceStore {
         self.inner.metadata.exists(namespace)
     }
 
-    pub async fn destroy(&self, namespace: NamespaceName) -> crate::Result<()> {
+    pub async fn destroy(&self, namespace: NamespaceName, prune_all: bool) -> crate::Result<()> {
         if self.inner.has_shutdown.load(Ordering::Relaxed) {
             return Err(Error::NamespaceStoreShutdown);
         }
+
+        // destroy on-disk database and backups
+        // FIXME: this is blocking
+        let db_config = self
+            .inner
+            .metadata
+            .remove(namespace.clone())?
+            .ok_or_else(|| crate::Error::NamespaceDoesntExist(namespace.to_string()))?;
+
         let mut bottomless_db_id_init = NamespaceBottomlessDbIdInit::FetchFromConfig;
         if let Some(ns) = self.inner.store.remove(&namespace).await {
             // deallocate in-memory resources
@@ -103,17 +117,11 @@ impl NamespaceStore {
             }
         }
 
-        // destroy on-disk database and backups
-        let db_config = self
-            .inner
-            .metadata
-            .remove(namespace.clone())?
-            .ok_or_else(|| crate::Error::NamespaceDoesntExist(namespace.to_string()))?;
         Namespace::cleanup(
             &self.inner.config,
             &namespace,
             &db_config,
-            true,
+            prune_all,
             bottomless_db_id_init,
         )
         .await?;
@@ -159,6 +167,7 @@ impl NamespaceStore {
             restore_option,
             &namespace,
             self.make_reset_cb(),
+            self.resolve_attach_fn(),
         )
         .await?;
 
@@ -181,7 +190,7 @@ impl NamespaceStore {
                         }
                     }
                     ResetOp::Destroy(ns) => {
-                        if let Err(e) = this.destroy(ns.clone()).await {
+                        if let Err(e) = this.destroy(ns.clone(), false).await {
                             tracing::error!("error destroying namesace `{ns}`: {e}",);
                         }
                     }
@@ -263,6 +272,7 @@ impl NamespaceStore {
             to.clone(),
             handle.clone(),
             timestamp,
+            self.resolve_attach_fn(),
         )
         .await?;
 
@@ -323,6 +333,20 @@ impl NamespaceStore {
         .await
     }
 
+    fn resolve_attach_fn(&self) -> ResolveNamespacePathFn {
+        static FN: OnceCell<ResolveNamespacePathFn> = OnceCell::new();
+        FN.get_or_init(|| {
+            Arc::new({
+                let store = self.clone();
+                move |ns: &NamespaceName| {
+                    tokio::runtime::Handle::current()
+                        .block_on(store.with(ns.clone(), |ns| ns.path.clone()))
+                }
+            })
+        })
+        .clone()
+    }
+
     async fn load_namespace(
         &self,
         namespace: &NamespaceName,
@@ -338,6 +362,7 @@ impl NamespaceStore {
                     restore_option,
                     &namespace,
                     self.make_reset_cb(),
+                    self.resolve_attach_fn(),
                 )
                 .await?;
                 tracing::info!("loaded namespace: `{namespace}`");
@@ -367,6 +392,12 @@ impl NamespaceStore {
         db_config: DatabaseConfig,
     ) -> crate::Result<()> {
         if let Some(shared_schema_name) = &db_config.shared_schema_name {
+            // we hold a lock for the duration of the namespace creation
+            let _lock = self
+                .inner
+                .schema_locks
+                .acquire_shared(shared_schema_name.clone())
+                .await;
             return self
                 .fork(shared_schema_name.clone(), namespace, db_config, None)
                 .await;
@@ -391,13 +422,22 @@ impl NamespaceStore {
     }
 
     pub async fn shutdown(self) -> crate::Result<()> {
+        let mut set = JoinSet::new();
         self.inner.has_shutdown.store(true, Ordering::Relaxed);
+
         for (_name, entry) in self.inner.store.iter() {
+            let snapshow_at_shutdown = self.inner.snapshot_at_shutdown;
             let mut lock = entry.write().await;
             if let Some(ns) = lock.take() {
-                ns.shutdown(self.inner.snapshot_at_shutdown).await?;
+                set.spawn(async move {
+                    ns.shutdown(snapshow_at_shutdown).await?;
+                    Ok::<_, anyhow::Error>(())
+                });
             }
         }
+
+        while let Some(_) = set.join_next().await.transpose()?.transpose()? {}
+
         self.inner.metadata.shutdown().await?;
         self.inner.store.invalidate_all();
         self.inner.store.run_pending_tasks().await;
@@ -417,5 +457,9 @@ impl NamespaceStore {
 
     pub(crate) fn meta_store(&self) -> &MetaStore {
         &self.inner.metadata
+    }
+
+    pub(crate) fn schema_locks(&self) -> &SchemaLocksRegistry {
+        &self.inner.schema_locks
     }
 }

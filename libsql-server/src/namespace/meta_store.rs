@@ -126,6 +126,7 @@ pub async fn metastore_connection_maker(
                 max_batch_interval: config.backup_interval,
                 s3_upload_max_parallelism: 32,
                 s3_max_retries: 10,
+                skip_snapshot: false,
             };
             let mut replicator = bottomless::replicator::Replicator::with_options(
                 db_path.join("data").to_str().unwrap(),
@@ -137,7 +138,7 @@ pub async fn metastore_connection_maker(
             match action {
                 bottomless::replicator::RestoreAction::SnapshotMainDbFile => {
                     replicator.new_generation().await;
-                    if let Some(_handle) = replicator.snapshot_main_db_file().await? {
+                    if let Some(_handle) = replicator.snapshot_main_db_file(true).await? {
                         tracing::trace!(
                             "got snapshot handle after restore with generation upgrade"
                         );
@@ -349,7 +350,7 @@ fn try_process(
             }
         }
         tx.execute(
-            "INSERT OR REPLACE INTO namespace_configs (namespace, config) VALUES (?1, ?2)",
+            "INSERT INTO namespace_configs (namespace, config) VALUES (?1, ?2) ON CONFLICT(namespace) DO UPDATE SET config=excluded.config",
             rusqlite::params![namespace.as_str(), config_encoded],
         )?;
         tx.execute(
@@ -363,7 +364,7 @@ fn try_process(
         tx.commit()?;
     } else {
         inner.conn.execute(
-            "INSERT OR REPLACE INTO namespace_configs (namespace, config) VALUES (?1, ?2)",
+            "INSERT INTO namespace_configs (namespace, config) VALUES (?1, ?2) ON CONFLICT(namespace) DO UPDATE SET config=excluded.config",
             rusqlite::params![namespace.as_str(), config_encoded],
         )?;
     }
@@ -431,7 +432,18 @@ impl MetaStore {
             tracing::debug!("removed namespace `{}` from meta store", namespace);
             let config = sender.borrow().clone();
             let tx = guard.conn.transaction()?;
+            if config.config.is_shared_schema {
+                if crate::schema::db::schema_has_linked_dbs(&tx, &namespace)? {
+                    return Err(crate::Error::HasLinkedDbs(namespace.clone()));
+                }
+            }
             if let Some(ref shared_schema) = config.config.shared_schema_name {
+                if crate::schema::db::has_pending_migration_jobs(&tx, shared_schema)? {
+                    return Err(crate::Error::PendingMigrationOnSchema(
+                        shared_schema.clone(),
+                    ));
+                }
+
                 tx.execute(
                     "DELETE FROM shared_schema_links WHERE shared_schema_name = ? AND namespace = ?",
                     (shared_schema.as_str(), namespace.as_str()),

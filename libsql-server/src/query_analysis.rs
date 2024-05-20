@@ -288,6 +288,7 @@ impl Statement {
             stmt_count: u64,
             has_more_stmts: bool,
             c: Cmd,
+            stmt_orig: &str,
         ) -> Result<Statement> {
             let kind = StmtKind::kind(&c)
                 .ok_or_else(|| anyhow::anyhow!("unsupported statement: {original}"))?;
@@ -319,8 +320,9 @@ impl Statement {
                 }) => Some((expr.clone(), name.clone())),
                 _ => None,
             };
+
             Ok(Statement {
-                stmt: c.to_string(),
+                stmt: stmt_orig.to_string(),
                 kind,
                 is_iud,
                 is_insert,
@@ -332,16 +334,55 @@ impl Statement {
         // on the heap:
         // - https://github.com/gwenn/lemon-rs/issues/8
         // - https://github.com/gwenn/lemon-rs/pull/19
-        let mut parser = Box::new(Parser::new(s.as_bytes()).peekable());
+
+        let mut parser = Box::new(Parser::new(s.as_bytes()));
+        let parser_iter = fallible_iterator::from_fn(move || {
+            let offset = parser.offset();
+            match parser.next()? {
+                Some(cmd) => {
+                    let new_offset = parser.offset();
+                    Ok(Some((cmd, &s[offset..new_offset])))
+                }
+                None => Ok(None),
+            }
+        });
+        let mut parser = Some(parser_iter.peekable());
         let mut stmt_count = 0;
         std::iter::from_fn(move || {
+            // temporary macro to catch panic from the parser, until we fix it.
+            macro_rules! parse {
+                ($parser:expr, |$arg:ident| $b:block) => {{
+                    let Some(mut p) = $parser.take() else {
+                        return None;
+                    };
+                    match std::panic::catch_unwind(|| {
+                        let ret = {
+                            let $arg = &mut p;
+                            $b
+                        };
+                        (ret, p)
+                    }) {
+                        Ok((ret, parser)) => {
+                            $parser = Some(parser);
+                            ret
+                        }
+                        Err(_) => {
+                            return Some(Err(anyhow::anyhow!("unexpected parser error")));
+                        }
+                    }
+                }};
+            }
+
             stmt_count += 1;
-            match parser.next() {
-                Ok(Some(cmd)) => Some(parse_inner(
+            let next = parse!(parser, |p| { p.next() });
+
+            match next {
+                Ok(Some((cmd, stmt_orig))) => Some(parse_inner(
                     s,
                     stmt_count,
-                    parser.peek().map_or(true, |o| o.is_some()),
+                    parse!(parser, |p| { p.peek().map_or(true, |o| o.is_some()) }),
                     cmd,
+                    stmt_orig,
                 )),
                 Ok(None) => None,
                 Err(sqlite3_parser::lexer::sql::Error::ParserError(

@@ -35,6 +35,16 @@ pub enum Error {
     CantStepJobDryRunSuccess,
     #[error("failed to backup namespace {0}: {1}")]
     NamespaceBackupFailure(NamespaceName, BoxError),
+    #[error("migration dry run failed: {0}")]
+    DryRunFailure(String),
+    #[error("migration failed: {0}")]
+    MigrationFailure(String),
+    #[error("Error executing migration: {0}")]
+    MigrationExecuteError(Box<crate::Error>),
+    #[error("Interactive transactions are not allowed against a schema")]
+    InteractiveTxnNotAllowed,
+    #[error("Connection left in transaction state")]
+    ConnectionInTxnState,
 }
 
 impl ResponseError for Error {}
@@ -47,6 +57,7 @@ impl IntoResponse for &Error {
             Error::MigrationContainsTransactionStatements { .. } => {
                 self.format_err(StatusCode::BAD_REQUEST)
             }
+            Error::MigrationExecuteError(e) => e.as_ref().into_response(),
             _ => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }

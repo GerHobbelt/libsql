@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
-use axum::http::HeaderValue;
+use anyhow::{anyhow, bail, Error, Result};
 use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
@@ -21,6 +20,29 @@ pub struct Session {
     streams: HashMap<i32, StreamHandle>,
     sqls: HashMap<i32, String>,
     cursors: HashMap<i32, i32>,
+}
+
+impl Session {
+    pub fn new(auth: Authenticated, version: Version) -> Self {
+        Self {
+            auth,
+            version,
+            streams: HashMap::new(),
+            sqls: HashMap::new(),
+            cursors: HashMap::new(),
+        }
+    }
+
+    pub fn update_auth(&mut self, auth: Authenticated) -> Result<(), Error> {
+        if self.version < Version::Hrana2 {
+            bail!(ProtocolError::NotSupported {
+                what: "Repeated hello message",
+                min_version: Version::Hrana2,
+            })
+        }
+        self.auth = auth;
+        Ok(())
+    }
 }
 
 struct StreamHandle {
@@ -66,68 +88,22 @@ pub enum ResponseError {
     Batch(batch::BatchError),
 }
 
-pub(super) async fn handle_initial_hello(
+pub(super) async fn handle_hello(
     server: &Server,
-    version: Version,
     jwt: Option<String>,
     namespace: NamespaceName,
-) -> Result<Session> {
+) -> Result<Authenticated> {
     let namespace_jwt_key = server
         .namespaces
         .with(namespace.clone(), |ns| ns.jwt_key())
         .await??;
 
-    // Convert jwt token into a HeaderValue to be compatible with UserAuthStrategy
-    let user_credential = jwt
-        .clone()
-        .and_then(|t| HeaderValue::from_str(&format!("Bearer {t}")).ok());
-
-    let auth = namespace_jwt_key
-        .map(Jwt::new)
-        .map(Auth::new)
-        .unwrap_or(server.user_auth_strategy.clone())
-        .authenticate(UserAuthContext { user_credential })
-        .map_err(|err| anyhow!(ResponseError::Auth { source: err }))?;
-
-    Ok(Session {
-        auth,
-        version,
-        streams: HashMap::new(),
-        sqls: HashMap::new(),
-        cursors: HashMap::new(),
-    })
-}
-
-pub(super) async fn handle_repeated_hello(
-    server: &Server,
-    session: &mut Session,
-    jwt: Option<String>,
-    namespace: NamespaceName,
-) -> Result<()> {
-    if session.version < Version::Hrana2 {
-        bail!(ProtocolError::NotSupported {
-            what: "Repeated hello message",
-            min_version: Version::Hrana2,
-        })
-    }
-    let namespace_jwt_key = server
-        .namespaces
-        .with(namespace.clone(), |ns| ns.jwt_key())
-        .await??;
-
-    // Convert jwt token into a HeaderValue to be compatible with UserAuthStrategy
-    let user_credential = jwt
-        .clone()
-        .and_then(|t| HeaderValue::from_str(&format!("Bearer {t}")).ok());
-
-    session.auth = namespace_jwt_key
+    namespace_jwt_key
         .map(Jwt::new)
         .map(Auth::new)
         .unwrap_or_else(|| server.user_auth_strategy.clone())
-        .authenticate(UserAuthContext { user_credential })
-        .map_err(|err| anyhow!(ResponseError::Auth { source: err }))?;
-
-    Ok(())
+        .authenticate(Ok(UserAuthContext::bearer_opt(jwt)))
+        .map_err(|err| anyhow!(ResponseError::Auth { source: err }))
 }
 
 pub(super) async fn handle_request(
@@ -487,7 +463,19 @@ async fn stream_respond<F>(
 fn catch_stmt_error(err: anyhow::Error) -> anyhow::Error {
     match err.downcast::<stmt::StmtError>() {
         Ok(stmt_err) => anyhow!(ResponseError::Stmt(stmt_err)),
-        Err(err) => err,
+        Err(err) => match err.downcast::<crate::Error>() {
+            Ok(crate::Error::Migration(crate::schema::Error::MigrationError(_step, message))) => {
+                anyhow!(ResponseError::Stmt(stmt::StmtError::SqliteError {
+                    source: rusqlite::ffi::Error {
+                        code: rusqlite::ffi::ErrorCode::Unknown,
+                        extended_code: 4242
+                    },
+                    message
+                }))
+            }
+            Ok(err) => anyhow!(err),
+            Err(err) => err,
+        },
     }
 }
 

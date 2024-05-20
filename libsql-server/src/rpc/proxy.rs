@@ -19,7 +19,6 @@ use tokio::time::Duration;
 use uuid::Uuid;
 
 use crate::auth::parsers::parse_grpc_auth_header;
-use crate::auth::user_auth_strategies::UserAuthContext;
 use crate::auth::{Auth, Authenticated, Jwt};
 use crate::connection::{Connection as _, RequestContext};
 use crate::database::Connection;
@@ -313,7 +312,7 @@ impl ProxyService {
         req: &mut tonic::Request<T>,
     ) -> Result<RequestContext, tonic::Status> {
         let namespace = super::extract_namespace(self.disable_namespaces, req)?;
-
+        // todo dupe #auth
         let namespace_jwt_key = self
             .namespaces
             .with(namespace.clone(), |ns| ns.jwt_key())
@@ -336,9 +335,8 @@ impl ProxyService {
         };
 
         let auth = if let Some(auth) = auth {
-            auth.authenticate(UserAuthContext {
-                user_credential: parse_grpc_auth_header(req.metadata()),
-            })?
+            let context = parse_grpc_auth_header(req.metadata());
+            auth.authenticate(context)?
         } else {
             Authenticated::from_proxy_grpc_request(req)?
         };
@@ -517,6 +515,8 @@ impl QueryResultBuilder for ExecuteResultsBuilder {
     fn into_ret(self) -> Self::Ret {
         self.output.unwrap()
     }
+
+    fn add_stats(&mut self, _rows_read: u64, _rows_written: u64, _duration: Duration) {}
 }
 
 pub struct TimeoutConnection {
@@ -589,8 +589,8 @@ impl Proxy for ProxyService {
                     .db
                     .as_primary()
                     .expect("invalid call to stream_exec: not a primary")
-                    .wal_manager
-                    .wrapped()
+                    .wal_wrapper
+                    .wrapper()
                     .logger()
                     .new_frame_notifier
                     .subscribe();
@@ -605,7 +605,10 @@ impl Proxy for ProxyService {
                 }
             })?;
 
-        let conn = connection_maker.create().await.unwrap();
+        let conn = connection_maker
+            .create()
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("Unable to create DB: {:?}", e)))?;
 
         let stream = make_proxy_stream(conn, ctx, req.into_inner());
 
@@ -634,20 +637,24 @@ impl Proxy for ProxyService {
                 }
             })?;
 
-        let lock = self.clients.upgradable_read().await;
-        let conn = match lock.get(&client_id) {
-            Some(conn) => conn.clone(),
-            None => {
-                tracing::debug!("connected: {client_id}");
-                match connection_maker.create().await {
-                    Ok(conn) => {
-                        assert!(conn.is_primary());
-                        let conn = Arc::new(TimeoutConnection::new(conn));
-                        let mut lock = RwLockUpgradableReadGuard::upgrade(lock).await;
-                        lock.insert(client_id, conn.clone());
-                        conn
+        let conn = {
+            let lock = self.clients.upgradable_read().await;
+            match lock.get(&client_id) {
+                Some(conn) => conn.clone(),
+                None => {
+                    tracing::debug!("connected: {client_id}");
+                    match connection_maker.create().await {
+                        Ok(conn) => {
+                            assert!(conn.is_primary());
+                            let conn = Arc::new(TimeoutConnection::new(conn));
+                            let mut lock = RwLockUpgradableReadGuard::upgrade(lock).await;
+                            lock.insert(client_id, conn.clone());
+                            conn
+                        }
+                        Err(e) => {
+                            return Err(tonic::Status::new(tonic::Code::Internal, e.to_string()))
+                        }
                     }
-                    Err(e) => return Err(tonic::Status::new(tonic::Code::Internal, e.to_string())),
                 }
             }
         };
@@ -695,8 +702,8 @@ impl Proxy for ProxyService {
                     .db
                     .as_primary()
                     .unwrap()
-                    .wal_manager
-                    .wrapped()
+                    .wal_wrapper
+                    .wrapper()
                     .logger()
                     .new_frame_notifier
                     .subscribe();

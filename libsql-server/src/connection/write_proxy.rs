@@ -8,7 +8,7 @@ use libsql_replication::rpc::proxy::proxy_client::ProxyClient;
 use libsql_replication::rpc::proxy::{
     exec_req, exec_resp, ExecReq, ExecResp, StreamDescribeReq, StreamProgramReq,
 };
-use libsql_sys::wal::{Sqlite3Wal, Sqlite3WalManager};
+use libsql_sys::wal::wrapper::PassthroughWalWrapper;
 use libsql_sys::EncryptionConfig;
 use parking_lot::Mutex as PMutex;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -20,6 +20,7 @@ use crate::connection::program::{DescribeCol, DescribeParam};
 use crate::error::Error;
 use crate::metrics::{REPLICA_LOCAL_EXEC_MISPREDICT, REPLICA_LOCAL_PROGRAM_EXEC};
 use crate::namespace::meta_store::MetaStoreHandle;
+use crate::namespace::ResolveNamespacePathFn;
 use crate::query_analysis::TxnStatus;
 use crate::query_result_builder::{QueryBuilderConfig, QueryResultBuilder};
 use crate::replication::FrameNo;
@@ -40,7 +41,7 @@ pub struct MakeWriteProxyConn {
     max_response_size: u64,
     max_total_response_size: u64,
     primary_replication_index: Option<FrameNo>,
-    make_read_only_conn: MakeLibSqlConn<Sqlite3WalManager>,
+    make_read_only_conn: MakeLibSqlConn<PassthroughWalWrapper>,
     encryption_config: Option<EncryptionConfig>,
 }
 
@@ -58,11 +59,12 @@ impl MakeWriteProxyConn {
         max_total_response_size: u64,
         primary_replication_index: Option<FrameNo>,
         encryption_config: Option<EncryptionConfig>,
+        resolve_attach_path: ResolveNamespacePathFn,
     ) -> crate::Result<Self> {
         let client = ProxyClient::with_origin(channel, uri);
         let make_read_only_conn = MakeLibSqlConn::new(
             db_path.clone(),
-            Sqlite3WalManager::new(),
+            PassthroughWalWrapper,
             stats.clone(),
             config_store.clone(),
             extensions.clone(),
@@ -72,6 +74,7 @@ impl MakeWriteProxyConn {
             applied_frame_no_receiver.clone(),
             encryption_config.clone(),
             Arc::new(AtomicBool::new(false)), // this is always false for write proxy
+            resolve_attach_path,
         )
         .await?;
 
@@ -110,7 +113,7 @@ impl MakeConnection for MakeWriteProxyConn {
 
 pub struct WriteProxyConnection<R> {
     /// Lazily initialized read connection
-    read_conn: LibSqlConnection<Sqlite3Wal>,
+    read_conn: LibSqlConnection<PassthroughWalWrapper>,
     write_proxy: ProxyClient<Channel>,
     state: Mutex<TxnStatus>,
     /// FrameNo of the last write performed by this connection on the primary.
@@ -135,7 +138,7 @@ impl WriteProxyConnection<RpcStream> {
         applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
         builder_config: QueryBuilderConfig,
         primary_replication_index: Option<u64>,
-        read_conn: LibSqlConnection<Sqlite3Wal>,
+        read_conn: LibSqlConnection<PassthroughWalWrapper>,
     ) -> Result<Self> {
         Ok(Self {
             read_conn,
@@ -462,14 +465,13 @@ impl Connection for WriteProxyConnection<RpcStream> {
                 .read_conn
                 .execute_program(pgm.clone(), ctx.clone(), builder, replication_index)
                 .await?;
-            let new_state = self.read_conn.txn_status()?;
-            if new_state != TxnStatus::Init {
+            if !self.read_conn.is_autocommit().await? {
                 REPLICA_LOCAL_EXEC_MISPREDICT.increment(1);
                 self.read_conn.rollback(ctx.clone()).await?;
                 self.execute_remote(pgm, &mut state, ctx, builder).await
             } else {
                 REPLICA_LOCAL_PROGRAM_EXEC.increment(1);
-                *state = new_state;
+                *state = TxnStatus::Init;
                 Ok(builder)
             }
         } else {

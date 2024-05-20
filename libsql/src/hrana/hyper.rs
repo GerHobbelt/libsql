@@ -7,7 +7,7 @@ use crate::hrana::{bind_params, unwrap_err, HranaError, HttpSend, Result};
 use crate::params::Params;
 use crate::transaction::Tx;
 use crate::util::ConnectorService;
-use crate::{Rows, Statement};
+use crate::{Error, Rows, Statement};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{Stream, TryStreamExt};
@@ -85,7 +85,11 @@ impl HttpSend for HttpSender {
     }
 
     fn oneshot(self, url: Arc<str>, auth: Arc<str>, body: String) {
-        tokio::spawn(self.send(url, auth, body));
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(self.send(url, auth, body));
+        } else {
+            tracing::warn!("tried to send request to `{url}` while no runtime was available");
+        }
     }
 }
 
@@ -117,6 +121,10 @@ impl Conn for HttpConnection<HttpSender> {
         self.current_stream().execute_batch(sql).await
     }
 
+    async fn execute_transactional_batch(&self, sql: &str) -> crate::Result<()> {
+        self.current_stream().execute_transactional_batch(sql).await
+    }
+
     async fn prepare(&self, sql: &str) -> crate::Result<Statement> {
         let stream = self.current_stream().clone();
         let stmt = crate::hrana::Statement::new(stream, sql.to_string(), true)?;
@@ -141,7 +149,13 @@ impl Conn for HttpConnection<HttpSender> {
             close: Some(Box::new(|| {
                 // make sure that Hrana connection is closed and all uncommitted changes
                 // are rolled back when we're about to drop the transaction
-                drop(tokio::task::spawn(async move { tx.rollback().await }));
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    // transaction will rollback automatically after timeout on the server side
+                    // this is gracefull rollback on best-effort basis
+                    rt.spawn(async move {
+                        let _ = tx.rollback().await;
+                    });
+                }
             })),
         })
     }
@@ -258,6 +272,23 @@ impl Conn for HranaStream<HttpSender> {
         let close = !in_tx_scope || c.end_tx();
         let res = self
             .batch_inner(Batch::from_iter(stmts), close)
+            .await
+            .map_err(|e| crate::Error::Hrana(e.into()))?;
+        unwrap_err(res)
+    }
+
+    async fn execute_transactional_batch(&self, sql: &str) -> crate::Result<()> {
+        let mut stmts = Vec::new();
+        let parse = crate::parser::Statement::parse(sql);
+        for s in parse {
+            let s = s?;
+            if s.kind == crate::parser::StmtKind::TxnBegin || s.kind == crate::parser::StmtKind::TxnBeginReadOnly || s.kind == crate::parser::StmtKind::TxnEnd {
+                return Err(Error::TransactionalBatchError("Transactions forbidden inside transactional batch".to_string()));
+            }
+            stmts.push(Stmt::new(s.stmt, false));
+        }
+        let res = self
+            .batch_inner(Batch::transactional(stmts), true)
             .await
             .map_err(|e| crate::Error::Hrana(e.into()))?;
         unwrap_err(res)

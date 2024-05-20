@@ -2,6 +2,7 @@ mod fork;
 pub mod meta_store;
 mod name;
 pub mod replication_wal;
+mod schema_lock;
 mod store;
 
 use std::path::{Path, PathBuf};
@@ -16,7 +17,8 @@ use enclose::enclose;
 use futures_core::{Future, Stream};
 use hyper::Uri;
 use libsql_replication::rpc::replication::replication_log_client::ReplicationLogClient;
-use libsql_sys::wal::{Sqlite3WalManager, WalManager};
+use libsql_sys::wal::wrapper::WrapWal;
+use libsql_sys::wal::{Sqlite3Wal, Sqlite3WalManager, WalManager};
 use libsql_sys::EncryptionConfig;
 use parking_lot::Mutex;
 use rusqlite::ErrorCode;
@@ -52,10 +54,12 @@ pub use fork::ForkError;
 use self::fork::{ForkTask, PointInTimeRestore};
 use self::meta_store::MetaStoreHandle;
 pub use self::name::NamespaceName;
-use self::replication_wal::{make_replication_wal, ReplicationWalManager};
+use self::replication_wal::{make_replication_wal_wrapper, ReplicationWalWrapper};
 pub use self::store::NamespaceStore;
 
 pub type ResetCb = Box<dyn Fn(ResetOp) + Send + Sync + 'static>;
+pub type ResolveNamespacePathFn =
+    Arc<dyn Fn(&NamespaceName) -> crate::Result<Arc<Path>> + Sync + Send + 'static>;
 
 pub enum ResetOp {
     Reset(NamespaceName),
@@ -92,6 +96,7 @@ pub struct Namespace {
     tasks: JoinSet<anyhow::Result<()>>,
     stats: Arc<Stats>,
     db_config_store: MetaStoreHandle,
+    path: Arc<Path>,
 }
 
 impl Namespace {
@@ -101,16 +106,38 @@ impl Namespace {
         restore_option: RestoreOption,
         name: &NamespaceName,
         reset: ResetCb,
+        resolve_attach_path: ResolveNamespacePathFn,
     ) -> crate::Result<Self> {
         match ns_config.db_kind {
             DatabaseKind::Primary if db_config.get().is_shared_schema => {
-                Self::new_schema(ns_config, name.clone(), db_config, restore_option).await
+                Self::new_schema(
+                    ns_config,
+                    name.clone(),
+                    db_config,
+                    restore_option,
+                    resolve_attach_path,
+                )
+                .await
             }
             DatabaseKind::Primary => {
-                Self::new_primary(ns_config, name.clone(), db_config, restore_option).await
+                Self::new_primary(
+                    ns_config,
+                    name.clone(),
+                    db_config,
+                    restore_option,
+                    resolve_attach_path,
+                )
+                .await
             }
             DatabaseKind::Replica => {
-                Self::new_replica(ns_config, name.clone(), db_config, reset).await
+                Self::new_replica(
+                    ns_config,
+                    name.clone(),
+                    db_config,
+                    reset,
+                    resolve_attach_path,
+                )
+                .await
             }
         }
     }
@@ -130,25 +157,26 @@ impl Namespace {
         let ns_path = ns_config.base_path.join("dbs").join(name.as_str());
         match ns_config.db_kind {
             DatabaseKind::Primary => {
-                if prune_all {
-                    if let Some(ref options) = ns_config.bottomless_replication {
-                        let bottomless_db_id = match bottomless_db_id_init {
-                            NamespaceBottomlessDbIdInit::Provided(db_id) => db_id,
-                            NamespaceBottomlessDbIdInit::FetchFromConfig => {
-                                NamespaceBottomlessDbId::from_config(&db_config)
-                            }
-                        };
-                        let options =
-                            make_bottomless_options(options, bottomless_db_id, name.clone());
-                        let replicator = bottomless::replicator::Replicator::with_options(
-                            ns_path.join("data").to_str().unwrap(),
-                            options,
-                        )
-                        .await?;
+                if let Some(ref options) = ns_config.bottomless_replication {
+                    let bottomless_db_id = match bottomless_db_id_init {
+                        NamespaceBottomlessDbIdInit::Provided(db_id) => db_id,
+                        NamespaceBottomlessDbIdInit::FetchFromConfig => {
+                            NamespaceBottomlessDbId::from_config(&db_config)
+                        }
+                    };
+                    let options = make_bottomless_options(options, bottomless_db_id, name.clone());
+                    let replicator = bottomless::replicator::Replicator::with_options(
+                        ns_path.join("data").to_str().unwrap(),
+                        options,
+                    )
+                    .await?;
+                    if prune_all {
                         let delete_all = replicator.delete_all(None).await?;
-
                         // perform hard deletion in the background
                         tokio::spawn(delete_all.commit());
+                    } else {
+                        // for soft delete make sure that local db is fully backed up
+                        replicator.savepoint().confirmed().await?;
                     }
                 }
             }
@@ -182,6 +210,7 @@ impl Namespace {
             self.checkpoint().await?;
         }
         self.db.shutdown().await?;
+        let _ = tokio::fs::remove_file(self.path.join(".sentinel")).await;
         Ok(())
     }
 
@@ -217,17 +246,30 @@ impl Namespace {
         name: NamespaceName,
         meta_store_handle: MetaStoreHandle,
         restore_option: RestoreOption,
+        resolve_attach_path: ResolveNamespacePathFn,
     ) -> crate::Result<Self> {
+        let db_path: Arc<Path> = config.base_path.join("dbs").join(name.as_str()).into();
+        let fresh_namespace = !db_path.try_exists()?;
         // FIXME: make that truly atomic. explore the idea of using temp directories, and it's implications
-        match Self::try_new_primary(config, name.clone(), meta_store_handle, restore_option).await {
-            Ok(ns) => Ok(ns),
-            Err(e) => {
-                let path = config.base_path.join("dbs").join(name.as_str());
-                if let Err(e) = tokio::fs::remove_dir_all(path).await {
-                    tracing::error!("failed to clean dirty namespace: {e}");
+        match Self::try_new_primary(
+            config,
+            name.clone(),
+            meta_store_handle,
+            restore_option,
+            resolve_attach_path,
+            db_path.clone(),
+        )
+        .await
+        {
+            Ok(this) => Ok(this),
+            Err(e) if fresh_namespace => {
+                tracing::error!("an error occured while deleting creating namespace, cleaning...");
+                if let Err(e) = tokio::fs::remove_dir_all(&db_path).await {
+                    tracing::error!("failed to remove dirty namespace directory: {e}")
                 }
                 Err(e)
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -239,11 +281,20 @@ impl Namespace {
         restore_option: RestoreOption,
         block_writes: Arc<AtomicBool>,
         join_set: &mut JoinSet<anyhow::Result<()>>,
-    ) -> crate::Result<(PrimaryConnectionMaker, ReplicationWalManager, Arc<Stats>)> {
+        resolve_attach_path: ResolveNamespacePathFn,
+    ) -> crate::Result<(PrimaryConnectionMaker, ReplicationWalWrapper, Arc<Stats>)> {
         let db_config = meta_store_handle.get();
         let bottomless_db_id = NamespaceBottomlessDbId::from_config(&db_config);
         // FIXME: figure how to to it per-db
-        let mut is_dirty = ns_config.db_is_dirty;
+        let mut is_dirty = {
+            let sentinel_path = db_path.join(".sentinel");
+            if sentinel_path.try_exists()? {
+                true
+            } else {
+                tokio::fs::File::create(&sentinel_path).await?;
+                false
+            }
+        };
 
         // FIXME: due to a bug in logger::checkpoint_db we call regular checkpointing code
         // instead of our virtual WAL one. It's a bit tangled to fix right now, because
@@ -296,10 +347,10 @@ impl Namespace {
         )
         .await?;
 
-        let wal_manager = make_replication_wal(bottomless_replicator, logger.clone());
+        let wal_wrapper = make_replication_wal_wrapper(bottomless_replicator, logger.clone());
         let connection_maker = MakeLibSqlConn::new(
             db_path.to_path_buf(),
-            wal_manager.clone(),
+            wal_wrapper.clone(),
             stats.clone(),
             meta_store_handle.clone(),
             ns_config.extensions.clone(),
@@ -309,6 +360,7 @@ impl Namespace {
             logger.new_frame_notifier.subscribe(),
             ns_config.encryption_config.clone(),
             block_writes,
+            resolve_attach_path,
         )
         .await?
         .throttled(
@@ -329,7 +381,7 @@ impl Namespace {
                 load_dump(
                     &db_path,
                     dump,
-                    wal_manager.clone(),
+                    wal_wrapper.clone().map_wal(),
                     ns_config.encryption_config.clone(),
                 )
                 .await?;
@@ -339,7 +391,7 @@ impl Namespace {
 
         join_set.spawn(run_periodic_compactions(logger.clone()));
 
-        Ok((connection_maker, wal_manager, stats))
+        Ok((connection_maker, wal_wrapper, stats))
     }
 
     async fn try_new_primary(
@@ -347,14 +399,15 @@ impl Namespace {
         name: NamespaceName,
         meta_store_handle: MetaStoreHandle,
         restore_option: RestoreOption,
+        resolve_attach_path: ResolveNamespacePathFn,
+        db_path: Arc<Path>,
     ) -> crate::Result<Self> {
         let mut join_set = JoinSet::new();
-        let db_path = ns_config.base_path.join("dbs").join(name.as_str());
 
         tokio::fs::create_dir_all(&db_path).await?;
 
         let block_writes = Arc::new(AtomicBool::new(false));
-        let (connection_maker, wal_manager, stats) = Self::make_primary_connection_maker(
+        let (connection_maker, wal_wrapper, stats) = Self::make_primary_connection_maker(
             ns_config,
             &meta_store_handle,
             &db_path,
@@ -362,6 +415,7 @@ impl Namespace {
             restore_option,
             block_writes.clone(),
             &mut join_set,
+            resolve_attach_path,
         )
         .await?;
         let connection_maker = Arc::new(connection_maker);
@@ -386,28 +440,32 @@ impl Namespace {
             join_set.spawn(run_periodic_checkpoint(
                 connection_maker.clone(),
                 checkpoint_interval,
+                name.clone(),
             ));
         }
 
         Ok(Self {
             tasks: join_set,
             db: Database::Primary(PrimaryDatabase {
-                wal_manager,
+                wal_wrapper,
                 connection_maker,
                 block_writes,
             }),
             name,
             stats,
             db_config_store: meta_store_handle,
+            path: db_path.into(),
         })
     }
 
-    #[tracing::instrument(skip(config, reset, meta_store_handle))]
+    #[tracing::instrument(skip(config, reset, meta_store_handle, resolve_attach_path))]
+    #[async_recursion::async_recursion]
     async fn new_replica(
         config: &NamespaceConfig,
         name: NamespaceName,
         meta_store_handle: MetaStoreHandle,
         reset: ResetCb,
+        resolve_attach_path: ResolveNamespacePathFn,
     ) -> crate::Result<Self> {
         tracing::debug!("creating replica namespace");
         let db_path = config.base_path.join("dbs").join(name.as_str());
@@ -437,8 +495,18 @@ impl Namespace {
             Err(libsql_replication::replicator::Error::Meta(
                 libsql_replication::meta::Error::LogIncompatible,
             )) => {
-                tracing::error!("trying to replicate incompatible logs, reseting replica");
-                (reset)(ResetOp::Reset(name.clone()));
+                tracing::error!(
+                    "trying to replicate incompatible logs, reseting replica and nuking db dir"
+                );
+                std::fs::remove_dir_all(&db_path).unwrap();
+                return Self::new_replica(
+                    config,
+                    name,
+                    meta_store_handle,
+                    reset,
+                    resolve_attach_path,
+                )
+                .await;
             }
             Err(e) => Err(e)?,
             Ok(_) => (),
@@ -522,6 +590,7 @@ impl Namespace {
             config.max_total_response_size,
             primary_current_replicatio_index,
             config.encryption_config.clone(),
+            resolve_attach_path,
         )
         .await?
         .throttled(
@@ -539,6 +608,7 @@ impl Namespace {
             name,
             stats,
             db_config_store: meta_store_handle,
+            path: db_path.into(),
         })
     }
 
@@ -549,6 +619,7 @@ impl Namespace {
         to_ns: NamespaceName,
         to_config: MetaStoreHandle,
         timestamp: Option<NaiveDateTime>,
+        resolve_attach: ResolveNamespacePathFn,
     ) -> crate::Result<Namespace> {
         let from_config = from_config.get();
         match ns_config.db_kind {
@@ -572,8 +643,8 @@ impl Namespace {
                 };
 
                 let logger = match &from_ns.db {
-                    Database::Primary(db) => db.wal_manager.wrapped().logger(),
-                    Database::Schema(db) => db.wal_manager.wrapped().logger(),
+                    Database::Primary(db) => db.wal_wrapper.wrapper().logger(),
+                    Database::Schema(db) => db.wal_wrapper.wrapper().logger(),
                     _ => {
                         return Err(crate::Error::Fork(ForkError::Internal(Error::msg(
                             "Invalid source database type for fork",
@@ -589,6 +660,7 @@ impl Namespace {
                     bottomless_db_id,
                     to_config,
                     ns_config,
+                    resolve_attach,
                 };
 
                 let ns = fork_task.fork().await?;
@@ -603,6 +675,7 @@ impl Namespace {
         name: NamespaceName,
         meta_store_handle: MetaStoreHandle,
         restore_option: RestoreOption,
+        resolve_attach_path: ResolveNamespacePathFn,
     ) -> crate::Result<Namespace> {
         let mut join_set = JoinSet::new();
         let db_path = ns_config.base_path.join("dbs").join(name.as_str());
@@ -617,6 +690,7 @@ impl Namespace {
             restore_option,
             Arc::new(AtomicBool::new(false)), // this is always false for schema
             &mut join_set,
+            resolve_attach_path,
         )
         .await?;
 
@@ -626,11 +700,13 @@ impl Namespace {
                 name.clone(),
                 connection_maker,
                 wal_manager,
+                meta_store_handle.clone(),
             )),
             name,
             tasks: join_set,
             stats,
             db_config_store: meta_store_handle,
+            path: db_path.into(),
         })
     }
 }
@@ -641,7 +717,6 @@ pub struct NamespaceConfig {
     // Common config
     pub(crate) base_path: Arc<Path>,
     pub(crate) max_log_size: u64,
-    pub(crate) db_is_dirty: bool,
     pub(crate) max_log_duration: Option<Duration>,
     pub(crate) extensions: Arc<[PathBuf]>,
     pub(crate) stats_sender: StatsSender,
@@ -741,22 +816,21 @@ pub enum RestoreOption {
 const WASM_TABLE_CREATE: &str =
     "CREATE TABLE libsql_wasm_func_table (name text PRIMARY KEY, body text) WITHOUT ROWID;";
 
-async fn load_dump<S, C>(
+async fn load_dump<S, W>(
     db_path: &Path,
     dump: S,
-    wal_manager: C,
+    wal_wrapper: W,
     encryption_config: Option<EncryptionConfig>,
 ) -> crate::Result<(), LoadDumpError>
 where
     S: Stream<Item = std::io::Result<Bytes>> + Unpin,
-    C: WalManager + Clone + Send + 'static,
-    C::Wal: Send + 'static,
+    W: WrapWal<Sqlite3Wal> + Clone + Send + 'static,
 {
     let mut retries = 0;
     // there is a small chance we fail to acquire the lock right away, so we perform a few retries
     let conn = loop {
         let db_path = db_path.to_path_buf();
-        let wal_manager = wal_manager.clone();
+        let wal_manager = Sqlite3WalManager::default().wrap(wal_wrapper.clone());
 
         let encryption_config = encryption_config.clone();
         match tokio::task::spawn_blocking(move || {
@@ -866,7 +940,7 @@ pub async fn init_bottomless_replicator(
     match action {
         bottomless::replicator::RestoreAction::SnapshotMainDbFile => {
             replicator.new_generation().await;
-            if let Some(_handle) = replicator.snapshot_main_db_file().await? {
+            if let Some(_handle) = replicator.snapshot_main_db_file(true).await? {
                 tracing::trace!("got snapshot handle after restore with generation upgrade");
             }
             // Restoration process only leaves the local WAL file if it was
@@ -930,15 +1004,15 @@ async fn run_storage_monitor(
             // initialize a connection here, and keep it alive for the entirety of the program. If we
             // fail to open it, we wait for `duration` and try again later.
             match open_conn(&db_path, Sqlite3WalManager::new(), Some(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY), encryption_config) {
-                Ok(conn) => {
-                    if let Ok(storage_bytes_used) =
-                        conn.query_row("select sum(pgsize) from dbstat;", [], |row| {
-                            row.get::<usize, u64>(0)
-                        })
-                    {
-                        stats.set_storage_bytes_used(storage_bytes_used);
+                Ok(mut conn) => {
+                    if let Ok(tx) = conn.transaction() {
+                        let page_count = tx.query_row("pragma page_count;", [], |row| { row.get::<usize, u64>(0) });
+                        let freelist_count = tx.query_row("pragma freelist_count;", [], |row| { row.get::<usize, u64>(0) });
+                        if let (Ok(page_count), Ok(freelist_count)) = (page_count, freelist_count) {
+                            let storage_bytes_used = (page_count - freelist_count) * 4096;
+                            stats.set_storage_bytes_used(storage_bytes_used);
+                        }
                     }
-
                 },
                 Err(e) => {
                     tracing::warn!("failed to open connection for storager monitor: {e}, trying again in {duration:?}");

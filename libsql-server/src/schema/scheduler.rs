@@ -22,13 +22,14 @@ use super::db::{
     job_step_dry_run_success, register_schema_migration_job, setup_schema,
 };
 use super::error::Error;
+use super::handle::JobHandle;
 use super::migration::enqueue_migration_task;
 use super::status::{MigrationJob, MigrationTask};
 use super::{
     abort_migration_task, perform_migration, step_task, MigrationTaskStatus, SchedulerMessage,
 };
 
-const MAX_CONCCURENT_JOBS: usize = 10;
+const MAX_CONCURRENT: usize = 10;
 
 pub struct Scheduler {
     namespace_store: NamespaceStore,
@@ -41,6 +42,7 @@ pub struct Scheduler {
     current_job: Option<MigrationJob>,
     has_work: bool,
     permits: Arc<Semaphore>,
+    event_notifier: tokio::sync::broadcast::Sender<(i64, MigrationJobStatus)>,
 }
 
 impl Scheduler {
@@ -57,7 +59,8 @@ impl Scheduler {
             // initialized to true to kickoff the queue
             has_work: true,
             migration_db: Arc::new(Mutex::new(conn)),
-            permits: Arc::new(Semaphore::new(MAX_CONCCURENT_JOBS)),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+            event_notifier: tokio::sync::broadcast::Sender::new(32),
         })
     }
 
@@ -119,19 +122,23 @@ impl Scheduler {
                         // - the current batch has more tasks to enqueue
                         // - the remaining number of pending tasks is greater than the amount of in-flight tasks: we can enqueue more
                         // - there's no more in-flight nor pending tasks for the job: we need to step the job
-                        let in_flight = MAX_CONCCURENT_JOBS - self.permits.available_permits();
+                        let in_flight = MAX_CONCURRENT - self.permits.available_permits();
                         let pending_tasks = current_job.count_pending_tasks();
                         self.has_work = !self.current_batch.is_empty() || (pending_tasks == 0 && in_flight == 0) || pending_tasks > in_flight;
                     }
                     Ok(WorkResult::Job { status }) => {
-                        if status.is_finished() {
-                            self.current_job.take();
+                        let job_id = if status.is_finished() {
+                            let job = self.current_job.take().unwrap();
+                            job.job_id
                         } else {
-                            *self.current_job
+                            let current_job = self.current_job
                                 .as_mut()
-                                .expect("job is missing, but got status update for that job")
-                                .status_mut() = status;
-                        }
+                                .expect("job is missing, but got status update for that job");
+                            *current_job.status_mut() = status;
+                            current_job.job_id()
+                        };
+
+                        let _ = self.event_notifier.send((job_id, status));
 
                         self.has_work = true;
                     }
@@ -154,10 +161,14 @@ impl Scheduler {
                 ret,
             } => {
                 let res = self.register_migration_job(schema, migration).await;
-                let _ = ret.send(res);
+                let _ = ret.send(res.map(|id| JobHandle::new(id, self.event_notifier.subscribe())));
                 // it not necessary to raise the flag if we are currently processing a job: it
                 // prevents spurious wakeups, and the job will be picked up anyway.
                 self.has_work = self.current_job.is_none();
+            }
+            SchedulerMessage::GetJobStatus { job_id, ret } => {
+                let res = self.get_job_status(job_id).await;
+                let _ = ret.send(res);
             }
         }
     }
@@ -381,8 +392,25 @@ impl Scheduler {
         schema: NamespaceName,
         migration: Arc<Program>,
     ) -> Result<i64, Error> {
+        // acquire an exclusive lock to the schema before enqueueing to ensure that no namespaces
+        // are still being created before we register the migration
+        let _lock = self
+            .namespace_store
+            .schema_locks()
+            .acquire_exlusive(schema.clone())
+            .await;
         with_conn_async(self.migration_db.clone(), move |conn| {
             register_schema_migration_job(conn, &schema, &migration)
+        })
+        .await
+    }
+
+    async fn get_job_status(
+        &self,
+        job_id: i64,
+    ) -> Result<(MigrationJobStatus, Option<String>), Error> {
+        with_conn_async(self.migration_db.clone(), move |conn| {
+            super::db::get_job_status(conn, job_id)
         })
         .await
     }
@@ -731,6 +759,7 @@ async fn step_job_run_success(
 
 #[cfg(test)]
 mod test {
+    use insta::assert_debug_snapshot;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -833,7 +862,6 @@ mod test {
             db_kind: DatabaseKind::Primary,
             base_path: path.to_path_buf().into(),
             max_log_size: 1000000000,
-            db_is_dirty: false,
             max_log_duration: None,
             extensions: Arc::new([]),
             stats_sender: tokio::sync::mpsc::channel(1).0,
@@ -951,5 +979,134 @@ mod test {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cant_delete_namespace_while_pending_job() {
+        let tmp = tempdir().unwrap();
+        let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let conn = maker().unwrap();
+        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = mpsc::channel(100);
+        let config = make_config(sender.clone().into(), tmp.path());
+        let store = NamespaceStore::new(false, false, 10, config, meta_store)
+            .await
+            .unwrap();
+        let mut scheduler = Scheduler::new(store.clone(), maker().unwrap()).unwrap();
+
+        store
+            .create(
+                "schema".into(),
+                RestoreOption::Latest,
+                DatabaseConfig {
+                    is_shared_schema: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                "ns".into(),
+                RestoreOption::Latest,
+                DatabaseConfig {
+                    shared_schema_name: Some("schema".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (snd, _rcv) = tokio::sync::oneshot::channel();
+        sender
+            .send(SchedulerMessage::ScheduleMigration {
+                schema: "schema".into(),
+                migration: Program::seq(&["create table test (c)"]).into(),
+                ret: snd,
+            })
+            .await
+            .unwrap();
+
+        while !super::super::db::has_pending_migration_jobs(
+            &scheduler.migration_db.lock(),
+            &"schema".into(),
+        )
+        .unwrap()
+        {
+            scheduler.step(&mut receiver).await.unwrap();
+        }
+
+        assert_debug_snapshot!(store.destroy("ns".into(), true).await.unwrap_err());
+
+        while super::super::db::has_pending_migration_jobs(
+            &scheduler.migration_db.lock(),
+            &"schema".into(),
+        )
+        .unwrap()
+        {
+            scheduler.step(&mut receiver).await.unwrap();
+        }
+
+        store.destroy("ns".into(), true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_locks() {
+        let tmp = tempdir().unwrap();
+        let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let conn = maker().unwrap();
+        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
+            .await
+            .unwrap();
+        let (sender, _receiver) = mpsc::channel(100);
+        let config = make_config(sender.clone().into(), tmp.path());
+        let store = NamespaceStore::new(false, false, 10, config, meta_store)
+            .await
+            .unwrap();
+        let scheduler = Scheduler::new(store.clone(), maker().unwrap()).unwrap();
+
+        store
+            .create(
+                "schema".into(),
+                RestoreOption::Latest,
+                DatabaseConfig {
+                    is_shared_schema: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        {
+            let _lock = store.schema_locks().acquire_shared("schema".into()).await;
+            let fut = scheduler.register_migration_job(
+                "schema".into(),
+                Program::seq(&["create table test (x)"]).into(),
+            );
+            // we can't acquire the lock
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(1), fut)
+                .await
+                .is_err());
+        }
+
+        {
+            // simulate an ongoing migration registration
+            let _lock = store.schema_locks().acquire_exlusive("schema".into()).await;
+
+            let fut = store.create(
+                "some_namespace".into(),
+                RestoreOption::Latest,
+                DatabaseConfig {
+                    shared_schema_name: Some("schema".into()),
+                    ..Default::default()
+                },
+            );
+            // we can't acquire the lock
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(1), fut)
+                .await
+                .is_err());
+        }
     }
 }
