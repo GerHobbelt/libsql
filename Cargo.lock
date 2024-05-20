@@ -288,15 +288,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d468802bab17cbc0cc575e9b053f41e72aa36bfa6b7f55e3529ffa43161b97fa"
 
 [[package]]
-name = "autotools"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef8da1805e028a172334c3b680f93e71126f2327622faef2ec3d893c0a4ad77"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "aws-config"
 version = "0.55.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2644,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "libsql"
-version = "0.2.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2659,9 +2650,9 @@ dependencies = [
  "http",
  "hyper",
  "hyper-rustls 0.24.2",
- "libsql-replication",
  "libsql-sqlite3-parser",
  "libsql-sys",
+ "libsql_replication",
  "parking_lot",
  "pprof",
  "serde",
@@ -2704,33 +2695,6 @@ dependencies = [
  "bindgen",
  "cc",
  "libsql-wasmtime-bindings",
-]
-
-[[package]]
-name = "libsql-replication"
-version = "0.1.0"
-dependencies = [
- "arbitrary",
- "async-stream",
- "async-trait",
- "bincode",
- "bytes",
- "libsql-rusqlite",
- "libsql-sys",
- "parking_lot",
- "prost",
- "prost-build",
- "serde",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-build",
- "tracing",
- "uuid",
- "zerocopy",
 ]
 
 [[package]]
@@ -2795,10 +2759,11 @@ dependencies = [
  "jsonwebtoken",
  "libsql",
  "libsql-client",
- "libsql-replication",
  "libsql-rusqlite",
  "libsql-sqlite3-parser",
  "libsql-sys",
+ "libsql_replication",
+ "md-5",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
@@ -2811,8 +2776,6 @@ dependencies = [
  "priority-queue",
  "proptest",
  "prost",
- "prost-build",
- "protobuf-src",
  "rand",
  "regex",
  "reqwest",
@@ -2832,7 +2795,6 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tonic",
- "tonic-build",
  "tonic-web",
  "tower",
  "tower-http 0.3.5",
@@ -2883,6 +2845,7 @@ dependencies = [
 name = "libsql-sys"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "libsql-ffi",
  "libsql-rusqlite",
  "once_cell",
@@ -2907,6 +2870,33 @@ checksum = "5c4794ff21e37f83839dad45f8c7977b071315f18705cf73badc9850b9fb6b6f"
 dependencies = [
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "libsql_replication"
+version = "0.2.0"
+dependencies = [
+ "arbitrary",
+ "async-stream",
+ "async-trait",
+ "bincode",
+ "bytes",
+ "libsql-rusqlite",
+ "libsql-sys",
+ "parking_lot",
+ "prost",
+ "prost-build",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "uuid",
+ "zerocopy",
 ]
 
 [[package]]
@@ -3721,15 +3711,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "193898f59edcf43c26227dcd4c8427f00d99d61e95dcde58dabd49fa291d470e"
 dependencies = [
  "prost",
-]
-
-[[package]]
-name = "protobuf-src"
-version = "1.1.0+21.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7ac8852baeb3cc6fb83b93646fb93c0ffe5d14bf138c945ceb4b9948ee0e3c1"
-dependencies = [
- "autotools",
 ]
 
 [[package]]

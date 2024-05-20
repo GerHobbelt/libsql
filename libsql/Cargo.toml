@@ -1,6 +1,6 @@
 [package]
 name = "libsql"
-version = "0.2.0-alpha.1"
+version = "0.2.0"
 edition = "2021"
 description = "libSQL library: the main gateway for interacting with the database"
 repository = "https://github.com/tursodatabase/libsql"
@@ -38,7 +38,7 @@ zerocopy = { version = "0.7.28", optional = true }
 sqlite3-parser = { package = "libsql-sqlite3-parser", path = "../vendored/sqlite3-parser", version = "0.11", optional = true }
 fallible-iterator = { version = "0.3", optional = true }
 
-libsql-replication = { path = "../libsql-replication", optional = true }
+libsql_replication = { version = "0.2", path = "../libsql-replication", optional = true }
 async-stream = { version = "0.3.5", optional = true }
 
 [dev-dependencies]
@@ -82,7 +82,7 @@ replication = [
   "dep:tower",
   "dep:hyper-rustls",
   "dep:futures",
-  "dep:libsql-replication",
+  "dep:libsql_replication",
   "dep:async-stream",
 ]
 hrana = [
@@ -110,11 +110,11 @@ cloudflare = [
   "wasm",
   "dep:worker"
 ]
+encryption = ["core", "libsql-sys/encryption"]
 
 [[bench]]
 name = "benchmark"
 harness = false
-
 
 [package.metadata.docs.rs]
 all-features = true

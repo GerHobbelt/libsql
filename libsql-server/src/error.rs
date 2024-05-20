@@ -99,6 +99,17 @@ pub enum Error {
     // This is for errors returned by moka
     #[error(transparent)]
     Ref(#[from] std::sync::Arc<Self>),
+    #[error("Unable to decode protobuf: {0}")]
+    ProstDecode(#[from] prost::DecodeError),
+}
+
+impl AsRef<Self> for Error {
+    fn as_ref(&self) -> &Self {
+        match self {
+            Self::Ref(this) => this.as_ref(),
+            _ => self,
+        }
+    }
 }
 
 trait ResponseError: std::error::Error {
@@ -166,6 +177,7 @@ impl IntoResponse for &Error {
             NamespaceStoreShutdown => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
             MetaStoreUpdateFailure(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             Ref(this) => this.as_ref().into_response(),
+            ProstDecode(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }
 }

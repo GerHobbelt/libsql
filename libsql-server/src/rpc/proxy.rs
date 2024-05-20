@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::auth::{Auth, Authenticated};
 use crate::connection::Connection;
 use crate::database::{Database, PrimaryConnection};
-use crate::namespace::{NamespaceStore, PrimaryNamespaceMaker};
+use crate::namespace::{NamespaceName, NamespaceStore, PrimaryNamespaceMaker};
 use crate::query_result_builder::{
     Column, QueryBuilderConfig, QueryResultBuilder, QueryResultBuilderError,
 };
@@ -302,6 +302,33 @@ impl ProxyService {
     pub fn clients(&self) -> Arc<RwLock<HashMap<Uuid, Arc<PrimaryConnection>>>> {
         self.clients.clone()
     }
+
+    async fn auth<T>(
+        &self,
+        req: &mut tonic::Request<T>,
+        namespace: NamespaceName,
+    ) -> Result<Authenticated, tonic::Status> {
+        let namespace_jwt_key = self.namespaces.with(namespace, |ns| ns.jwt_key()).await;
+        let namespace_jwt_key = match namespace_jwt_key {
+            Ok(Ok(jwt_key)) => Ok(jwt_key),
+            Err(e) => match e.as_ref() {
+                crate::error::Error::NamespaceDoesntExist(_) => Ok(None),
+                _ => Err(tonic::Status::internal(format!(
+                    "Error fetching jwt key for a namespace: {}",
+                    e
+                ))),
+            },
+            Ok(Err(e)) => Err(tonic::Status::internal(format!(
+                "Error fetching jwt key for a namespace: {}",
+                e
+            ))),
+        }?;
+        Ok(if let Some(auth) = &self.auth {
+            auth.authenticate_grpc(&req, self.disable_namespaces, namespace_jwt_key)?
+        } else {
+            Authenticated::from_proxy_grpc_request(&req, self.disable_namespaces)?
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -491,15 +518,11 @@ impl Proxy for ProxyService {
 
     async fn stream_exec(
         &self,
-        req: tonic::Request<tonic::Streaming<ExecReq>>,
+        mut req: tonic::Request<tonic::Streaming<ExecReq>>,
     ) -> Result<tonic::Response<Self::StreamExecStream>, tonic::Status> {
-        let auth = if let Some(auth) = &self.auth {
-            auth.authenticate_grpc(&req, self.disable_namespaces)?
-        } else {
-            Authenticated::from_proxy_grpc_request(&req, self.disable_namespaces)?
-        };
-
         let namespace = super::extract_namespace(self.disable_namespaces, &req)?;
+        let auth = self.auth(&mut req, namespace.clone()).await?;
+
         let (connection_maker, _new_frame_notifier) = self
             .namespaces
             .with(namespace, |ns| {
@@ -531,14 +554,10 @@ impl Proxy for ProxyService {
 
     async fn execute(
         &self,
-        req: tonic::Request<rpc::ProgramReq>,
+        mut req: tonic::Request<rpc::ProgramReq>,
     ) -> Result<tonic::Response<ExecuteResults>, tonic::Status> {
-        let auth = if let Some(auth) = &self.auth {
-            auth.authenticate_grpc(&req, self.disable_namespaces)?
-        } else {
-            Authenticated::from_proxy_grpc_request(&req, self.disable_namespaces)?
-        };
         let namespace = super::extract_namespace(self.disable_namespaces, &req)?;
+        let auth = self.auth(&mut req, namespace.clone()).await?;
         let req = req.into_inner();
         let pgm = crate::connection::program::Program::try_from(req.pgm.unwrap())
             .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
@@ -602,16 +621,12 @@ impl Proxy for ProxyService {
 
     async fn describe(
         &self,
-        msg: tonic::Request<DescribeRequest>,
+        mut msg: tonic::Request<DescribeRequest>,
     ) -> Result<tonic::Response<DescribeResult>, tonic::Status> {
-        let auth = if let Some(auth) = &self.auth {
-            auth.authenticate_grpc(&msg, self.disable_namespaces)?
-        } else {
-            Authenticated::from_proxy_grpc_request(&msg, self.disable_namespaces)?
-        };
+        let namespace = super::extract_namespace(self.disable_namespaces, &msg)?;
+        let auth = self.auth(&mut msg, namespace.clone()).await?;
 
         // FIXME: copypasta from execute(), creatively extract to a helper function
-        let namespace = super::extract_namespace(self.disable_namespaces, &msg)?;
         let lock = self.clients.upgradable_read().await;
         let (connection_maker, _new_frame_notifier) = self
             .namespaces

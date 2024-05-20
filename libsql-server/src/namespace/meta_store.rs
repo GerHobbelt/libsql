@@ -1,16 +1,16 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use bottomless::bottomless_wal::BottomlessWalWrapper;
 use bottomless::replicator::CompressionKind;
+use libsql_replication::rpc::metadata;
 use libsql_sys::wal::{
     wrapper::{WalWrapper, WrappedWal},
     Sqlite3Wal, Sqlite3WalManager,
 };
 use parking_lot::Mutex;
+use prost::Message;
 use tokio::sync::{
     mpsc,
     watch::{self, Receiver, Sender},
@@ -41,14 +41,23 @@ pub struct MetaStoreHandle {
 #[derive(Debug, Clone)]
 enum HandleState {
     Internal(Arc<Mutex<Arc<DatabaseConfig>>>),
-    External(mpsc::Sender<ChangeMsg>, Receiver<Arc<DatabaseConfig>>),
+    External(mpsc::Sender<ChangeMsg>, Receiver<InnerConfig>),
+}
+
+#[derive(Debug, Default, Clone)]
+struct InnerConfig {
+    /// Version of this config _per_ each running process of sqld, this means
+    /// that this version is not stored between restarts and is only used to track
+    /// config changes during the lifetime of the sqld process.
+    version: usize,
+    config: Arc<DatabaseConfig>,
 }
 
 struct MetaStoreInner {
     // TODO(lucio): Use a concurrent hashmap so we don't block connection creation
     // when we are updating the config. The config si already synced via the watch
     // channel.
-    configs: HashMap<NamespaceName, Sender<Arc<DatabaseConfig>>>,
+    configs: HashMap<NamespaceName, Sender<InnerConfig>>,
     conn: Connection,
     wal_manager: WalManager,
 }
@@ -58,7 +67,7 @@ struct MetaStoreInner {
 fn process(msg: ChangeMsg, inner: Arc<Mutex<MetaStoreInner>>) -> Result<()> {
     let (namespace, config) = msg;
 
-    let config_encoded = serde_json::to_vec(&config)?;
+    let config_encoded = metadata::DatabaseConfig::from(&*config).encode_to_vec();
 
     let inner = &mut inner.lock();
 
@@ -70,11 +79,16 @@ fn process(msg: ChangeMsg, inner: Arc<Mutex<MetaStoreInner>>) -> Result<()> {
     let configs = &mut inner.configs;
 
     if let Some(config_watch) = configs.get_mut(&namespace) {
+        let new_version = config_watch.borrow().version.wrapping_add(1);
+
         config_watch.send_modify(|c| {
-            *c = config;
+            *c = InnerConfig {
+                version: new_version,
+                config,
+            };
         });
     } else {
-        let (tx, _) = watch::channel(config);
+        let (tx, _) = watch::channel(InnerConfig { version: 0, config });
         configs.insert(namespace, tx);
     }
 
@@ -82,7 +96,7 @@ fn process(msg: ChangeMsg, inner: Arc<Mutex<MetaStoreInner>>) -> Result<()> {
 }
 
 #[tracing::instrument(skip(db))]
-fn restore(db: &Connection) -> Result<HashMap<NamespaceName, Sender<Arc<DatabaseConfig>>>> {
+fn restore(db: &Connection) -> Result<HashMap<NamespaceName, Sender<InnerConfig>>> {
     tracing::info!("restoring meta store");
 
     db.execute(
@@ -116,15 +130,18 @@ fn restore(db: &Connection) -> Result<HashMap<NamespaceName, Sender<Arc<Database
                     }
                 };
 
-                let config = match serde_json::from_slice::<DatabaseConfig>(&v[..]) {
-                    Ok(c) => c,
+                let config = match metadata::DatabaseConfig::decode(&v[..]) {
+                    Ok(c) => Arc::new(DatabaseConfig::from(&c)),
                     Err(e) => {
                         tracing::warn!("unable to convert config: {}", e);
                         continue;
                     }
                 };
 
-                let (tx, _) = watch::channel(Arc::new(config));
+                // We don't store the version in the sqlitedb due to the session token
+                // changed each time we start the primary, this will cause the replica to
+                // handshake again and get the latest config.
+                let (tx, _) = watch::channel(InnerConfig { version: 0, config });
 
                 configs.insert(ns, tx);
             }
@@ -198,7 +215,7 @@ impl MetaStore {
             replicator.map(BottomlessWalWrapper::new),
             Sqlite3WalManager::default(),
         );
-        let conn = open_conn_active_checkpoint(&db_path, wal_manager.clone(), None, 1000)?;
+        let conn = open_conn_active_checkpoint(&db_path, wal_manager.clone(), None, 1000, None)?;
 
         let configs = restore(&conn)?;
 
@@ -235,7 +252,7 @@ impl MetaStore {
         let sender = lock.entry(namespace.clone()).or_insert_with(|| {
             // TODO(lucio): if no entry exists we need to ensure we send the update to
             // the bg channel.
-            let (tx, _) = watch::channel(Arc::new(DatabaseConfig::default()));
+            let (tx, _) = watch::channel(InnerConfig::default());
             tx
         });
 
@@ -246,6 +263,24 @@ impl MetaStore {
         MetaStoreHandle {
             namespace,
             inner: HandleState::External(change_tx, rx),
+        }
+    }
+
+    pub fn remove(&self, namespace: NamespaceName) -> Result<Option<Arc<DatabaseConfig>>> {
+        tracing::debug!("removing namespace `{}` from meta store", namespace);
+
+        let mut guard = self.inner.lock();
+        guard.conn.execute(
+            "DELETE FROM namespace_configs WHERE namespace = ?",
+            [namespace.as_str()],
+        )?;
+        if let Some(sender) = guard.configs.remove(&namespace) {
+            tracing::debug!("removed namespace `{}` from meta store", namespace);
+            let config = sender.borrow().clone();
+            Ok(Some(config.config))
+        } else {
+            tracing::trace!("namespace `{}` not found in meta store", namespace);
+            Ok(None)
         }
     }
 
@@ -288,7 +323,10 @@ impl MetaStoreHandle {
         let config_path = db_path.as_ref().join("config.json");
 
         let config = match fs::read(config_path) {
-            Ok(data) => serde_json::from_slice(&data)?,
+            Ok(data) => {
+                let c = metadata::DatabaseConfig::decode(&data[..])?;
+                DatabaseConfig::from(&c)
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => DatabaseConfig::default(),
             Err(err) => return Err(Error::IOError(err)),
         };
@@ -309,7 +347,14 @@ impl MetaStoreHandle {
     pub fn get(&self) -> Arc<DatabaseConfig> {
         match &self.inner {
             HandleState::Internal(config) => config.lock().clone(),
-            HandleState::External(_, config) => config.borrow().clone(),
+            HandleState::External(_, config) => config.borrow().clone().config,
+        }
+    }
+
+    pub fn version(&self) -> usize {
+        match &self.inner {
+            HandleState::Internal(_) => 0,
+            HandleState::External(_, config) => config.borrow().version,
         }
     }
 

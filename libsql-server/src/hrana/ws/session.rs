@@ -64,14 +64,19 @@ pub enum ResponseError {
     Batch(batch::BatchError),
 }
 
-pub(super) fn handle_initial_hello<F: MakeNamespace>(
+pub(super) async fn handle_initial_hello<F: MakeNamespace>(
     server: &Server<F>,
     version: Version,
     jwt: Option<String>,
+    namespace: NamespaceName,
 ) -> Result<Session<<F::Database as Database>::Connection>> {
+    let namespace_jwt_key = server
+        .namespaces
+        .with(namespace, |ns| ns.jwt_key())
+        .await??;
     let authenticated = server
         .auth
-        .authenticate_jwt(jwt.as_deref(), server.disable_namespaces)
+        .authenticate_jwt(jwt.as_deref(), server.disable_namespaces, namespace_jwt_key)
         .map_err(|err| anyhow!(ResponseError::Auth { source: err }))?;
 
     Ok(Session {
@@ -83,10 +88,11 @@ pub(super) fn handle_initial_hello<F: MakeNamespace>(
     })
 }
 
-pub(super) fn handle_repeated_hello<F: MakeNamespace>(
+pub(super) async fn handle_repeated_hello<F: MakeNamespace>(
     server: &Server<F>,
     session: &mut Session<<F::Database as Database>::Connection>,
     jwt: Option<String>,
+    namespace: NamespaceName,
 ) -> Result<()> {
     if session.version < Version::Hrana2 {
         bail!(ProtocolError::NotSupported {
@@ -94,10 +100,13 @@ pub(super) fn handle_repeated_hello<F: MakeNamespace>(
             min_version: Version::Hrana2,
         })
     }
-
+    let namespace_jwt_key = server
+        .namespaces
+        .with(namespace, |ns| ns.jwt_key())
+        .await??;
     session.authenticated = server
         .auth
-        .authenticate_jwt(jwt.as_deref(), server.disable_namespaces)
+        .authenticate_jwt(jwt.as_deref(), server.disable_namespaces, namespace_jwt_key)
         .map_err(|err| anyhow!(ResponseError::Auth { source: err }))?;
     Ok(())
 }

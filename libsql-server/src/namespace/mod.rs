@@ -31,6 +31,7 @@ use tokio_util::io::StreamReader;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+use crate::auth::parse_jwt_key;
 use crate::auth::Authenticated;
 use crate::config::MetaStoreConfig;
 use crate::connection::config::DatabaseConfig;
@@ -250,7 +251,7 @@ impl MakeNamespace for PrimaryNamespaceMaker {
         meta_store: &MetaStore,
     ) -> crate::Result<()> {
         let ns_path = self.config.base_path.join("dbs").join(namespace.as_str());
-        let meta_store_handle = meta_store.handle(namespace.clone());
+        let db_config = meta_store.remove(namespace.clone())?;
 
         if prune_all {
             if let Some(ref options) = self.config.bottomless_replication {
@@ -259,9 +260,10 @@ impl MakeNamespace for PrimaryNamespaceMaker {
                     NamespaceBottomlessDbIdInit::FetchFromConfig => {
                         if !ns_path.try_exists()? {
                             NamespaceBottomlessDbId::NotProvided
-                        } else {
-                            let config = meta_store_handle.get();
+                        } else if let Some(config) = db_config {
                             NamespaceBottomlessDbId::from_config(&config)
+                        } else {
+                            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
                         }
                     }
                 };
@@ -279,6 +281,7 @@ impl MakeNamespace for PrimaryNamespaceMaker {
         }
 
         if ns_path.try_exists()? {
+            tracing::debug!("removing database directory: {}", ns_path.display());
             tokio::fs::remove_dir_all(ns_path).await?;
         }
 
@@ -473,7 +476,6 @@ impl<M: MakeNamespace> NamespaceStore<M> {
                 &self.inner.metadata,
             )
             .await?;
-
         tracing::info!("destroyed namespace: {namespace}");
 
         Ok(())
@@ -803,6 +805,25 @@ impl<T: Database> Namespace<T> {
         self.db.shutdown().await?;
         Ok(())
     }
+
+    pub fn config(&self) -> Arc<DatabaseConfig> {
+        self.db_config_store.get()
+    }
+
+    pub fn config_version(&self) -> usize {
+        self.db_config_store.version()
+    }
+
+    pub fn jwt_key(&self) -> crate::Result<Option<jsonwebtoken::DecodingKey>> {
+        let config = self.db_config_store.get();
+        if let Some(jwt_key) = config.jwt_key.as_deref() {
+            Ok(Some(
+                parse_jwt_key(jwt_key).context("Could not parse JWT decoding key")?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 pub struct ReplicaNamespaceConfig {
@@ -817,6 +838,7 @@ pub struct ReplicaNamespaceConfig {
     pub extensions: Arc<[PathBuf]>,
     /// Stats monitor
     pub stats_sender: StatsSender,
+    pub encryption_key: Option<bytes::Bytes>,
 }
 
 impl Namespace<ReplicaDatabase> {
@@ -832,14 +854,19 @@ impl Namespace<ReplicaDatabase> {
 
         let rpc_client =
             ReplicationLogClient::with_origin(config.channel.clone(), config.uri.clone());
-        let client =
-            crate::replication::replicator_client::Client::new(name.clone(), rpc_client, &db_path)
-                .await?;
+        let client = crate::replication::replicator_client::Client::new(
+            name.clone(),
+            rpc_client,
+            &db_path,
+            meta_store_handle.clone(),
+        )
+        .await?;
         let applied_frame_no_receiver = client.current_frame_no_notifier.subscribe();
         let mut replicator = libsql_replication::replicator::Replicator::new(
             client,
             db_path.join("data"),
             DEFAULT_AUTO_CHECKPOINT,
+            config.encryption_key.clone(),
         )
         .await?;
 
@@ -911,6 +938,7 @@ impl Namespace<ReplicaDatabase> {
             config.stats_sender.clone(),
             name.clone(),
             applied_frame_no_receiver.clone(),
+            config.encryption_key.clone(),
         )
         .await?;
 
@@ -926,6 +954,7 @@ impl Namespace<ReplicaDatabase> {
             config.max_total_response_size,
             name.clone(),
             primary_current_replicatio_index,
+            config.encryption_key.clone(),
         )
         .await?
         .throttled(
@@ -959,6 +988,7 @@ pub struct PrimaryNamespaceConfig {
     pub max_total_response_size: u64,
     pub checkpoint_interval: Option<Duration>,
     pub disable_namespace: bool,
+    pub encryption_key: Option<bytes::Bytes>,
 }
 
 pub type DumpStream =
@@ -1088,6 +1118,7 @@ impl Namespace<PrimaryDatabase> {
             config.stats_sender.clone(),
             name.clone(),
             logger.new_frame_notifier.subscribe(),
+            config.encryption_key.clone(),
         )
         .await?;
 
@@ -1102,6 +1133,7 @@ impl Namespace<PrimaryDatabase> {
             config.max_total_response_size,
             auto_checkpoint,
             logger.new_frame_notifier.subscribe(),
+            config.encryption_key.clone(),
         )
         .await?
         .throttled(
@@ -1119,7 +1151,13 @@ impl Namespace<PrimaryDatabase> {
                 Err(LoadDumpError::LoadDumpExistingDb)?;
             }
             RestoreOption::Dump(dump) => {
-                load_dump(&db_path, dump, wal_manager.clone()).await?;
+                load_dump(
+                    &db_path,
+                    dump,
+                    wal_manager.clone(),
+                    config.encryption_key.clone(),
+                )
+                .await?;
             }
             _ => { /* other cases were already handled when creating bottomless */ }
         }
@@ -1152,6 +1190,7 @@ async fn make_stats(
     stats_sender: StatsSender,
     name: NamespaceName,
     mut current_frame_no: watch::Receiver<Option<FrameNo>>,
+    encryption_key: Option<bytes::Bytes>,
 ) -> anyhow::Result<Arc<Stats>> {
     let stats = Stats::new(name.clone(), db_path, join_set).await?;
 
@@ -1176,7 +1215,11 @@ async fn make_stats(
         }
     });
 
-    join_set.spawn(run_storage_monitor(db_path.into(), Arc::downgrade(&stats)));
+    join_set.spawn(run_storage_monitor(
+        db_path.into(),
+        Arc::downgrade(&stats),
+        encryption_key,
+    ));
 
     Ok(stats)
 }
@@ -1202,6 +1245,7 @@ async fn load_dump<S, C>(
     db_path: &Path,
     dump: S,
     wal_manager: C,
+    encryption_key: Option<bytes::Bytes>,
 ) -> crate::Result<(), LoadDumpError>
 where
     S: Stream<Item = std::io::Result<Bytes>> + Unpin,
@@ -1213,7 +1257,13 @@ where
     let conn = loop {
         let db_path = db_path.to_path_buf();
         let wal_manager = wal_manager.clone();
-        match tokio::task::spawn_blocking(move || open_conn(&db_path, wal_manager, None)).await? {
+
+        let encryption_key = encryption_key.clone();
+        match tokio::task::spawn_blocking(move || {
+            open_conn(&db_path, wal_manager, None, encryption_key)
+        })
+        .await?
+        {
             Ok(conn) => {
                 break conn;
             }
@@ -1357,7 +1407,11 @@ fn check_fresh_db(path: &Path) -> crate::Result<bool> {
 // Periodically check the storage used by the database and save it in the Stats structure.
 // TODO: Once we have a separate fiber that does WAL checkpoints, running this routine
 // right after checkpointing is exactly where it should be done.
-async fn run_storage_monitor(db_path: PathBuf, stats: Weak<Stats>) -> anyhow::Result<()> {
+async fn run_storage_monitor(
+    db_path: PathBuf,
+    stats: Weak<Stats>,
+    encryption_key: Option<bytes::Bytes>,
+) -> anyhow::Result<()> {
     // on initialization, the database file doesn't exist yet, so we wait a bit for it to be
     // created
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1369,11 +1423,13 @@ async fn run_storage_monitor(db_path: PathBuf, stats: Weak<Stats>) -> anyhow::Re
         let Some(stats) = stats.upgrade() else {
             return Ok(());
         };
+
+        let encryption_key = encryption_key.clone();
         let _ = tokio::task::spawn_blocking(move || {
             // because closing the last connection interferes with opening a new one, we lazily
             // initialize a connection here, and keep it alive for the entirety of the program. If we
             // fail to open it, we wait for `duration` and try again later.
-            match open_conn(&db_path, Sqlite3WalManager::new(), Some(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)) {
+            match open_conn(&db_path, Sqlite3WalManager::new(), Some(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY), encryption_key) {
                 Ok(conn) => {
                     if let Ok(storage_bytes_used) =
                         conn.query_row("select sum(pgsize) from dbstat;", [], |row| {

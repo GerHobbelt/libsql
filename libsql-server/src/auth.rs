@@ -71,6 +71,7 @@ impl Auth {
         &self,
         auth_header: Option<&hyper::header::HeaderValue>,
         disable_namespaces: bool,
+        namespace_jwt_key: Option<jsonwebtoken::DecodingKey>,
     ) -> Result<Authenticated, AuthError> {
         if self.disabled {
             return Ok(Authenticated::Authorized(Authorized {
@@ -101,7 +102,9 @@ impl Auth {
                     Err(AuthError::BasicRejected)
                 }
             }
-            HttpAuthHeader::Bearer(token) => self.validate_jwt(&token, disable_namespaces),
+            HttpAuthHeader::Bearer(token) => {
+                self.validate_jwt(&token, disable_namespaces, namespace_jwt_key)
+            }
         }
     }
 
@@ -109,6 +112,7 @@ impl Auth {
         &self,
         req: &tonic::Request<T>,
         disable_namespaces: bool,
+        namespace_jwt_key: Option<jsonwebtoken::DecodingKey>,
     ) -> Result<Authenticated, Status> {
         let metadata = req.metadata();
 
@@ -117,7 +121,7 @@ impl Auth {
             .map(|v| v.to_bytes().expect("Auth should always be ASCII"))
             .map(|v| HeaderValue::from_maybe_shared(v).expect("Should already be valid header"));
 
-        self.authenticate_http(auth.as_ref(), disable_namespaces)
+        self.authenticate_http(auth.as_ref(), disable_namespaces, namespace_jwt_key)
             .map_err(Into::into)
     }
 
@@ -125,6 +129,7 @@ impl Auth {
         &self,
         jwt: Option<&str>,
         disable_namespaces: bool,
+        namespace_jwt_key: Option<jsonwebtoken::DecodingKey>,
     ) -> Result<Authenticated, AuthError> {
         if self.disabled {
             return Ok(Authenticated::Authorized(Authorized {
@@ -137,16 +142,21 @@ impl Auth {
             return Err(AuthError::JwtMissing);
         };
 
-        self.validate_jwt(jwt, disable_namespaces)
+        self.validate_jwt(jwt, disable_namespaces, namespace_jwt_key)
     }
 
     fn validate_jwt(
         &self,
         jwt: &str,
         disable_namespaces: bool,
+        namespace_jwt_key: Option<jsonwebtoken::DecodingKey>,
     ) -> Result<Authenticated, AuthError> {
-        let Some(jwt_key) = self.jwt_key.as_ref() else {
-            return Err(AuthError::JwtNotAllowed);
+        let jwt_key = match namespace_jwt_key.as_ref() {
+            Some(jwt_key) => jwt_key,
+            None => match self.jwt_key.as_ref() {
+                Some(jwt_key) => jwt_key,
+                None => return Err(AuthError::JwtNotAllowed),
+            },
         };
         validate_jwt(jwt_key, jwt, disable_namespaces)
     }
@@ -368,7 +378,7 @@ mod tests {
     use hyper::header::HeaderValue;
 
     fn authenticate_http(auth: &Auth, header: &str) -> Result<Authenticated, AuthError> {
-        auth.authenticate_http(Some(&HeaderValue::from_str(header).unwrap()), false)
+        auth.authenticate_http(Some(&HeaderValue::from_str(header).unwrap()), false, None)
     }
 
     const VALID_JWT_KEY: &str = "zaMv-aFGmB7PXkjM4IrMdF6B5zCYEiEGXW3RgMjNAtc";
@@ -400,9 +410,9 @@ mod tests {
     #[test]
     fn test_default() {
         let auth = Auth::default();
-        assert_err!(auth.authenticate_http(None, false));
+        assert_err!(auth.authenticate_http(None, false, None));
         assert_err!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWJlYXI="));
-        assert_err!(auth.authenticate_jwt(Some(VALID_JWT), false));
+        assert_err!(auth.authenticate_jwt(Some(VALID_JWT), false, None));
     }
 
     #[test]
@@ -420,7 +430,7 @@ mod tests {
         assert_err!(authenticate_http(&auth, "Basic d29qdgvronrozwjlyxi="));
         assert_err!(authenticate_http(&auth, "Basic d29qdGVrOnRoZWZveA=="));
 
-        assert_err!(auth.authenticate_http(None, false));
+        assert_err!(auth.authenticate_http(None, false, None));
         assert_err!(authenticate_http(&auth, ""));
         assert_err!(authenticate_http(&auth, "foobar"));
         assert_err!(authenticate_http(&auth, "foo bar"));
@@ -457,7 +467,7 @@ mod tests {
             jwt_key: Some(parse_jwt_key(VALID_JWT_KEY).unwrap()),
             ..Auth::default()
         };
-        assert_ok!(auth.authenticate_jwt(Some(VALID_JWT), false));
-        assert_err!(auth.authenticate_jwt(Some(&VALID_JWT[..80]), false));
+        assert_ok!(auth.authenticate_jwt(Some(VALID_JWT), false, None));
+        assert_err!(auth.authenticate_jwt(Some(&VALID_JWT[..80]), false, None));
     }
 }

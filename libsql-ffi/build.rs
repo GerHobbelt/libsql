@@ -11,11 +11,13 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
 
-    println!("cargo:rerun-if-changed={BUNDLED_DIR}/src");
-
     if std::env::var("LIBSQL_DEV").is_ok() || cfg!(feature = "wasmtime-bindings") {
-        println!("cargo:rerun-if-changed={SQLITE_DIR}/src");
         make_amalgation();
+    }
+
+    if cfg!(feature = "multiple-ciphers") {
+        build_multiple_ciphers(&out_dir, &out_path);
+        return;
     }
 
     build_bundled(&out_dir, &out_path);
@@ -217,6 +219,32 @@ pub fn build_bundled(out_dir: &str, out_path: &Path) {
     cfg.compile(LIB_NAME);
 
     println!("cargo:lib_dir={out_dir}");
+}
+
+fn build_multiple_ciphers(out_dir: &str, out_path: &Path) {
+    let bindgen_rs_path = if cfg!(feature = "session") {
+        "bundled/bindings/session_bindgen.rs"
+    } else {
+        "bundled/bindings/bindgen.rs"
+    };
+    if std::env::var("LIBSQL_DEV").is_ok() {
+        let header = HeaderLocation::FromPath(format!("{BUNDLED_DIR}/src/sqlite3.h"));
+        bindings::write_to_out_dir(header, bindgen_rs_path.as_ref());
+    }
+    let dir = env!("CARGO_MANIFEST_DIR");
+    std::fs::copy(format!("{dir}/{bindgen_rs_path}"), out_path).unwrap();
+
+    let _output = Command::new("./build_libsqlite3mc.sh")
+        .current_dir(BUNDLED_DIR)
+        .output()
+        .unwrap();
+    std::fs::copy(
+        format!("{BUNDLED_DIR}/SQLite3MultipleCiphers/build/libsqlite3mc_static.a"),
+        format!("{out_dir}/libsqlite3mc.a"),
+    )
+    .unwrap();
+    println!("cargo:rustc-link-lib=static=sqlite3mc");
+    println!("cargo:rustc-link-search={out_dir}");
 }
 
 fn env(name: &str) -> Option<OsString> {
