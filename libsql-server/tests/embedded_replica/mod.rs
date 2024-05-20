@@ -1,3 +1,7 @@
+#![allow(deprecated)]
+
+mod local;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,6 +38,11 @@ fn make_primary(sim: &mut Sim, path: PathBuf) {
         async move {
             let server = TestServer {
                 path: path.into(),
+                db_config: DbConfig {
+                    max_log_size: 1,
+                    max_log_duration: Some(5.0),
+                    ..Default::default()
+                },
                 user_api_config: UserApiConfig {
                     ..Default::default()
                 },
@@ -286,6 +295,7 @@ fn replica_primary_reset() {
             .await
             .unwrap()
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)
@@ -299,6 +309,7 @@ fn replica_primary_reset() {
             .await
             .unwrap()
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)
@@ -343,6 +354,7 @@ fn replica_primary_reset() {
             .await
             .unwrap()
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)
@@ -356,6 +368,7 @@ fn replica_primary_reset() {
             .await
             .unwrap()
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)
@@ -463,6 +476,7 @@ fn replicate_with_snapshots() {
         .tcp_capacity(200)
         .build();
 
+    const ROW_COUNT: i64 = 200;
     let tmp = tempdir().unwrap();
 
     init_tracing();
@@ -496,12 +510,17 @@ fn replicate_with_snapshots() {
     });
 
     sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/foo/create", json!({}))
+            .await?;
+
         let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)
             .unwrap();
         let conn = db.connect().unwrap();
         conn.execute("create table test (x)", ()).await.unwrap();
         // insert enough to trigger snapshot creation.
-        for _ in 0..200 {
+        for _ in 0..ROW_COUNT {
             conn.execute("INSERT INTO test values (randomblob(6000))", ())
                 .await
                 .unwrap();
@@ -526,14 +545,30 @@ fn replicate_with_snapshots() {
         let mut res = conn.query("select count(*) from test", ()).await.unwrap();
         assert_eq!(
             *res.next()
+                .await
                 .unwrap()
                 .unwrap()
                 .get_value(0)
                 .unwrap()
                 .as_integer()
                 .unwrap(),
-            200
+            ROW_COUNT
         );
+
+        let stats = client
+            .get("http://primary:9090/v1/namespaces/default/stats")
+            .await?
+            .json_value()
+            .await
+            .unwrap();
+
+        let stat = stats
+            .get("embedded_replica_frames_replicated")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+
+        assert_eq!(stat, 427);
 
         Ok(())
     });
@@ -621,7 +656,130 @@ fn proxy_write_returning_row() {
             .await
             .unwrap();
 
-        rows.next().unwrap().unwrap();
+        rows.next().await.unwrap().unwrap();
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn freeze() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(u64::MAX))
+        .build();
+
+    let tmp_embedded = tempdir().unwrap();
+    let tmp_host = tempdir().unwrap();
+    let tmp_embedded_path = tmp_embedded.path().to_owned();
+    let tmp_host_path = tmp_host.path().to_owned();
+
+    make_primary(&mut sim, tmp_host_path.clone());
+
+    sim.client("client", async move {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/foo/create", json!({}))
+            .await?;
+
+        let path = tmp_embedded_path.join("embedded");
+        let db = Database::open_with_remote_sync_connector(
+            path.to_str().unwrap(),
+            "http://foo.primary:8080",
+            "",
+            TurmoilConnector,
+            true,
+            None,
+        )
+        .await?;
+
+        let conn = db.connect()?;
+
+        conn.execute("create table test (x)", ()).await?;
+
+        for _ in 0..50 {
+            conn.execute("insert into test values (12)", ())
+                .await
+                .unwrap();
+        }
+
+        drop(conn);
+        drop(db);
+
+        let db = Database::open_with_remote_sync_connector(
+            path.to_str().unwrap(),
+            "http://foo.primary:8080",
+            "",
+            TurmoilConnector,
+            true,
+            None,
+        )
+        .await?;
+
+        db.sync().await.unwrap();
+
+        let db = db.freeze().unwrap();
+
+        let conn = db.connect().unwrap();
+
+        let mut rows = conn.query("select count(*) from test", ()).await.unwrap();
+
+        let row = rows.next().await.unwrap().unwrap();
+
+        let count = row.get::<u64>(0).unwrap();
+
+        assert_eq!(count, 50);
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn periodic_sync() {
+    let mut sim = Builder::new().build();
+
+    let tmp_embedded = tempdir().unwrap();
+    let tmp_host = tempdir().unwrap();
+    let tmp_embedded_path = tmp_embedded.path().to_owned();
+    let tmp_host_path = tmp_host.path().to_owned();
+
+    make_primary(&mut sim, tmp_host_path.clone());
+
+    sim.client("client", async move {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/foo/create", json!({}))
+            .await?;
+
+        let path = tmp_embedded_path.join("embedded");
+        let db = libsql::Builder::new_remote_replica(
+            path.to_str().unwrap(),
+            "http://foo.primary:8080".to_string(),
+            "".to_string(),
+        )
+        .connector(TurmoilConnector)
+        .periodic_sync(Duration::from_millis(100))
+        .build()
+        .await?;
+
+        let conn = db.connect()?;
+
+        conn.execute("create table test (x)", ()).await?;
+
+        conn.execute("insert into test values (12)", ())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut rows = conn.query("select * from test", ()).await.unwrap();
+
+        let row = rows.next().await.unwrap().unwrap();
+
+        assert_eq!(row.get::<u64>(0).unwrap(), 12);
 
         Ok(())
     });

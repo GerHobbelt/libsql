@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 pub mod ffi {
     //! C ffi for libsql.
 
@@ -62,6 +63,8 @@ pub mod ffi {
 #[cfg(feature = "api")]
 pub mod connection;
 pub mod error;
+#[cfg(feature = "hrana")]
+pub mod hrana;
 #[cfg(feature = "api")]
 pub mod statement;
 #[cfg(feature = "api")]

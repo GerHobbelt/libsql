@@ -1104,6 +1104,15 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn sqlite3_wal_backfilled(pWal: *mut sqlite3_wal) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn sqlite3_wal_frame_page_no(
+        pWal: *mut sqlite3_wal,
+        iFrame: ::std::os::raw::c_uint,
+    ) -> ::std::os::raw::c_uint;
+}
+extern "C" {
     pub fn libsql_try_initialize_wasm_func_table(db: *mut sqlite3) -> ::std::os::raw::c_int;
 }
 extern "C" {
@@ -3309,6 +3318,7 @@ pub struct libsql_wal_methods {
             arg3: ::std::os::raw::c_uint,
             arg4: ::std::os::raw::c_int,
             arg5: ::std::os::raw::c_int,
+            arg6: *mut ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int,
     >,
     pub xCheckpoint: ::std::option::Option<
@@ -3325,6 +3335,17 @@ pub struct libsql_wal_methods {
             zBuf: *mut ::std::os::raw::c_uchar,
             pnLog: *mut ::std::os::raw::c_int,
             pnCkpt: *mut ::std::os::raw::c_int,
+            xCb: ::std::option::Option<
+                unsafe extern "C" fn(
+                    pCbData: *mut ::std::os::raw::c_void,
+                    mxSafeFrame: ::std::os::raw::c_int,
+                    pPage: *const ::std::os::raw::c_uchar,
+                    nPage: ::std::os::raw::c_int,
+                    page_no: ::std::os::raw::c_int,
+                    frame_no: ::std::os::raw::c_int,
+                ) -> ::std::os::raw::c_int,
+            >,
+            pCbData: *mut ::std::os::raw::c_void,
         ) -> ::std::os::raw::c_int,
     >,
     pub xCallback:

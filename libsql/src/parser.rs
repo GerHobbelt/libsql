@@ -124,14 +124,14 @@ impl StmtKind {
         let name = name.name.0.as_str();
         match name {
             // always ok to be served by primary or replicas - pure readonly pragmas
-            "table_list" | "index_list" | "table_info" | "table_xinfo" | "index_xinfo"
+            "table_list" | "index_list" | "table_info" | "table_xinfo" | "index_info" | "index_xinfo"
             | "pragma_list" | "compile_options" | "database_list" | "function_list"
             | "module_list" => Some(Self::Read),
             // special case for `encoding` - it's effectively readonly for connections
             // that already created a database, which is always the case for sqld
             "encoding" => Some(Self::Read),
             // always ok to be served by primary
-            "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
+            "defer_foreign_keys" | "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
             | "data_version" | "freelist_count" | "integrity_check" | "legacy_file_format"
             | "page_count" | "quick_check" | "stats" | "user_version" => Some(Self::Write),
             // ok to be served by primary without args
@@ -144,7 +144,6 @@ impl StmtKind {
             | "cache_spill"
             | "cell_size_check"
             | "checkpoint_fullfsync"
-            | "defer_foreign_keys"
             | "fullfsync"
             | "hard_heap_limit"
             | "journal_mode"

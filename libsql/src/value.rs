@@ -13,7 +13,7 @@ pub enum Value {
 }
 
 /// The possible types a column can be in libsql.
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ValueType {
     Integer = 1,
     Real,
@@ -111,6 +111,18 @@ impl Value {
     }
 }
 
+impl From<i8> for Value {
+    fn from(value: i8) -> Value {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<i16> for Value {
+    fn from(value: i16) -> Value {
+        Value::Integer(value as i64)
+    }
+}
+
 impl From<i32> for Value {
     fn from(value: i32) -> Value {
         Value::Integer(value as i64)
@@ -120,6 +132,18 @@ impl From<i32> for Value {
 impl From<i64> for Value {
     fn from(value: i64) -> Value {
         Value::Integer(value)
+    }
+}
+
+impl From<u8> for Value {
+    fn from(value: u8) -> Value {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<u16> for Value {
+    fn from(value: u16) -> Value {
+        Value::Integer(value as i64)
     }
 }
 
@@ -558,6 +582,13 @@ mod serde_ {
                     E: serde::de::Error,
                 {
                     Ok(Value::Text(v))
+                }
+
+                fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    Ok(Value::Text(v.to_string()))
                 }
 
                 fn visit_some<D>(

@@ -40,6 +40,17 @@ pub enum Error {
     RemoteSqliteFailure(i32, i32, String),
     #[error("replication error: {0}")]
     Replication(crate::BoxError),
+    #[error("path has invalid UTF-8")]
+    InvalidUTF8Path,
+    #[error("freeze is not supported in {0} mode.")]
+    FreezeNotSupported(String),
+}
+
+#[cfg(feature = "hrana")]
+impl From<crate::hrana::HranaError> for Error {
+    fn from(e: crate::hrana::HranaError) -> Self {
+        Error::Hrana(e.into())
+    }
 }
 
 impl From<std::convert::Infallible> for Error {

@@ -1,3 +1,4 @@
+#![allow(clippy::mutable_key_type)]
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -169,6 +170,7 @@ impl MetaStore {
                     create_bucket_if_not_exists: true,
                     verify_crc: true,
                     use_compression: CompressionKind::None,
+                    encryption_key: None,
                     aws_endpoint: Some(config.bucket_endpoint),
                     access_key_id: Some(config.access_key_id),
                     secret_access_key: Some(config.secret_access_key),
@@ -178,8 +180,6 @@ impl MetaStore {
                     max_frames_per_batch: 10_000,
                     max_batch_interval: config.backup_interval,
                     s3_upload_max_parallelism: 32,
-                    restore_transaction_page_swap_after: 1000,
-                    restore_transaction_cache_fpath: ".bottomless.restore".into(),
                     s3_max_retries: 10,
                 };
                 let mut replicator = bottomless::replicator::Replicator::with_options(
@@ -212,7 +212,7 @@ impl MetaStore {
         };
 
         let wal_manager = WalWrapper::new(
-            replicator.map(BottomlessWalWrapper::new),
+            replicator.map(|b| BottomlessWalWrapper::new(Arc::new(std::sync::Mutex::new(Some(b))))),
             Sqlite3WalManager::default(),
         );
         let conn = open_conn_active_checkpoint(&db_path, wal_manager.clone(), None, 1000, None)?;

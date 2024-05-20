@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use libsql::{replication::Frames, Database};
 use libsql_replication::{
     frame::{FrameBorrowed, FrameHeader, FrameMut},
@@ -41,6 +43,7 @@ async fn inject_frames() {
     assert_eq!(
         *rows
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)
@@ -82,6 +85,7 @@ async fn inject_frames() {
     assert_eq!(
         *rows
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)
@@ -148,6 +152,7 @@ async fn inject_frames_split_txn() {
     assert_eq!(
         *rows
             .next()
+            .await
             .unwrap()
             .unwrap()
             .get_value(0)

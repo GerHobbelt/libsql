@@ -54,8 +54,8 @@ fn execute_individual_statements() {
 
         assert_eq!(rows.column_count(), 1);
         assert_eq!(rows.column_name(0), Some("x"));
-        assert_eq!(rows.next()?.unwrap().get::<String>(0)?, "hello");
-        assert!(rows.next()?.is_none());
+        assert_eq!(rows.next().await?.unwrap().get::<String>(0)?, "hello");
+        assert!(rows.next().await?.is_none());
 
         Ok(())
     });
@@ -85,8 +85,66 @@ fn execute_batch() {
 
         assert_eq!(rows.column_count(), 1);
         assert_eq!(rows.column_name(0), Some("x"));
-        assert_eq!(rows.next()?.unwrap().get::<String>(0)?, "hello; world");
-        assert!(rows.next()?.is_none());
+        assert_eq!(
+            rows.next().await?.unwrap().get::<String>(0)?,
+            "hello; world"
+        );
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn multistatement_query() {
+    let mut sim = turmoil::Builder::new().build();
+    sim.host("primary", super::make_standalone_server);
+    sim.client("client", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
+        let conn = db.connect()?;
+        let mut rows = conn
+            .query("select 1 + ?; select 'abc';", params![1])
+            .await?;
+
+        assert_eq!(rows.column_count(), 1);
+        assert_eq!(rows.next().await?.unwrap().get::<i32>(0)?, 2);
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn affected_rows_and_last_rowid() {
+    let mut sim = turmoil::Builder::new().build();
+    sim.host("primary", super::make_standalone_server);
+    sim.client("client", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
+        let conn = db.connect()?;
+
+        conn.execute(
+            "create table t(id integer primary key autoincrement, x text);",
+            (),
+        )
+        .await?;
+
+        let r = conn.execute("insert into t(x) values('a');", ()).await?;
+        assert_eq!(r, 1, "1st row inserted");
+        assert_eq!(conn.last_insert_rowid(), 1, "1st row id");
+
+        let r = conn
+            .execute("insert into t(x) values('b'),('c');", ())
+            .await?;
+        assert_eq!(r, 2, "2nd and 3rd rows inserted");
+        assert_eq!(conn.last_insert_rowid(), 3, "3rd row id");
+
+        let r = conn.execute("update t set x = 'd';", ()).await?;
+        assert_eq!(r, 3, "all three rows updated");
+        assert_eq!(conn.last_insert_rowid(), 3, "last row id unchanged");
 
         Ok(())
     });

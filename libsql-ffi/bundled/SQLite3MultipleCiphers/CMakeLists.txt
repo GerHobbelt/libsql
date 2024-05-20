@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24.0.0)
+cmake_minimum_required(VERSION 3.18.0.0)
 project(sqlite3mc)
 
 # Helper macro
@@ -69,6 +69,9 @@ OPTION(SQLITE3MC_USE_RANDOM_FILL_MEMORY "Fill freed memory with random data" OFF
 # Omit AES hardware support
 OPTION(SQLITE3MC_OMIT_AES_HARDWARE_SUPPORT "Omit AES hardware support" OFF)
 
+# Enable Wasm runtime
+OPTION(LIBSQL_ENABLE_WASM_RUNTIME "Enable libSQL Wasm runtime" OFF)
+
 # TCL
 #OPTION(SQLITE_ENABLE_TCL "Enable TCL interface" OFF)
 
@@ -118,8 +121,14 @@ set(SQLITE3MC_BASE_DEFINITIONS
   $<$<BOOL:${SQLITE_ENABLE_SESSION}>:SQLITE_ENABLE_SESSION=1>
   $<$<BOOL:${SQLITE3MC_USE_MINIZ}>:SQLITE3MC_USE_MINIZ=1>
   $<$<BOOL:${SQLITE3MC_OMIT_AES_HARDWARE_SUPPORT}>:SQLITE3MC_OMIT_AES_HARDWARE_SUPPORT=1>
+  $<$<BOOL:${LIBSQL_ENABLE_WASM_RUNTIME}>:LIBSQL_ENABLE_WASM_RUNTIME=1>
   LIBSQL_EXTRA_PRAGMAS=1
   LIBSQL_CUSTOM_PAGER_CODEC=1
+
+  SQLITE_ENABLE_DBSTAT_VTAB=1
+  SQLITE_ENABLE_DBPAGE_VTAB=1
+  SQLITE_ENABLE_STMTVTAB=1
+  SQLITE_DEFAULT_FOREIGN_KEYS=1
 
   HAVE_CIPHER_AES_128_CBC=0
   HAVE_CIPHER_AES_256_CBC=1
@@ -266,8 +275,18 @@ endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux"
     OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse4.2 -maes")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.2 -maes")
+
+  # Do not set `-maes -msee4.2` when we are on arm which doesn't support
+  # this instruction set.
+  if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64"
+      OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  else()
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse4.2 -maes")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.2 -maes")
+  endif()
+  
   set(SQLITE3MC_LINK_LIBRARIES
     pthread
     dl
@@ -283,6 +302,11 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.2 -maes")
   endif()
   set(SHARED_LIB_EXPORT_DEFINITION "__declspec(dllexport)")
+endif()
+
+if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse4.2 -maes -Wno-error=incompatible-function-pointer-types")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.2 -maes")
 endif()
 
 set(_LIB_DIFINITIONS

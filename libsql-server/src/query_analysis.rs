@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use anyhow::Result;
 use fallible_iterator::FallibleIterator;
 use sqlite3_parser::ast::{Cmd, PragmaBody, QualifiedName, Stmt};
@@ -119,16 +121,16 @@ impl StmtKind {
 
     fn pragma_kind(name: &QualifiedName, body: Option<&PragmaBody>) -> Option<Self> {
         let name = name.name.0.as_str();
-        match name {
+        match to_ascii_lower(name).as_ref() {
             // always ok to be served by primary or replicas - pure readonly pragmas
-            "table_list" | "index_list" | "table_info" | "table_xinfo" | "index_xinfo"
+            "table_list" | "index_list" | "table_info" | "table_xinfo" | "index_info" | "index_xinfo"
             | "pragma_list" | "compile_options" | "database_list" | "function_list"
             | "module_list" => Some(Self::Read),
             // special case for `encoding` - it's effectively readonly for connections
             // that already created a database, which is always the case for sqld
             "encoding" => Some(Self::Read),
             // always ok to be served by primary
-            "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
+            "defer_foreign_keys" | "foreign_keys" | "foreign_key_list" | "foreign_key_check" | "collation_list"
             | "data_version" | "freelist_count" | "integrity_check" | "legacy_file_format"
             | "page_count" | "quick_check" | "stats" | "user_version" => Some(Self::Write),
             // ok to be served by primary without args
@@ -141,7 +143,6 @@ impl StmtKind {
             | "cache_spill"
             | "cell_size_check"
             | "checkpoint_fullfsync"
-            | "defer_foreign_keys"
             | "fullfsync"
             | "hard_heap_limit"
             | "journal_mode"
@@ -196,6 +197,14 @@ impl StmtKind {
     #[must_use]
     pub fn is_release(&self) -> bool {
         matches!(self, Self::Release)
+    }
+}
+
+fn to_ascii_lower(s: &str) -> Cow<str> {
+    if s.chars().all(|c| char::is_ascii_lowercase(&c)) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.to_ascii_lowercase())
     }
 }
 

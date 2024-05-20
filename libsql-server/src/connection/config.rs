@@ -2,6 +2,9 @@ use crate::LIBSQL_PAGE_SIZE;
 use url::Url;
 
 use libsql_replication::rpc::metadata;
+use tokio::time::Duration;
+
+use super::TXN_TIMEOUT;
 
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
@@ -14,6 +17,7 @@ pub struct DatabaseConfig {
     pub heartbeat_url: Option<Url>,
     pub bottomless_db_id: Option<String>,
     pub jwt_key: Option<String>,
+    pub txn_timeout: Option<Duration>,
 }
 
 const fn default_max_size() -> u64 {
@@ -30,6 +34,7 @@ impl Default for DatabaseConfig {
             heartbeat_url: None,
             bottomless_db_id: None,
             jwt_key: None,
+            txn_timeout: Some(TXN_TIMEOUT),
         }
     }
 }
@@ -41,12 +46,10 @@ impl From<&metadata::DatabaseConfig> for DatabaseConfig {
             block_writes: value.block_writes,
             block_reason: value.block_reason.clone(),
             max_db_pages: value.max_db_pages,
-            heartbeat_url: value
-                .heartbeat_url
-                .as_ref()
-                .map(|s| Url::parse(&s).unwrap()),
+            heartbeat_url: value.heartbeat_url.as_ref().map(|s| Url::parse(s).unwrap()),
             bottomless_db_id: value.bottomless_db_id.clone(),
             jwt_key: value.jwt_key.clone(),
+            txn_timeout: value.txn_timeout_s.map(Duration::from_secs),
         }
     }
 }
@@ -61,6 +64,7 @@ impl From<&DatabaseConfig> for metadata::DatabaseConfig {
             heartbeat_url: value.heartbeat_url.as_ref().map(|s| s.to_string()),
             bottomless_db_id: value.bottomless_db_id.clone(),
             jwt_key: value.jwt_key.clone(),
+            txn_timeout_s: value.txn_timeout.map(|d| d.as_secs()),
         }
     }
 }

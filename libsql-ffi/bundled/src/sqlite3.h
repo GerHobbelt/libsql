@@ -3806,6 +3806,10 @@ SQLITE_API int libsql_open_v3(
   libsql_wal_manager wal_manager   /* wal_manager instance, in charge of instanciating a wal */
 );
 
+typedef struct sqlite3_wal sqlite3_wal;
+SQLITE_API int sqlite3_wal_backfilled(sqlite3_wal *pWal);
+SQLITE_API unsigned int sqlite3_wal_frame_page_no(sqlite3_wal *pWal, unsigned int iFrame);
+
 SQLITE_API LIBSQL_API int libsql_try_initialize_wasm_func_table(sqlite3 *db);
 
 /*
@@ -8695,6 +8699,10 @@ SQLITE_API int sqlite3_status64(
 */
 SQLITE_API int sqlite3_db_status(sqlite3*, int op, int *pCur, int *pHiwtr, int resetFlg);
 
+#ifdef LIBSQL_CUSTOM_PAGER_CODEC
+SQLITE_API void *libsql_leak_pager(sqlite3*);
+#endif
+
 /*
 ** CAPI3REF: Status Parameters for database connections
 ** KEYWORDS: {SQLITE_DBSTATUS options}
@@ -13499,7 +13507,7 @@ typedef struct libsql_wal_methods {
   int (*xSavepointUndo)(wal_impl* pWal, unsigned int *aWalData);
 
   /* Write a frame or frames to the log. */
-  int (*xFrames)(wal_impl* pWal, int, libsql_pghdr *, unsigned int, int, int);
+  int (*xFrames)(wal_impl* pWal, int, libsql_pghdr *, unsigned int, int, int, int*);
 
   /* Copy pages from the log to the database file */
   int (*xCheckpoint)(
@@ -13512,7 +13520,12 @@ typedef struct libsql_wal_methods {
     int nBuf,                       /* Size of buffer nBuf */
     unsigned char *zBuf,                       /* Temporary buffer to use */
     int *pnLog,                     /* OUT: Number of frames in WAL */
-    int *pnCkpt                     /* OUT: Number of backfilled frames in WAL */
+    int *pnCkpt,                    /* OUT: Number of backfilled frames in WAL */
+    /*
+     * Called for each page being inserted in the wal, and once if the whole checkpoint operation was successfull with pPage == NULL
+     */
+    int (*xCb)(void* pCbData, int mxSafeFrame, const unsigned char* pPage, int nPage, int page_no, int frame_no), /* called */
+    void* pCbData                  /* user data passed to xCb */
   );
 
   /* Return the value to pass to a sqlite3_wal_hook callback, the
@@ -13656,6 +13669,9 @@ typedef struct RefCountedWalManager {
 int make_ref_counted_wal_manager(libsql_wal_manager wal_manager, RefCountedWalManager **out);
 void destroy_wal_manager(RefCountedWalManager *p);
 RefCountedWalManager* clone_wal_manager(RefCountedWalManager *p);
+
+SQLITE_API int sqlite3_wal_backfilled(sqlite3_wal* pWal);
+SQLITE_API unsigned int sqlite3_wal_frame_page_no(sqlite3_wal *pWal, unsigned int iFrame);
 
 RefCountedWalManager *make_sqlite3_wal_manager_rc();
 

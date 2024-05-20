@@ -7,19 +7,17 @@ cfg_remote! {
 }
 
 mod cursor;
-pub mod pipeline;
-pub mod proto;
 mod stream;
 pub mod transaction;
 
-use crate::hrana::connection::HttpConnection;
-pub(crate) use crate::hrana::pipeline::StreamResponseError;
-use crate::hrana::proto::{Col, Stmt, StmtResult};
+use crate::hrana::cursor::{Cursor, Error, OwnedCursorStep};
 use crate::hrana::stream::HranaStream;
+use crate::parser::StmtKind;
 use crate::{params::Params, ValueType};
 use bytes::Bytes;
-use futures::Stream;
-use std::collections::VecDeque;
+use futures::{Stream, StreamExt};
+pub use libsql_sys::hrana::proto;
+use libsql_sys::hrana::proto::{Batch, BatchResult, Col, Stmt};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,9 +36,12 @@ struct Cookie {
 }
 
 pub trait HttpSend: Clone {
-    type Stream: Stream<Item = Result<Bytes>> + Unpin;
+    type Stream: Stream<Item = std::io::Result<Bytes>> + Unpin;
     type Result: Future<Output = Result<Self::Stream>>;
     fn http_send(&self, url: Arc<str>, auth: Arc<str>, body: String) -> Self::Result;
+
+    /// Schedule sending a HTTP post request without waiting for the completion.
+    fn oneshot(self, url: Arc<str>, auth: Arc<str>, body: String);
 }
 
 pub enum HttpBody<S> {
@@ -56,9 +57,9 @@ impl<S> From<Bytes> for HttpBody<S> {
 
 impl<S> Stream for HttpBody<S>
 where
-    S: Stream<Item = Result<Bytes>> + Unpin,
+    S: Stream<Item = std::io::Result<Bytes>> + Unpin,
 {
-    type Item = Result<Bytes>;
+    type Item = std::io::Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
@@ -84,7 +85,7 @@ pub enum HranaError {
     #[error("stream closed: `{0}`")]
     StreamClosed(String),
     #[error("stream error: `{0:?}`")]
-    StreamError(StreamResponseError),
+    StreamError(proto::Error),
     #[error("cursor error: `{0}`")]
     CursorError(CursorResponseError),
     #[error("json error: `{0}`")]
@@ -99,41 +100,22 @@ pub enum HranaError {
 pub enum CursorResponseError {
     #[error("cursor step {actual} arrived before step {expected} end message")]
     NotClosed { expected: u32, actual: u32 },
-    #[error("error at step {step}: `{error}`")]
-    StepError { step: u32, error: String },
+    #[error("error at step {step}: {error}")]
+    StepError { step: u32, error: Error },
     #[error("cursor stream ended prematurely")]
     CursorClosed,
+    #[error("cursor hasn't fetched any rows yet")]
+    NoRowsFetched,
     #[error("{0}")]
     Other(String),
-}
-
-enum StatementExecutor<T: HttpSend> {
-    /// An opened HTTP Hrana stream - usually in scope of executing transaction. Operations over it
-    /// will be scheduled for sequential execution.
-    Stream(HranaStream<T>),
-    /// Hrana HTTP connection. Operations executing over it are not attached to any sequential
-    /// order of execution.
-    Connection(HttpConnection<T>),
-}
-
-impl<T> StatementExecutor<T>
-where
-    T: HttpSend,
-{
-    async fn execute(&self, stmt: Stmt) -> crate::Result<StmtResult> {
-        let res = match self {
-            StatementExecutor::Stream(stream) => stream.execute(stmt).await,
-            StatementExecutor::Connection(conn) => conn.execute_inner(stmt).await,
-        };
-        res.map_err(|e| crate::Error::Hrana(e.into()))
-    }
 }
 
 pub struct Statement<T>
 where
     T: HttpSend,
 {
-    executor: StatementExecutor<T>,
+    stream: HranaStream<T>,
+    close_stream: bool,
     inner: Stmt,
 }
 
@@ -141,17 +123,25 @@ impl<T> Statement<T>
 where
     T: HttpSend,
 {
-    pub(crate) fn from_stream(stream: HranaStream<T>, sql: String, want_rows: bool) -> Self {
-        Statement {
-            executor: StatementExecutor::Stream(stream),
-            inner: Stmt::new(sql, want_rows),
-        }
-    }
-
-    pub(crate) fn from_connection(conn: HttpConnection<T>, sql: String, want_rows: bool) -> Self {
-        Statement {
-            executor: StatementExecutor::Connection(conn),
-            inner: Stmt::new(sql, want_rows),
+    pub(crate) fn new(stream: HranaStream<T>, sql: String, want_rows: bool) -> crate::Result<Self> {
+        // in SQLite when a multiple statements are glued together into one string, only the first one is
+        // executed and then a handle to continue execution is returned. However Hrana API doesn't allow
+        // passing multi-statement strings, so we just pick first one.
+        let mut parse = crate::parser::Statement::parse(&sql);
+        match parse.next() {
+            None => Err(crate::Error::Misuse(
+                "no SQL statement provided".to_string(),
+            )),
+            Some(Err(e)) => Err(e),
+            Some(Ok(stmt)) => {
+                let close_stream = !matches!(stmt.kind, StmtKind::TxnBegin | StmtKind::TxnBeginReadOnly);
+                let inner = Stmt::new(stmt.stmt, want_rows);
+                Ok(Statement {
+                    stream,
+                    close_stream,
+                    inner,
+                })
+            }
         }
     }
 
@@ -159,83 +149,137 @@ where
         let mut stmt = self.inner.clone();
         bind_params(params.clone(), &mut stmt);
 
-        let v = self.executor.execute(stmt).await?;
-        Ok(v.affected_row_count as usize)
+        let result = self.stream.execute_inner(stmt, self.close_stream).await?;
+        Ok(result.affected_row_count as usize)
     }
 
-    pub async fn query(&mut self, params: &Params) -> crate::Result<super::Rows> {
+    pub(crate) async fn query_raw(
+        &mut self,
+        params: &Params,
+    ) -> crate::Result<HranaRows<T::Stream>> {
         let mut stmt = self.inner.clone();
         bind_params(params.clone(), &mut stmt);
 
-        let StmtResult { rows, cols, .. } = self.executor.execute(stmt).await?;
+        let cursor = self.stream.cursor(Batch::single(stmt)).await?;
+        let rows = HranaRows::from_cursor(cursor).await?;
 
+        Ok(rows)
+    }
+}
+impl<T> Statement<T>
+where
+    T: HttpSend,
+    <T as HttpSend>::Stream: Send + Sync + 'static,
+{
+    pub async fn query(&mut self, params: &Params) -> crate::Result<super::Rows> {
+        let rows = self.query_raw(params).await?;
         Ok(super::Rows {
-            inner: Box::new(Rows {
-                rows,
-                cols: Arc::new(cols),
-            }),
+            inner: Box::new(rows),
         })
     }
 }
 
-pub struct Rows {
-    cols: Arc<Vec<Col>>,
-    rows: VecDeque<Vec<proto::Value>>,
+pub struct HranaRows<S> {
+    cursor_step: OwnedCursorStep<S>,
+    column_types: Option<Vec<ValueType>>,
 }
 
-impl RowsInner for Rows {
-    fn next(&mut self) -> crate::Result<Option<super::Row>> {
-        let row = match self.rows.pop_front() {
-            Some(row) => Row {
-                cols: self.cols.clone(),
-                inner: row,
-            },
+impl<S> HranaRows<S>
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Unpin,
+{
+    async fn from_cursor(cursor: Cursor<S>) -> Result<Self> {
+        let cursor_step = cursor.next_step_owned().await?;
+        Ok(HranaRows {
+            cursor_step,
+            column_types: None,
+        })
+    }
+
+    pub async fn next(&mut self) -> crate::Result<Option<super::Row>> {
+        let row = match self.cursor_step.next().await {
+            Some(Ok(row)) => row,
+            Some(Err(e)) => return Err(crate::Error::Hrana(Box::new(e))),
             None => return Ok(None),
         };
+
+        if self.column_types.is_none() {
+            self.init_column_types(&row);
+        }
 
         Ok(Some(super::Row {
             inner: Box::new(row),
         }))
     }
 
-    fn column_count(&self) -> i32 {
-        self.cols.len() as i32
+    fn init_column_types(&mut self, row: &Row) {
+        self.column_types = Some(
+            row.inner
+                .iter()
+                .map(|value| match value {
+                    proto::Value::Null | proto::Value::None => ValueType::Null,
+                    proto::Value::Integer { value: _ } => ValueType::Integer,
+                    proto::Value::Float { value: _ } => ValueType::Real,
+                    proto::Value::Text { value: _ } => ValueType::Text,
+                    proto::Value::Blob { value: _ } => ValueType::Blob,
+                })
+                .collect(),
+        );
     }
 
-    fn column_name(&self, idx: i32) -> Option<&str> {
-        self.cols
+    pub fn column_count(&self) -> i32 {
+        self.cursor_step.cols().len() as i32
+    }
+
+    pub fn column_name(&self, idx: i32) -> Option<&str> {
+        self.cursor_step
+            .cols()
             .get(idx as usize)
             .and_then(|c| c.name.as_ref())
             .map(|s| s.as_str())
     }
+}
+
+#[async_trait::async_trait]
+impl<S> RowsInner for HranaRows<S>
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin,
+{
+    async fn next(&mut self) -> crate::Result<Option<super::Row>> {
+        self.next().await
+    }
+
+    fn column_count(&self) -> i32 {
+        self.column_count()
+    }
+
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.column_name(idx)
+    }
 
     fn column_type(&self, idx: i32) -> crate::Result<ValueType> {
-        let row = match self.rows.get(0) {
-            None => return Err(crate::Error::QueryReturnedNoRows),
-            Some(row) => row,
-        };
-        let cell = match row.get(idx as usize) {
-            None => return Err(crate::Error::ColumnNotFound(idx)),
-            Some(cell) => cell,
-        };
-        Ok(match cell {
-            proto::Value::Null => ValueType::Null,
-            proto::Value::Integer { .. } => ValueType::Integer,
-            proto::Value::Float { .. } => ValueType::Real,
-            proto::Value::Text { .. } => ValueType::Text,
-            proto::Value::Blob { .. } => ValueType::Blob,
-        })
+        if let Some(col_types) = &self.column_types {
+            if let Some(t) = col_types.get(idx as usize) {
+                Ok(*t)
+            } else {
+                Err(crate::Error::ColumnNotFound(idx))
+            }
+        } else {
+            Err(crate::Error::Hrana(Box::new(HranaError::CursorError(
+                CursorResponseError::NoRowsFetched,
+            ))))
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct Row {
-    cols: Arc<Vec<Col>>,
+    cols: Arc<[Col]>,
     inner: Vec<proto::Value>,
 }
 
 impl Row {
-    pub(super) fn new(cols: Arc<Vec<Col>>, inner: Vec<proto::Value>) -> Self {
+    pub(super) fn new(cols: Arc<[Col]>, inner: Vec<proto::Value>) -> Self {
         Row { cols, inner }
     }
 }
@@ -253,8 +297,16 @@ impl RowInner for Row {
             .map(|s| s.as_str())
     }
 
-    fn column_str(&self, _idx: i32) -> crate::Result<&str> {
-        todo!()
+    fn column_str(&self, idx: i32) -> crate::Result<&str> {
+        if let Some(value) = self.inner.get(idx as usize) {
+            if let proto::Value::Text { value } = value {
+                Ok(value)
+            } else {
+                Err(crate::Error::InvalidColumnType)
+            }
+        } else {
+            Err(crate::Error::ColumnNotFound(idx))
+        }
     }
 
     fn column_type(&self, idx: i32) -> crate::Result<ValueType> {
@@ -265,6 +317,7 @@ impl RowInner for Row {
                 proto::Value::Float { value: _ } => ValueType::Real,
                 proto::Value::Text { value: _ } => ValueType::Text,
                 proto::Value::Blob { value: _ } => ValueType::Blob,
+                proto::Value::None => return Err(crate::Error::InvalidColumnType),
             })
         } else {
             Err(crate::Error::ColumnNotFound(idx))
@@ -297,17 +350,29 @@ fn into_value(value: crate::Value) -> proto::Value {
         crate::Value::Null => proto::Value::Null,
         crate::Value::Integer(value) => proto::Value::Integer { value },
         crate::Value::Real(value) => proto::Value::Float { value },
-        crate::Value::Text(value) => proto::Value::Text { value },
-        crate::Value::Blob(value) => proto::Value::Blob { value },
+        crate::Value::Text(value) => proto::Value::Text {
+            value: value.into(),
+        },
+        crate::Value::Blob(value) => proto::Value::Blob {
+            value: value.into(),
+        },
     }
 }
 
 fn into_value2(value: proto::Value) -> crate::Value {
     match value {
-        proto::Value::Null => crate::Value::Null,
+        proto::Value::Null | proto::Value::None => crate::Value::Null,
         proto::Value::Integer { value } => crate::Value::Integer(value),
         proto::Value::Float { value } => crate::Value::Real(value),
-        proto::Value::Text { value } => crate::Value::Text(value),
-        proto::Value::Blob { value } => crate::Value::Blob(value),
+        proto::Value::Text { value } => crate::Value::Text(value.to_string()),
+        proto::Value::Blob { value } => crate::Value::Blob(value.into()),
     }
+}
+
+pub(crate) fn unwrap_err(batch_res: BatchResult) -> crate::Result<()> {
+    batch_res.step_errors
+        .into_iter()
+        .find_map(|e| e)
+        .map(|e| Err(crate::Error::Hrana(Box::new(HranaError::Api(e.message)))))
+        .unwrap_or(Ok(()))
 }

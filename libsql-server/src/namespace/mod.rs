@@ -24,7 +24,7 @@ use rusqlite::ErrorCode;
 use serde::de::Visitor;
 use serde::Deserialize;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tokio_util::io::StreamReader;
@@ -42,11 +42,11 @@ use crate::connection::MakeConnection;
 use crate::database::{Database, PrimaryDatabase, ReplicaDatabase};
 use crate::error::{Error, LoadDumpError};
 use crate::metrics::NAMESPACE_LOAD_LATENCY;
-use crate::replication::{FrameNo, NamespacedSnapshotCallback, ReplicationLogger};
+use crate::replication::script_backup_manager::ScriptBackupManager;
+use crate::replication::{FrameNo, ReplicationLogger};
 use crate::stats::Stats;
 use crate::{
     run_periodic_checkpoint, StatsSender, BLOCKING_RT, DB_CREATE_TIMEOUT, DEFAULT_AUTO_CHECKPOINT,
-    MAX_CONCURRENT_DBS,
 };
 
 use crate::namespace::fork::PointInTimeRestore;
@@ -76,6 +76,12 @@ impl Default for NamespaceName {
 impl AsRef<str> for NamespaceName {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl From<&'static str> for NamespaceName {
+    fn from(value: &'static str) -> Self {
+        Self::from_bytes(Bytes::from_static(value.as_bytes())).unwrap()
     }
 }
 
@@ -824,6 +830,10 @@ impl<T: Database> Namespace<T> {
             Ok(None)
         }
     }
+
+    pub fn stats(&self) -> Arc<Stats> {
+        self.stats.clone()
+    }
 }
 
 pub struct ReplicaNamespaceConfig {
@@ -839,6 +849,7 @@ pub struct ReplicaNamespaceConfig {
     /// Stats monitor
     pub stats_sender: StatsSender,
     pub encryption_key: Option<bytes::Bytes>,
+    pub max_concurrent_connections: Arc<Semaphore>,
 }
 
 impl Namespace<ReplicaDatabase> {
@@ -899,6 +910,11 @@ impl Namespace<ReplicaDatabase> {
                         (reset)(ResetOp::Destroy(namespace.clone()));
                         Err(err)?;
                     }
+                    e @ Error::Injector(_) => {
+                        tracing::error!("potential corruption detected while replicating, reseting  replica: {e}");
+                        (reset)(ResetOp::Reset(namespace.clone()));
+                        Err(e)?;
+                    },
                     Error::Meta(err) => {
                         use libsql_replication::meta::Error;
                         match err {
@@ -917,7 +933,6 @@ impl Namespace<ReplicaDatabase> {
                         }
                     }
                     e @ (Error::Internal(_)
-                    | Error::Injector(_)
                     | Error::Client(_)
                     | Error::PrimaryHandshakeTimeout
                     | Error::NeedSnapshot) => {
@@ -958,7 +973,7 @@ impl Namespace<ReplicaDatabase> {
         )
         .await?
         .throttled(
-            MAX_CONCURRENT_DBS,
+            config.max_concurrent_connections.clone(),
             Some(DB_CREATE_TIMEOUT),
             config.max_total_response_size,
         );
@@ -976,19 +991,19 @@ impl Namespace<ReplicaDatabase> {
 }
 
 pub struct PrimaryNamespaceConfig {
-    pub base_path: Arc<Path>,
-    pub max_log_size: u64,
-    pub db_is_dirty: bool,
-    pub max_log_duration: Option<Duration>,
-    pub snapshot_callback: NamespacedSnapshotCallback,
-    pub bottomless_replication: Option<bottomless::replicator::Options>,
-    pub extensions: Arc<[PathBuf]>,
-    pub stats_sender: StatsSender,
-    pub max_response_size: u64,
-    pub max_total_response_size: u64,
-    pub checkpoint_interval: Option<Duration>,
-    pub disable_namespace: bool,
-    pub encryption_key: Option<bytes::Bytes>,
+    pub(crate) base_path: Arc<Path>,
+    pub(crate) max_log_size: u64,
+    pub(crate) db_is_dirty: bool,
+    pub(crate) max_log_duration: Option<Duration>,
+    pub(crate) bottomless_replication: Option<bottomless::replicator::Options>,
+    pub(crate) extensions: Arc<[PathBuf]>,
+    pub(crate) stats_sender: StatsSender,
+    pub(crate) max_response_size: u64,
+    pub(crate) max_total_response_size: u64,
+    pub(crate) checkpoint_interval: Option<Duration>,
+    pub(crate) encryption_key: Option<bytes::Bytes>,
+    pub(crate) max_concurrent_connections: Arc<Semaphore>,
+    pub(crate) scripted_backup: Option<ScriptBackupManager>,
 }
 
 pub type DumpStream =
@@ -1105,11 +1120,9 @@ impl Namespace<PrimaryDatabase> {
             config.max_log_duration,
             is_dirty,
             auto_checkpoint,
-            Box::new({
-                let name = name.clone();
-                let cb = config.snapshot_callback.clone();
-                move |path: &Path| cb(path, &name)
-            }),
+            config.scripted_backup.clone(),
+            name.clone(),
+            config.encryption_key.clone(),
         )?);
 
         let stats = make_stats(
@@ -1137,7 +1150,7 @@ impl Namespace<PrimaryDatabase> {
         )
         .await?
         .throttled(
-            MAX_CONCURRENT_DBS,
+            config.max_concurrent_connections.clone(),
             Some(DB_CREATE_TIMEOUT),
             config.max_total_response_size,
         )

@@ -9,7 +9,7 @@ use anyhow::{bail, Context as _, Result};
 use bytesize::ByteSize;
 use clap::Parser;
 use hyper::client::HttpConnector;
-use mimalloc::MiMalloc;
+// use mimalloc::MiMalloc;
 use tokio::sync::Notify;
 use tokio::time::Duration;
 use tracing_subscriber::prelude::*;
@@ -24,8 +24,9 @@ use libsql_server::net::AddrIncoming;
 use libsql_server::Server;
 use libsql_server::{connection::dump::exporter::export_dump, version::Version};
 
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+// Use system allocator for now, seems like we are getting too much fragmentation.
+// #[global_allocator]
+// static GLOBAL: MiMalloc = MiMalloc;
 
 /// SQL daemon
 #[derive(Debug, Parser)]
@@ -225,8 +226,11 @@ struct Cli {
     #[clap(long)]
     meta_store_bucket_endpoint: Option<String>,
     /// encryption_key for encryption at rest
-    #[clap(long)]
+    #[clap(long, env = "SQLD_ENCRYPTION_KEY")]
     encryption_key: Option<bytes::Bytes>,
+
+    #[clap(long, default_value = "128")]
+    max_concurrent_connections: usize,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -280,6 +284,8 @@ impl Cli {
         eprintln!("\t- extensions path: {extensions_str}");
         eprintln!("\t- listening for HTTP requests on: {}", self.http_listen_addr);
         eprintln!("\t- grpc_tls: {}", if self.grpc_tls { "yes" } else { "no" });
+        #[cfg(feature = "encryption")]
+        eprintln!("\t- encryption at rest: {}", if self.encryption_key.is_some() { "enabled" } else { "disabled" });
     }
 }
 
@@ -326,12 +332,19 @@ fn enable_libsql_logging() {
 }
 
 fn make_db_config(config: &Cli) -> anyhow::Result<DbConfig> {
+    let mut bottomless_replication = config
+        .enable_bottomless_replication
+        .then(bottomless::replicator::Options::from_env)
+        .transpose()?;
+    // Inherit encryption key for bottomless from the db config, if not specified.
+    if let Some(ref mut bottomless_replication) = bottomless_replication {
+        if bottomless_replication.encryption_key.is_none() {
+            bottomless_replication.encryption_key = config.encryption_key.clone();
+        }
+    }
     Ok(DbConfig {
         extensions_path: config.extensions_path.clone().map(Into::into),
-        bottomless_replication: config
-            .enable_bottomless_replication
-            .then(bottomless::replicator::Options::from_env)
-            .transpose()?,
+        bottomless_replication,
         max_log_size: config.max_log_size,
         max_log_duration: config.max_log_duration,
         soft_heap_limit_mb: config.soft_heap_limit_mb,
@@ -588,6 +601,7 @@ async fn build_server(config: &Cli) -> anyhow::Result<Server> {
         shutdown,
         max_active_namespaces: config.max_active_namespaces,
         meta_store_config,
+        max_concurrent_connections: config.max_concurrent_connections,
     })
 }
 

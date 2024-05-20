@@ -3,7 +3,6 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 
@@ -34,9 +33,8 @@ use namespace::{
 };
 use net::Connector;
 use once_cell::sync::Lazy;
-use replication::NamespacedSnapshotCallback;
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Duration;
 use url::Url;
@@ -44,6 +42,7 @@ use utils::services::idle_shutdown::IdleShutdownKicker;
 
 use self::config::MetaStoreConfig;
 use self::net::AddrIncoming;
+use self::replication::script_backup_manager::{CommandHandler, ScriptBackupManager};
 
 pub mod config;
 pub mod connection;
@@ -72,7 +71,6 @@ mod stats;
 mod test;
 mod utils;
 
-const MAX_CONCURRENT_DBS: usize = 128;
 const DB_CREATE_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_AUTO_CHECKPOINT: u32 = 1000;
 const LIBSQL_PAGE_SIZE: u64 = 4096;
@@ -103,6 +101,7 @@ pub struct Server<C = HttpConnector, A = AddrIncoming, D = HttpsConnector<HttpCo
     pub shutdown: Arc<Notify>,
     pub max_active_namespaces: usize,
     pub meta_store_config: Option<MetaStoreConfig>,
+    pub max_concurrent_connections: usize,
 }
 
 impl<C, A, D> Default for Server<C, A, D> {
@@ -122,6 +121,7 @@ impl<C, A, D> Default for Server<C, A, D> {
             shutdown: Default::default(),
             max_active_namespaces: 100,
             meta_store_config: None,
+            max_concurrent_connections: 128,
         }
     }
 }
@@ -304,23 +304,6 @@ where
         }
     }
 
-    pub fn make_snapshot_callback(&self) -> NamespacedSnapshotCallback {
-        let snapshot_exec = self.db_config.snapshot_exec.clone();
-        Arc::new(move |snapshot_file: &Path, namespace: &NamespaceName| {
-            if let Some(exec) = snapshot_exec.as_ref() {
-                let status = Command::new(exec)
-                    .arg(snapshot_file)
-                    .arg(namespace.as_str())
-                    .status()?;
-                anyhow::ensure!(
-                    status.success(),
-                    "Snapshot exec process failed with status {status}"
-                );
-            }
-            Ok(())
-        })
-    }
-
     fn spawn_monitoring_tasks(
         &self,
         join_set: &mut JoinSet<anyhow::Result<()>>,
@@ -374,7 +357,6 @@ where
         let db_is_dirty = init_sentinel_file(&self.path)?;
         let idle_shutdown_kicker = self.setup_shutdown();
 
-        let snapshot_callback = self.make_snapshot_callback();
         let auth = self.user_api_config.get_auth().map(Arc::new)?;
         let extensions = self.db_config.validate_extensions()?;
         let namespace_store_shutdown_fut: Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -393,6 +375,7 @@ where
                     disable_namespaces: self.disable_namespaces,
                     max_active_namespaces: self.max_active_namespaces,
                     meta_store_config: self.meta_store_config.take(),
+                    max_concurrent_connections: self.max_concurrent_connections,
                 };
                 let (namespaces, proxy_service, replication_service) = replica.configure().await?;
                 self.rpc_client_config = None;
@@ -427,7 +410,6 @@ where
                     idle_shutdown_kicker: idle_shutdown_kicker.clone(),
                     stats_sender,
                     db_is_dirty,
-                    snapshot_callback,
                     extensions,
                     base_path: self.path.clone(),
                     disable_namespaces: self.disable_namespaces,
@@ -435,7 +417,9 @@ where
                     join_set: &mut join_set,
                     auth: auth.clone(),
                     meta_store_config: self.meta_store_config.take(),
+                    max_concurrent_connections: self.max_concurrent_connections,
                 };
+
                 let (namespaces, proxy_service, replication_service) = primary.configure().await?;
                 self.rpc_server_config = None;
                 self.spawn_monitoring_tasks(&mut join_set, stats_receiver, namespaces.clone())?;
@@ -495,7 +479,6 @@ struct Primary<'a, A> {
     idle_shutdown_kicker: Option<IdleShutdownKicker>,
     stats_sender: StatsSender,
     db_is_dirty: bool,
-    snapshot_callback: NamespacedSnapshotCallback,
     extensions: Arc<[PathBuf]>,
     base_path: Arc<Path>,
     disable_namespaces: bool,
@@ -503,6 +486,7 @@ struct Primary<'a, A> {
     auth: Arc<Auth>,
     join_set: &'a mut JoinSet<anyhow::Result<()>>,
     meta_store_config: Option<MetaStoreConfig>,
+    max_concurrent_connections: usize,
 }
 
 impl<A> Primary<'_, A>
@@ -516,20 +500,30 @@ where
         ProxyService,
         ReplicationLogService,
     )> {
+        let scripted_backup = match self.db_config.snapshot_exec {
+            Some(command) => {
+                let (scripted_backup, script_backup_task) =
+                    ScriptBackupManager::new(&self.base_path, CommandHandler::new(command)).await?;
+                self.join_set.spawn(script_backup_task.run());
+                Some(scripted_backup)
+            }
+            None => None,
+        };
+
         let conf = PrimaryNamespaceConfig {
             base_path: self.base_path.clone(),
             max_log_size: self.db_config.max_log_size,
             db_is_dirty: self.db_is_dirty,
             max_log_duration: self.db_config.max_log_duration.map(Duration::from_secs_f32),
-            snapshot_callback: self.snapshot_callback,
             bottomless_replication: self.db_config.bottomless_replication.clone(),
             extensions: self.extensions,
             stats_sender: self.stats_sender.clone(),
             max_response_size: self.db_config.max_response_size,
             max_total_response_size: self.db_config.max_total_response_size,
             checkpoint_interval: self.db_config.checkpoint_interval,
-            disable_namespace: self.disable_namespaces,
             encryption_key: self.db_config.encryption_key.clone(),
+            max_concurrent_connections: Arc::new(Semaphore::new(self.max_concurrent_connections)),
+            scripted_backup,
         };
 
         let factory = PrimaryNamespaceMaker::new(conf);
@@ -591,6 +585,7 @@ where
             self.idle_shutdown_kicker,
             Some(self.auth.clone()),
             self.disable_namespaces,
+            true,
         );
 
         let proxy_service =
@@ -619,6 +614,7 @@ struct Replica<C> {
     disable_namespaces: bool,
     max_active_namespaces: usize,
     meta_store_config: Option<MetaStoreConfig>,
+    max_concurrent_connections: usize,
 }
 
 impl<C: Connector> Replica<C> {
@@ -640,6 +636,7 @@ impl<C: Connector> Replica<C> {
             max_response_size: self.db_config.max_response_size,
             max_total_response_size: self.db_config.max_total_response_size,
             encryption_key: self.db_config.encryption_key.clone(),
+            max_concurrent_connections: Arc::new(Semaphore::new(self.max_concurrent_connections)),
         };
 
         let factory = ReplicaNamespaceMaker::new(conf);

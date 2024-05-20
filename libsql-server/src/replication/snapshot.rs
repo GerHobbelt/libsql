@@ -21,7 +21,8 @@ use zerocopy::AsBytes;
 use crate::namespace::NamespaceName;
 use crate::replication::primary::logger::LogFileHeader;
 
-use super::primary::logger::LogFile;
+use super::primary::logger::{FrameEncryptor, LogFile};
+use super::script_backup_manager::ScriptBackupManager;
 use super::FrameNo;
 
 /// This is the ratio of the space required to store snapshot vs size of the actual database.
@@ -79,6 +80,7 @@ fn snapshot_list(db_path: &Path) -> impl Stream<Item = anyhow::Result<String>> +
 pub async fn find_snapshot_file(
     db_path: &Path,
     frame_no: FrameNo,
+    encryptor: Option<FrameEncryptor>,
 ) -> anyhow::Result<Option<SnapshotFile>> {
     let snapshot_dir_path = snapshot_dir_path(db_path);
     let snapshots = snapshot_list(db_path);
@@ -91,7 +93,7 @@ pub async fn find_snapshot_file(
         if (start_frame_no..=end_frame_no).contains(&frame_no) {
             let snapshot_path = snapshot_dir_path.join(&name);
             tracing::debug!("found snapshot for frame {frame_no} at {snapshot_path:?}");
-            let snapshot_file = SnapshotFile::open(&snapshot_path).await?;
+            let snapshot_file = SnapshotFile::open(&snapshot_path, encryptor).await?;
             return Ok(Some(snapshot_file));
         }
     }
@@ -104,27 +106,18 @@ pub struct LogCompactor {
     sender: mpsc::Sender<(LogFile, PathBuf)>,
 }
 
-pub type SnapshotCallback = Box<dyn Fn(&Path) -> anyhow::Result<()> + Send + Sync>;
-pub type NamespacedSnapshotCallback =
-    Arc<dyn Fn(&Path, &NamespaceName) -> anyhow::Result<()> + Send + Sync>;
-
 async fn compact(
     db_path: &Path,
     to_compact_file: LogFile,
     log_id: Uuid,
     merger: &mut SnapshotMerger,
-    callback: &SnapshotCallback,
-    snapshot_dir_path: &Path,
     to_compact_path: &Path,
+    scripted_backup: Option<ScriptBackupManager>,
+    namespace: NamespaceName,
 ) -> anyhow::Result<()> {
-    match perform_compaction(db_path, to_compact_file, log_id).await {
+    match perform_compaction(db_path, to_compact_file, log_id, namespace, scripted_backup).await {
         Ok((snapshot_name, snapshot_frame_count, size_after)) => {
             tracing::info!("snapshot `{snapshot_name}` successfully created");
-
-            let snapshot_file = snapshot_dir_path.join(&snapshot_name);
-            if let Err(e) = (*callback)(&snapshot_file) {
-                bail!("failed to call snapshot callback: {e}");
-            }
 
             if let Err(e) = merger
                 .register_snapshot(snapshot_name, snapshot_frame_count, size_after)
@@ -165,7 +158,7 @@ fn pending_snapshots_list(compact_queue_dir: &Path) -> anyhow::Result<Vec<(LogFi
             }
             // max log duration and frame number don't  matter, we compact the file and discard it
             // immediately.
-            let to_compact_file = LogFile::new(file, u64::MAX, None)?;
+            let to_compact_file = LogFile::new(file, u64::MAX, None, None)?;
             to_compact.push((to_compact_file, to_compact_path));
         }
     }
@@ -178,7 +171,12 @@ fn pending_snapshots_list(compact_queue_dir: &Path) -> anyhow::Result<Vec<(LogFi
 }
 
 impl LogCompactor {
-    pub fn new(db_path: &Path, log_id: Uuid, callback: SnapshotCallback) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        db_path: &Path,
+        log_id: Uuid,
+        scripted_backup: Option<ScriptBackupManager>,
+        namespace: NamespaceName,
+    ) -> anyhow::Result<Self> {
         // a directory containing logs that need compaction
         let compact_queue_dir = db_path.join("to_compact");
         std::fs::create_dir_all(&compact_queue_dir)?;
@@ -191,9 +189,8 @@ impl LogCompactor {
         std::fs::create_dir_all(&tmp_path)?;
 
         let (sender, mut receiver) = mpsc::channel::<(LogFile, PathBuf)>(8);
-        let mut merger = SnapshotMerger::new(db_path, log_id)?;
-        let snapshot_dir_path = snapshot_dir_path(db_path);
-
+        let mut merger =
+            SnapshotMerger::new(db_path, log_id, scripted_backup.clone(), namespace.clone())?;
         let db_path = db_path.to_path_buf();
         // We gather pending snapshots here, so new snapshots don't interfere.
         let pending = pending_snapshots_list(&compact_queue_dir)?;
@@ -207,9 +204,9 @@ impl LogCompactor {
                     to_compact_file,
                     log_id,
                     &mut merger,
-                    &callback,
-                    &snapshot_dir_path,
                     &to_compact_path,
+                    scripted_backup.clone(),
+                    namespace.clone(),
                 )
                 .await
                 {
@@ -224,9 +221,9 @@ impl LogCompactor {
                     to_compact_file,
                     log_id,
                     &mut merger,
-                    &callback,
-                    &snapshot_dir_path,
                     &to_compact_path,
+                    scripted_backup.clone(),
+                    namespace.clone(),
                 )
                 .await
                 {
@@ -257,12 +254,18 @@ struct SnapshotMerger {
 }
 
 impl SnapshotMerger {
-    fn new(db_path: &Path, log_id: Uuid) -> anyhow::Result<Self> {
+    fn new(
+        db_path: &Path,
+        log_id: Uuid,
+        scripted_backup: Option<ScriptBackupManager>,
+        namespace: NamespaceName,
+    ) -> anyhow::Result<Self> {
         let (sender, receiver) = mpsc::channel(1);
 
         let db_path = db_path.to_path_buf();
         let handle = tokio::task::spawn(async move {
-            Self::run_snapshot_merger_loop(receiver, &db_path, log_id).await
+            Self::run_snapshot_merger_loop(receiver, &db_path, log_id, scripted_backup, namespace)
+                .await
         });
 
         Ok(Self {
@@ -281,6 +284,8 @@ impl SnapshotMerger {
         mut receiver: mpsc::Receiver<(String, u64, u32)>,
         db_path: &Path,
         log_id: Uuid,
+        scripted_backup: Option<ScriptBackupManager>,
+        namespace: NamespaceName,
     ) -> anyhow::Result<()> {
         let mut snapshots = Self::init_snapshot_info_list(db_path).await?;
         let mut working = false;
@@ -293,10 +298,14 @@ impl SnapshotMerger {
                     if !working && Self::should_compact(&snapshots, db_page_count) {
                         let snapshots = std::mem::take(&mut snapshots);
                         let db_path = db_path.clone();
-                        let handle = tokio::spawn(async move {
-                            let compacted_snapshot_info =
-                                Self::merge_snapshots(snapshots, db_path.as_ref(), log_id).await?;
-                            anyhow::Result::<_, anyhow::Error>::Ok(compacted_snapshot_info)
+                        let handle = tokio::spawn({
+                            let scripted_backup = scripted_backup.clone();
+                            let namespace = namespace.clone();
+                            async move {
+                                let compacted_snapshot_info =
+                                    Self::merge_snapshots(snapshots, db_path.as_ref(), log_id, scripted_backup, namespace).await?;
+                                anyhow::Result::<_, anyhow::Error>::Ok(compacted_snapshot_info)
+                            }
                         });
                         job.set(async move { Ok(handle.await?) });
                         working = true;
@@ -332,7 +341,8 @@ impl SnapshotMerger {
         tokio::pin!(snapshots);
         while let Some(snapshot_name) = snapshots.next().await.transpose()? {
             let snapshot_path = snapshot_dir_path.join(&snapshot_name);
-            let snapshot = SnapshotFile::open(&snapshot_path).await?;
+            // NOTICE: no encryptor needed for reading unencrypted headers
+            let snapshot = SnapshotFile::open(&snapshot_path, None).await?;
             temp.push((
                 snapshot_name,
                 snapshot.header().frame_count,
@@ -352,13 +362,16 @@ impl SnapshotMerger {
         snapshots: Vec<(String, u64)>,
         db_path: &Path,
         log_id: Uuid,
+        scripted_backup: Option<ScriptBackupManager>,
+        namespace: NamespaceName,
     ) -> anyhow::Result<(String, u64)> {
-        let mut builder = SnapshotBuilder::new(db_path, log_id).await?;
+        let mut builder = SnapshotBuilder::new(db_path, log_id, scripted_backup, namespace).await?;
         let snapshot_dir_path = snapshot_dir_path(db_path);
         let mut size_after = None;
         tracing::debug!("merging {} snashots for {log_id}", snapshots.len());
         for (name, _) in snapshots.iter().rev() {
-            let snapshot = SnapshotFile::open(&snapshot_dir_path.join(name)).await?;
+            // NOTICE: no encryptor passed in order to read frames as is, still encrypted
+            let snapshot = SnapshotFile::open(&snapshot_dir_path.join(name), None).await?;
             // The size after the merged snapshot is the size after the first snapshot to be merged
             if size_after.is_none() {
                 size_after.replace(snapshot.header().size_after);
@@ -418,6 +431,8 @@ struct SnapshotBuilder {
     snapshot_file: tokio::io::BufWriter<async_tempfile::TempFile>,
     db_path: PathBuf,
     last_seen_frame_no: u64,
+    scripted_backup: Option<ScriptBackupManager>,
+    namespace: NamespaceName,
 }
 
 fn snapshot_dir_path(db_path: &Path) -> PathBuf {
@@ -425,7 +440,12 @@ fn snapshot_dir_path(db_path: &Path) -> PathBuf {
 }
 
 impl SnapshotBuilder {
-    async fn new(db_path: &Path, log_id: Uuid) -> anyhow::Result<Self> {
+    async fn new(
+        db_path: &Path,
+        log_id: Uuid,
+        scripted_backup: Option<ScriptBackupManager>,
+        namespace: NamespaceName,
+    ) -> anyhow::Result<Self> {
         let snapshot_dir_path = snapshot_dir_path(db_path);
         std::fs::create_dir_all(&snapshot_dir_path)?;
         let mut f =
@@ -446,6 +466,8 @@ impl SnapshotBuilder {
             snapshot_file: f,
             db_path: db_path.to_path_buf(),
             last_seen_frame_no: u64::MAX,
+            scripted_backup,
+            namespace,
         })
     }
 
@@ -505,6 +527,16 @@ impl SnapshotBuilder {
 
         file.sync_all().await?;
 
+        if let Some(manager) = self.scripted_backup {
+            manager
+                .register(
+                    self.namespace,
+                    self.header.start_frame_no.into(),
+                    self.header.end_frame_no.into(),
+                    file.file_path(),
+                )
+                .await?;
+        }
         tokio::fs::rename(
             file.file_path(),
             snapshot_dir_path(&self.db_path).join(&snapshot_name),
@@ -523,6 +555,8 @@ async fn perform_compaction(
     db_path: &Path,
     file_to_compact: LogFile,
     log_id: Uuid,
+    namespace: NamespaceName,
+    scripted_backup: Option<ScriptBackupManager>,
 ) -> anyhow::Result<(String, u64, u32)> {
     let header = file_to_compact.header();
     tracing::info!(
@@ -531,9 +565,9 @@ async fn perform_compaction(
         Uuid::from_u128(header.log_id.get()),
         header.start_frame_no,
     );
-    let mut builder = SnapshotBuilder::new(db_path, log_id).await?;
+    let mut builder = SnapshotBuilder::new(db_path, log_id, scripted_backup, namespace).await?;
     builder
-        .append_frames(file_to_compact.into_rev_stream_mut())
+        .append_frames(file_to_compact.into_not_decrypted_rev_stream_mut())
         .await?;
     builder.finish().await
 }
@@ -588,7 +622,7 @@ mod test {
                     .read(true)
                     .open(&logfile_path)
                     .unwrap();
-                let mut logfile = LogFile::new(file, u64::MAX, None).unwrap();
+                let mut logfile = LogFile::new(file, u64::MAX, None, None).unwrap();
                 let header = LogFileHeader {
                     log_id: log_id.as_u128().into(),
                     start_frame_no: current_fno.into(),
@@ -624,7 +658,7 @@ mod test {
         // start processing pending logs, but a correct implementation should always processs the
         // log _after_ the pending logs have been processed. A failure to do so will trigger
         // assertions in the merger code.
-        let compactor = LogCompactor::new(tmp.path(), log_id, Box::new(|_| Ok(()))).unwrap();
+        let compactor = LogCompactor::new(tmp.path(), log_id, None, "test".into()).unwrap();
         let compactor_clone = compactor.clone();
         tokio::task::spawn_blocking(move || {
             let (logfile, logfile_path) = make_logfile();
@@ -634,7 +668,7 @@ mod test {
         .unwrap();
 
         // wait a bit for snapshot to be compated
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // no error occured: the loop is still running.
         assert!(!compactor.sender.is_closed());
@@ -673,12 +707,12 @@ mod test {
             .read(true)
             .open(&logfile_path)
             .unwrap();
-        let mut logfile = LogFile::new(file, u64::MAX, None).unwrap();
+        let mut logfile = LogFile::new(file, u64::MAX, None, None).unwrap();
         logfile.write_header().unwrap();
 
         let _compactor =
-            LogCompactor::new(tmp.path(), Uuid::new_v4(), Box::new(|_| Ok(()))).unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            LogCompactor::new(tmp.path(), Uuid::new_v4(), None, "test".into()).unwrap();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
 
         // emtpy snapshot was discarded
         assert_dir_is_empty(&tmp.path().join("to_compact")).await;
@@ -707,7 +741,7 @@ mod test {
                     .read(true)
                     .open(&logfile_path)
                     .unwrap();
-                let mut logfile = LogFile::new(file, u64::MAX, None).unwrap();
+                let mut logfile = LogFile::new(file, u64::MAX, None, None).unwrap();
                 let header = LogFileHeader {
                     log_id: log_id.as_u128().into(),
                     start_frame_no: current_fno.into(),
@@ -739,7 +773,7 @@ mod test {
         // start processing pending logs, but a correct implementation should always processs the
         // log _after_ the pending logs have been processed. A failure to do so will trigger
         // assertions in the merger code.
-        let compactor = LogCompactor::new(tmp.path(), log_id, Box::new(|_| Ok(()))).unwrap();
+        let compactor = LogCompactor::new(tmp.path(), log_id, None, "test".into()).unwrap();
         let compactor_clone = compactor.clone();
         tokio::task::spawn_blocking(move || {
             for _ in 0..10 {
@@ -751,7 +785,7 @@ mod test {
         .unwrap();
 
         // wait a bit for snapshot to be compated
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // no error occured: the loop is still running.
         assert!(!compactor.sender.is_closed());
@@ -779,7 +813,8 @@ mod test {
     #[tokio::test]
     async fn compact_file_create_snapshot() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let mut log_file = LogFile::new(temp.as_file().try_clone().unwrap(), 0, None).unwrap();
+        let mut log_file =
+            LogFile::new(temp.as_file().try_clone().unwrap(), 0, None, None).unwrap();
         let log_id = Uuid::new_v4();
         log_file.header.log_id = log_id.as_u128().into();
         log_file.write_header().unwrap();
@@ -800,7 +835,7 @@ mod test {
         log_file.commit().unwrap();
 
         let dump_dir = tempdir().unwrap();
-        let compactor = LogCompactor::new(dump_dir.path(), log_id, Box::new(|_| Ok(()))).unwrap();
+        let compactor = LogCompactor::new(dump_dir.path(), log_id, None, "test".into()).unwrap();
         tokio::task::spawn_blocking({
             let compactor = compactor.clone();
             move || {
@@ -843,7 +878,7 @@ mod test {
         assert_eq!(seen_frames.len(), 25);
         assert_eq!(seen_page_no.len(), 25);
 
-        let snapshot_file = SnapshotFile::open(&snapshot_path).await.unwrap();
+        let snapshot_file = SnapshotFile::open(&snapshot_path, None).await.unwrap();
 
         let frames = snapshot_file.into_stream_mut_from(0);
         tokio::pin!(frames);

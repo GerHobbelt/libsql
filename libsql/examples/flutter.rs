@@ -1,4 +1,4 @@
-use libsql::Database;
+use libsql::Builder;
 
 #[tokio::main]
 async fn main() {
@@ -14,11 +14,14 @@ async fn main() {
             .enable_http1()
             .build();
 
-        Database::open_remote_with_connector(url, token, https).unwrap()
+        Builder::new_remote(url, token)
+            .connector(https)
+            .build()
+            .await
+            .unwrap()
     } else {
-        Database::open_in_memory().unwrap()
+        Builder::new_local(":memory:").build().await.unwrap()
     };
-
     let conn = db.connect().unwrap();
 
     conn.query("select 1; select 1;", ()).await.unwrap();
@@ -41,7 +44,7 @@ async fn main() {
 
     let mut rows = stmt.query(["foo@example.com"]).await.unwrap();
 
-    let row = rows.next().unwrap().unwrap();
+    let row = rows.next().await.unwrap().unwrap();
 
     let value = row.get_value(0).unwrap();
 

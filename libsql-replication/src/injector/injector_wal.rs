@@ -3,8 +3,8 @@ use std::num::NonZeroU32;
 
 use libsql_sys::ffi::{Pager, PgHdr};
 use libsql_sys::wal::{
-    BusyHandler, CheckpointMode, PageHeaders, Result, Sqlite3Db, Sqlite3File, Sqlite3Wal,
-    Sqlite3WalManager, UndoHandler, Vfs, Wal, WalManager,
+    BusyHandler, CheckpointCallback, CheckpointMode, PageHeaders, Result, Sqlite3Db, Sqlite3File,
+    Sqlite3Wal, Sqlite3WalManager, UndoHandler, Vfs, Wal, WalManager,
 };
 
 use crate::frame::FrameBorrowed;
@@ -141,7 +141,7 @@ impl Wal for InjectorWal {
         _size_after: u32,
         _is_commit: bool,
         sync_flags: c_int,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         self.is_txn = true;
         let mut buffer = self.buffer.lock();
 
@@ -162,7 +162,6 @@ impl Wal for InjectorWal {
                 return Err(libsql_sys::wal::Error::new(LIBSQL_INJECT_FATAL));
             }
 
-            debug_assert!(headers.all_applied());
             drop(headers);
             if size_after != 0 {
                 self.is_txn = false;
@@ -179,17 +178,28 @@ impl Wal for InjectorWal {
         }
     }
 
-    fn checkpoint<B: BusyHandler>(
+    fn checkpoint(
         &mut self,
         db: &mut Sqlite3Db,
         mode: CheckpointMode,
-        busy_handler: Option<&mut B>,
+        busy_handler: Option<&mut dyn BusyHandler>,
         sync_flags: u32,
         // temporary scratch buffer
         buf: &mut [u8],
-    ) -> Result<(u32, u32)> {
-        self.inner
-            .checkpoint(db, mode, busy_handler, sync_flags, buf)
+        checkpoint_cb: Option<&mut dyn CheckpointCallback>,
+        in_wal: Option<&mut i32>,
+        backfilled: Option<&mut i32>,
+    ) -> Result<()> {
+        self.inner.checkpoint(
+            db,
+            mode,
+            busy_handler,
+            sync_flags,
+            buf,
+            checkpoint_cb,
+            in_wal,
+            backfilled,
+        )
     }
 
     fn exclusive_mode(&mut self, op: c_int) -> Result<()> {
@@ -208,8 +218,20 @@ impl Wal for InjectorWal {
         self.inner.callback()
     }
 
-    fn last_fame_index(&self) -> u32 {
-        todo!()
+    fn frames_in_wal(&self) -> u32 {
+        self.inner.frames_in_wal()
+    }
+
+    fn db_file(&self) -> &Sqlite3File {
+        self.inner.db_file()
+    }
+
+    fn backfilled(&self) -> u32 {
+        self.inner.backfilled()
+    }
+
+    fn frame_page_no(&self, frame_no: NonZeroU32) -> Option<NonZeroU32> {
+        self.inner.frame_page_no(frame_no)
     }
 }
 
