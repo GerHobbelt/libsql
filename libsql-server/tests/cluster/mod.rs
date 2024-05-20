@@ -12,7 +12,7 @@ use turmoil::{Builder, Sim};
 
 use common::net::{init_tracing, TestServer, TurmoilAcceptor, TurmoilConnector};
 
-use crate::common::http::Client;
+use crate::common::{http::Client, net::SimServer, snapshot_metrics};
 
 fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
     init_tracing();
@@ -23,7 +23,6 @@ fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
             let server = TestServer {
                 path: path.into(),
                 user_api_config: UserApiConfig {
-                    http_acceptor: Some(TurmoilAcceptor::bind(([0, 0, 0, 0], 8080)).await?),
                     ..Default::default()
                 },
                 admin_api_config: Some(AdminApiConfig {
@@ -40,7 +39,7 @@ fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
                 ..Default::default()
             };
 
-            server.start().await?;
+            server.start_sim(8080).await?;
 
             Ok(())
         }
@@ -54,7 +53,6 @@ fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
                 let server = TestServer {
                     path: path.into(),
                     user_api_config: UserApiConfig {
-                        http_acceptor: Some(TurmoilAcceptor::bind(([0, 0, 0, 0], 8080)).await?),
                         ..Default::default()
                     },
                     admin_api_config: Some(AdminApiConfig {
@@ -72,7 +70,7 @@ fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
                     ..Default::default()
                 };
 
-                server.start().await.unwrap();
+                server.start_sim(8080).await.unwrap();
 
                 Ok(())
             }
@@ -102,6 +100,8 @@ fn proxy_write() {
             rows.next().unwrap().unwrap().get_value(0).unwrap(),
             Value::Integer(1)
         ));
+
+        snapshot_metrics().assert_gauge("libsql_server_current_frame_no", 2.0);
 
         Ok(())
     });

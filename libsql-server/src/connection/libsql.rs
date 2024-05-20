@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use metrics::histogram;
+use metrics::{histogram, increment_counter};
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{DatabaseName, ErrorCode, OpenFlags, StatementStatus};
+use rusqlite::{DatabaseName, ErrorCode, OpenFlags, StatementStatus, TransactionState};
 use sqld_libsql_bindings::wal_hook::{TransparentMethods, WalMethodsHook};
 use tokio::sync::{watch, Notify};
 use tokio::time::{Duration, Instant};
@@ -13,16 +13,16 @@ use tokio::time::{Duration, Instant};
 use crate::auth::{Authenticated, Authorized, Permission};
 use crate::error::Error;
 use crate::libsql_bindings::wal_hook::WalHook;
-use crate::metrics::{READ_QUERY_COUNT, WRITE_QUERY_COUNT};
+use crate::metrics::{READ_QUERY_COUNT, VACUUM_COUNT, WAL_CHECKPOINT_COUNT, WRITE_QUERY_COUNT};
 use crate::query::Query;
-use crate::query_analysis::{State, StmtKind};
+use crate::query_analysis::{StmtKind, TxnStatus};
 use crate::query_result_builder::{QueryBuilderConfig, QueryResultBuilder};
 use crate::replication::FrameNo;
 use crate::stats::Stats;
 use crate::Result;
 
 use super::config::DatabaseConfigStore;
-use super::program::{Cond, DescribeCol, DescribeParam, DescribeResponse, DescribeResult};
+use super::program::{Cond, DescribeCol, DescribeParam, DescribeResponse};
 use super::{MakeConnection, Program, Step, TXN_TIMEOUT};
 
 pub struct MakeLibSqlConn<W: WalHook + 'static> {
@@ -146,7 +146,6 @@ where
     }
 }
 
-#[derive(Clone)]
 pub struct LibSqlConnection<W: WalHook> {
     inner: Arc<Mutex<Connection<W>>>,
 }
@@ -158,6 +157,14 @@ impl<W: WalHook> std::fmt::Debug for LibSqlConnection<W> {
                 write!(f, "{conn:?}")
             }
             None => write!(f, "<locked>"),
+        }
+    }
+}
+
+impl<W: WalHook> Clone for LibSqlConnection<W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
         }
     }
 }
@@ -178,7 +185,13 @@ where
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     );
-    sqld_libsql_bindings::Connection::open(path, flags, wal_methods, hook_ctx, auto_checkpoint)
+    sqld_libsql_bindings::Connection::open(
+        path.join("data"),
+        flags,
+        wal_methods,
+        hook_ctx,
+        auto_checkpoint,
+    )
 }
 
 impl<W> LibSqlConnection<W>
@@ -220,6 +233,38 @@ where
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    pub fn txn_status(&self) -> crate::Result<TxnStatus> {
+        Ok(self
+            .inner
+            .lock()
+            .conn
+            .transaction_state(Some(DatabaseName::Main))?
+            .into())
+    }
+}
+
+#[cfg(test)]
+impl LibSqlConnection<TransparentMethods> {
+    pub fn new_test(path: &Path) -> Self {
+        let (_snd, rcv) = watch::channel(None);
+        let conn = Connection::new(
+            path,
+            Arc::new([]),
+            &crate::libsql_bindings::wal_hook::TRANSPARENT_METHODS,
+            (),
+            Default::default(),
+            DatabaseConfigStore::new_test().into(),
+            QueryBuilderConfig::default(),
+            rcv,
+            Default::default(),
+        )
+        .unwrap();
+
+        Self {
+            inner: Arc::new(Mutex::new(conn)),
+        }
     }
 }
 
@@ -265,7 +310,10 @@ impl<T: WalHook> TxnSlot<T> {
         // we have a lock on the connection, we don't need mode than a
         // Relaxed store.
         conn.rollback();
-        histogram!("write_txn_duration", self.created_at.elapsed())
+        histogram!(
+            "libsql_server_write_txn_duration",
+            self.created_at.elapsed()
+        )
         // WRITE_TXN_DURATION.record(self.created_at.elapsed());
     }
 }
@@ -341,25 +389,55 @@ unsafe extern "C" fn busy_handler<W: WalHook>(state: *mut c_void, _retries: c_in
             // the current holder of the transaction has timedout, we will attempt to steal their
             // lock.
             _ = timeout => {
+                tracing::info!("transaction has timed-out, stealing lock");
                 // only a single connection gets to steal the lock, others retry
                 if let Some(mut lock) = state.slot.try_write() {
-                    // We check that slot wasn't already stolen, and that their is still a slot.
-                    // The ordering is relaxed because the atomic is only set under the slot lock.
-                    if slot.is_stolen.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                        // The connection holding the current txn will set itself as stolen when it
-                        // detects a timeout, so if we arrive to this point, then there is
-                        // necessarily a slot, and this slot has to be the one we attempted to
-                        // steal.
-                        assert!(lock.take().is_some());
+                    if let Some(ref s) = *lock {
+                        // The state contains the same lock as the one we're attempting to steal
+                        if Arc::ptr_eq(s, &slot) {
+                            // We check that slot wasn't already stolen, and that their is still a slot.
+                            // The ordering is relaxed because the atomic is only set under the slot lock.
+                            if slot.is_stolen.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                // The connection holding the current txn will set itself as stolen when it
+                                // detects a timeout, so if we arrive to this point, then there is
+                                // necessarily a slot, and this slot has to be the one we attempted to
+                                // steal.
+                                assert!(lock.take().is_some());
 
-                        slot.abort();
-                        tracing::info!("stole transaction lock");
+                                slot.abort();
+                                tracing::info!("stole transaction lock");
+                            }
+                        }
                     }
                 }
+
                 1
             }
         }
+
     })
+}
+
+fn value_size(val: &rusqlite::types::ValueRef) -> usize {
+    use rusqlite::types::ValueRef;
+    match val {
+        ValueRef::Null => 0,
+        ValueRef::Integer(_) => 8,
+        ValueRef::Real(_) => 8,
+        ValueRef::Text(s) => s.len(),
+        ValueRef::Blob(b) => b.len(),
+    }
+}
+
+impl From<TransactionState> for TxnStatus {
+    fn from(value: TransactionState) -> Self {
+        use TransactionState as Tx;
+        match value {
+            Tx::None => TxnStatus::Init,
+            Tx::Read | Tx::Write => TxnStatus::Txn,
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl<W: WalHook> Connection<W> {
@@ -416,7 +494,7 @@ impl<W: WalHook> Connection<W> {
         this: Arc<Mutex<Self>>,
         pgm: Program,
         mut builder: B,
-    ) -> Result<(B, State)> {
+    ) -> Result<B> {
         use rusqlite::TransactionState as Tx;
 
         let state = this.lock().state.clone();
@@ -467,8 +545,20 @@ impl<W: WalHook> Connection<W> {
                 }
                 // lock was downgraded, notify a waiter
                 (Tx::Write, Tx::None | Tx::Read) => {
-                    state.slot.write().take();
-                    lock.slot.take();
+                    let old_slot = lock
+                        .slot
+                        .take()
+                        .expect("there should be a slot right after downgrading a txn");
+                    let mut maybe_state_slot = state.slot.write();
+                    // We need to make sure that the state slot is our slot before removing it.
+                    if let Some(ref state_slot) = *maybe_state_slot {
+                        if Arc::ptr_eq(state_slot, &old_slot) {
+                            maybe_state_slot.take();
+                        }
+                    }
+
+                    drop(maybe_state_slot);
+
                     state.notify.notify_one();
                 }
                 // nothing to do
@@ -480,20 +570,18 @@ impl<W: WalHook> Connection<W> {
             results.push(res);
         }
 
-        builder.finish(*this.lock().current_frame_no_receiver.borrow_and_update())?;
+        let status = this
+            .lock()
+            .conn
+            .transaction_state(Some(DatabaseName::Main))?
+            .into();
 
-        let state = if matches!(
-            this.lock()
-                .conn
-                .transaction_state(Some(DatabaseName::Main))?,
-            Tx::Read | Tx::Write
-        ) {
-            State::Txn
-        } else {
-            State::Init
-        };
+        builder.finish(
+            *this.lock().current_frame_no_receiver.borrow_and_update(),
+            status,
+        )?;
 
-        Ok((builder, state))
+        Ok(builder)
     }
 
     fn execute_step(
@@ -548,6 +636,9 @@ impl<W: WalHook> Connection<W> {
         builder: &mut impl QueryResultBuilder,
     ) -> Result<(u64, Option<i64>)> {
         tracing::trace!("executing query: {}", query.stmt.stmt);
+
+        increment_counter!("libsql_server_libsql_query_execute");
+
         let start = Instant::now();
         let config = self.config_store.get();
         let blocked = match query.stmt.kind {
@@ -578,15 +669,18 @@ impl<W: WalHook> Connection<W> {
 
         let mut qresult = stmt.raw_query();
 
+        let mut values_total_bytes = 0;
         builder.begin_rows()?;
         while let Some(row) = qresult.next()? {
             builder.begin_row()?;
             for i in 0..cols_count {
                 let val = row.get_ref(i)?;
+                values_total_bytes += value_size(&val);
                 builder.add_row_value(val)?;
             }
             builder.finish_row()?;
         }
+        histogram!("libsql_server_returned_bytes", values_total_bytes as f64);
 
         builder.finish_rows()?;
 
@@ -618,8 +712,11 @@ impl<W: WalHook> Connection<W> {
     }
 
     fn checkpoint(&self) -> Result<()> {
+        let start = Instant::now();
         self.conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", (), |_| Ok(()))?;
+        WAL_CHECKPOINT_COUNT.increment(1);
+        histogram!("libsql_server_wal_checkpoint_time", start.elapsed());
         Ok(())
     }
 
@@ -637,21 +734,25 @@ impl<W: WalHook> Connection<W> {
         } else {
             tracing::debug!("Not vacuuming: pages={page_count} freelist={freelist_count}");
         }
+        VACUUM_COUNT.increment(1);
         Ok(())
     }
 
     fn update_stats(&self, sql: String, stmt: &rusqlite::Statement, elapsed: Duration) {
+        histogram!("libsql_server_statement_execution_time", elapsed);
         let elapsed = elapsed.as_millis() as u64;
-        let rows_read = stmt.get_status(StatementStatus::RowsRead);
-        let rows_written = stmt.get_status(StatementStatus::RowsWritten);
+        let rows_read = stmt.get_status(StatementStatus::RowsRead) as u64;
+        let rows_written = stmt.get_status(StatementStatus::RowsWritten) as u64;
+        let mem_used = stmt.get_status(StatementStatus::MemUsed) as u64;
+        histogram!("libsql_server_statement_mem_used_bytes", mem_used as f64);
         let rows_read = if rows_read == 0 && rows_written == 0 {
             1
         } else {
             rows_read
         };
-        self.stats.inc_rows_read(rows_read as u64);
-        self.stats.inc_rows_written(rows_written as u64);
-        let weight = (rows_read + rows_written) as i64;
+        self.stats.inc_rows_read(rows_read);
+        self.stats.inc_rows_written(rows_written);
+        let weight = rows_read + rows_written;
         if self.stats.qualifies_as_top_query(weight) {
             self.stats.add_top_query(crate::stats::TopQuery::new(
                 sql.clone(),
@@ -662,15 +763,18 @@ impl<W: WalHook> Connection<W> {
         if self.stats.qualifies_as_slowest_query(elapsed) {
             self.stats
                 .add_slowest_query(crate::stats::SlowestQuery::new(
-                    sql,
+                    sql.clone(),
                     elapsed,
                     rows_read,
                     rows_written,
                 ));
         }
+
+        self.stats
+            .update_query_metrics(sql, rows_read, rows_written, mem_used, elapsed)
     }
 
-    fn describe(&self, sql: &str) -> DescribeResult {
+    fn describe(&self, sql: &str) -> crate::Result<DescribeResponse> {
         let stmt = self.conn.prepare(sql)?;
 
         let params = (1..=stmt.parameter_count())
@@ -775,7 +879,9 @@ where
         auth: Authenticated,
         builder: B,
         _replication_index: Option<FrameNo>,
-    ) -> Result<(B, State)> {
+    ) -> Result<B> {
+        increment_counter!("libsql_server_libsql_execute_program");
+
         check_program_auth(auth, &pgm)?;
         let conn = self.inner.clone();
         tokio::task::spawn_blocking(move || Connection::run(conn, pgm, builder))
@@ -788,7 +894,7 @@ where
         sql: String,
         auth: Authenticated,
         _replication_index: Option<FrameNo>,
-    ) -> Result<DescribeResult> {
+    ) -> Result<crate::Result<DescribeResponse>> {
         check_describe_auth(auth)?;
         let conn = self.inner.clone();
         let res = tokio::task::spawn_blocking(move || conn.lock().describe(&sql))
@@ -832,10 +938,12 @@ where
 #[cfg(test)]
 mod test {
     use itertools::Itertools;
+    use rand::Rng;
     use sqld_libsql_bindings::wal_hook::TRANSPARENT_METHODS;
     use tempfile::tempdir;
     use tokio::task::JoinSet;
 
+    use crate::connection::Connection as _;
     use crate::query_result_builder::test::{test_driver, TestBuilder};
     use crate::query_result_builder::QueryResultBuilder;
     use crate::DEFAULT_AUTO_CHECKPOINT;
@@ -867,7 +975,7 @@ mod test {
     fn test_libsql_conn_builder_driver() {
         test_driver(1000, |b| {
             let conn = setup_test_conn();
-            Connection::run(conn, Program::seq(&["select * from test"]), b).map(|x| x.0)
+            Connection::run(conn, Program::seq(&["select * from test"]), b)
         })
     }
 
@@ -891,23 +999,23 @@ mod test {
 
         tokio::time::pause();
         let conn = make_conn.make_connection().await.unwrap();
-        let (_builder, state) = Connection::run(
+        let _builder = Connection::run(
             conn.inner.clone(),
             Program::seq(&["BEGIN IMMEDIATE"]),
             TestBuilder::default(),
         )
         .unwrap();
-        assert_eq!(state, State::Txn);
+        assert_eq!(conn.txn_status().unwrap(), TxnStatus::Txn);
 
         tokio::time::advance(TXN_TIMEOUT * 2).await;
 
-        let (builder, state) = Connection::run(
+        let builder = Connection::run(
             conn.inner.clone(),
             Program::seq(&["BEGIN IMMEDIATE"]),
             TestBuilder::default(),
         )
         .unwrap();
-        assert_eq!(state, State::Init);
+        assert_eq!(conn.txn_status().unwrap(), TxnStatus::Init);
         assert!(matches!(builder.into_ret()[0], Err(Error::LibSqlTxTimeout)));
     }
 
@@ -935,13 +1043,13 @@ mod test {
         for _ in 0..10 {
             let conn = make_conn.make_connection().await.unwrap();
             set.spawn_blocking(move || {
-                let (builder, state) = Connection::run(
-                    conn.inner,
+                let builder = Connection::run(
+                    conn.inner.clone(),
                     Program::seq(&["BEGIN IMMEDIATE"]),
                     TestBuilder::default(),
                 )
                 .unwrap();
-                assert_eq!(state, State::Txn);
+                assert_eq!(conn.txn_status().unwrap(), TxnStatus::Txn);
                 assert!(builder.into_ret()[0].is_ok());
             });
         }
@@ -976,15 +1084,15 @@ mod test {
 
         let conn1 = make_conn.make_connection().await.unwrap();
         tokio::task::spawn_blocking({
-            let conn = conn1.inner.clone();
+            let conn = conn1.clone();
             move || {
-                let (builder, state) = Connection::run(
-                    conn,
+                let builder = Connection::run(
+                    conn.inner.clone(),
                     Program::seq(&["BEGIN IMMEDIATE"]),
                     TestBuilder::default(),
                 )
                 .unwrap();
-                assert_eq!(state, State::Txn);
+                assert_eq!(conn.txn_status().unwrap(), TxnStatus::Txn);
                 assert!(builder.into_ret()[0].is_ok());
             }
         })
@@ -993,16 +1101,16 @@ mod test {
 
         let conn2 = make_conn.make_connection().await.unwrap();
         let handle = tokio::task::spawn_blocking({
-            let conn = conn2.inner.clone();
+            let conn = conn2.clone();
             move || {
                 let before = Instant::now();
-                let (builder, state) = Connection::run(
-                    conn,
+                let builder = Connection::run(
+                    conn.inner.clone(),
                     Program::seq(&["BEGIN IMMEDIATE"]),
                     TestBuilder::default(),
                 )
                 .unwrap();
-                assert_eq!(state, State::Txn);
+                assert_eq!(conn.txn_status().unwrap(), TxnStatus::Txn);
                 assert!(builder.into_ret()[0].is_ok());
                 before.elapsed()
             }
@@ -1012,12 +1120,15 @@ mod test {
         tokio::time::sleep(wait_time).await;
 
         tokio::task::spawn_blocking({
-            let conn = conn1.inner.clone();
+            let conn = conn1.clone();
             move || {
-                let (builder, state) =
-                    Connection::run(conn, Program::seq(&["COMMIT"]), TestBuilder::default())
-                        .unwrap();
-                assert_eq!(state, State::Init);
+                let builder = Connection::run(
+                    conn.inner.clone(),
+                    Program::seq(&["COMMIT"]),
+                    TestBuilder::default(),
+                )
+                .unwrap();
+                assert_eq!(conn.txn_status().unwrap(), TxnStatus::Init);
                 assert!(builder.into_ret()[0].is_ok());
             }
         })
@@ -1028,5 +1139,79 @@ mod test {
 
         let epsilon = Duration::from_millis(100);
         assert!((wait_time..wait_time + epsilon).contains(&elapsed));
+    }
+
+    /// The goal of this test is to run many conccurent transaction and hopefully catch a bug in
+    /// the lock stealing code. If this test becomes flaky check out the lock stealing code.
+    #[tokio::test]
+    async fn test_many_conccurent() {
+        let tmp = tempdir().unwrap();
+        let make_conn = MakeLibSqlConn::new(
+            tmp.path().into(),
+            &TRANSPARENT_METHODS,
+            || (),
+            Default::default(),
+            Arc::new(DatabaseConfigStore::load(tmp.path()).unwrap()),
+            Arc::new([]),
+            100000000,
+            100000000,
+            DEFAULT_AUTO_CHECKPOINT,
+            watch::channel(None).1,
+        )
+        .await
+        .unwrap();
+        let auth = Authenticated::Authorized(Authorized {
+            namespace: None,
+            permission: Permission::FullAccess,
+        });
+
+        let conn = make_conn.make_connection().await.unwrap();
+        conn.execute_program(
+            Program::seq(&["CREATE TABLE test (x)"]),
+            auth.clone(),
+            TestBuilder::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let run_conn = |maker: Arc<MakeLibSqlConn<TransparentMethods>>| {
+            let auth = auth.clone();
+            async move {
+                for _ in 0..1000 {
+                    let conn = maker.make_connection().await.unwrap();
+                    let pgm = Program::seq(&["BEGIN IMMEDIATE", "INSERT INTO test VALUES (42)"]);
+                    let res = conn
+                        .execute_program(pgm, auth.clone(), TestBuilder::default(), None)
+                        .await
+                        .unwrap()
+                        .into_ret();
+                    for result in res {
+                        result.unwrap();
+                    }
+                    // with 99% change, commit the txn
+                    if rand::thread_rng().gen_range(0..100) > 1 {
+                        let pgm = Program::seq(&["INSERT INTO test VALUES (43)", "COMMIT"]);
+                        let res = conn
+                            .execute_program(pgm, auth.clone(), TestBuilder::default(), None)
+                            .await
+                            .unwrap()
+                            .into_ret();
+                        for result in res {
+                            result.unwrap();
+                        }
+                    }
+                }
+            }
+        };
+
+        let maker = Arc::new(make_conn);
+        let mut join_set = JoinSet::new();
+        for _ in 0..3 {
+            join_set.spawn(run_conn(maker.clone()));
+        }
+
+        while let Some(next) = join_set.join_next().await {
+            next.unwrap();
+        }
     }
 }

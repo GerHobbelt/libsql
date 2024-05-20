@@ -1,7 +1,7 @@
 use crate::{Result, Value, ValueType};
+use std::fmt;
 
 // NOTICE: Column is blatantly copy-pasted from rusqlite
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct Column<'stmt> {
     pub name: &'stmt str,
     pub origin_name: Option<&'stmt str>,
@@ -97,6 +97,12 @@ impl Row {
 
     pub fn column_type(&self, idx: i32) -> Result<ValueType> {
         self.inner.column_type(idx)
+    }
+}
+
+impl fmt::Debug for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
+        self.inner.fmt(f)
     }
 }
 
@@ -208,7 +214,7 @@ where
     }
 }
 
-pub(crate) trait RowInner {
+pub(crate) trait RowInner: fmt::Debug {
     fn column_value(&self, idx: i32) -> Result<Value>;
     fn column_str(&self, idx: i32) -> Result<&str>;
     fn column_name(&self, idx: i32) -> Option<&str>;

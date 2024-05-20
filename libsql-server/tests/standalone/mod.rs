@@ -1,5 +1,7 @@
 //! Tests for standalone primary configuration
 
+use crate::common::{net::SimServer, snapshot_metrics};
+
 use super::common;
 
 use std::sync::Arc;
@@ -10,7 +12,7 @@ use tokio::sync::Notify;
 
 use sqld::config::UserApiConfig;
 
-use common::net::{init_tracing, TestServer, TurmoilAcceptor, TurmoilConnector};
+use common::net::{init_tracing, TestServer, TurmoilConnector};
 
 async fn make_standalone_server() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
@@ -19,13 +21,12 @@ async fn make_standalone_server() -> Result<(), Box<dyn std::error::Error>> {
         path: tmp.path().to_owned().into(),
         user_api_config: UserApiConfig {
             hrana_ws_acceptor: None,
-            http_acceptor: Some(TurmoilAcceptor::bind(([0, 0, 0, 0], 8080)).await?),
             ..Default::default()
         },
         ..Default::default()
     };
 
-    server.start().await?;
+    server.start_sim(8080).await?;
 
     Ok(())
 }
@@ -49,6 +50,36 @@ fn basic_query() {
             rows.next().unwrap().unwrap().get_value(0).unwrap(),
             libsql::Value::Integer(1)
         ));
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn basic_metrics() {
+    let mut sim = turmoil::Builder::new().build();
+
+    sim.host("primary", make_standalone_server);
+
+    sim.client("test", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
+        let conn = db.connect()?;
+
+        conn.execute("create table test (x)", ()).await?;
+        conn.execute("insert into test values (12)", ()).await?;
+
+        let mut rows = conn.query("select count(*) from test", ()).await?;
+
+        assert!(matches!(
+            rows.next().unwrap().unwrap().get_value(0).unwrap(),
+            libsql::Value::Integer(1)
+        ));
+
+        snapshot_metrics()
+            .assert_gauge("libsql_server_current_frame_no", 2.0)
+            .assert_counter("libsql_server_libsql_execute_program", 3);
 
         Ok(())
     });

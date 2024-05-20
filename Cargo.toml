@@ -10,9 +10,12 @@ members = [
   "bottomless",
   "bottomless-cli",
   "libsql-sys-tmp",
+  "libsql-replication",
 
   "vendored/rusqlite",
-  "vendored/sqlite3-parser"
+  "vendored/sqlite3-parser",
+
+  "xtask",
 ]
 
 [profile.release]

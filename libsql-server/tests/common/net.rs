@@ -8,6 +8,7 @@ use futures_core::Future;
 use hyper::client::connect::Connected;
 use hyper::server::accept::Accept as HyperAccept;
 use hyper::Uri;
+use metrics_util::debugging::DebuggingRecorder;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::Service;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -131,6 +132,43 @@ impl Service<Uri> for TurmoilConnector {
 }
 
 pub type TestServer = Server<TurmoilConnector, TurmoilAcceptor, TurmoilConnector>;
+
+#[async_trait::async_trait]
+pub trait SimServer {
+    async fn start_sim(self, user_api_port: usize) -> anyhow::Result<()>;
+}
+
+#[async_trait::async_trait]
+impl SimServer for TestServer {
+    async fn start_sim(mut self, user_api_port: usize) -> anyhow::Result<()> {
+        // We need to ensure that libsql's init code runs before we do anything
+        // with rusqlite in sqld. This is because libsql has saftey checks and
+        // needs to configure the sqlite api. Thus if we init sqld first
+        // it will fail. To work around this we open a temp db in memory db
+        // to ensure we run libsql's init code first. This DB is not actually
+        // used in the test only for its run once init code.
+        //
+        // This does change the serialization mode for sqld but because the mode
+        // that we use in libsql is safer than the sqld one it is still safe.
+        let db = libsql::Database::open_in_memory().unwrap();
+        db.connect().unwrap();
+
+        // Ignore the result because we may set it many times in a single process.
+        let _ = DebuggingRecorder::per_thread().install();
+
+        let user_api = TurmoilAcceptor::bind(([0, 0, 0, 0], user_api_port as u16)).await?;
+        self.user_api_config.http_acceptor = Some(user_api);
+
+        // Disable prom metrics since we already created our recorder.
+        if let Some(admin_api) = &mut self.admin_api_config {
+            admin_api.disable_metrics = true;
+        }
+
+        self.start().await?;
+
+        Ok(())
+    }
+}
 
 pub fn init_tracing() {
     static INIT_TRACING: Once = Once::new();
