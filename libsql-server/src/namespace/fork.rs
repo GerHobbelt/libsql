@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use bottomless::replicator::Replicator;
 use chrono::NaiveDateTime;
+use futures::TryStreamExt;
 use libsql_replication::frame::FrameBorrowed;
 use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -109,12 +110,11 @@ impl ForkTask<'_> {
                 self.dest_namespace.clone(),
                 RestoreOption::Latest,
                 self.bottomless_db_id,
-                true,
                 // Forking works only on primary and
                 // PrimaryNamespaceMaker::create ignores
                 // reset_cb param
                 Box::new(|_op| {}),
-                &self.meta_store,
+                self.meta_store,
             )
             .await
             .map_err(|e| ForkError::CreateNamespace(Box::new(e)))
@@ -131,7 +131,8 @@ impl ForkTask<'_> {
             let mut next_frame_no = 0;
             while next_frame_no < end_frame_no {
                 let mut streamer = FrameStream::new(logger.clone(), next_frame_no, false, None)
-                    .map_err(|e| ForkError::LogRead(e.into()))?;
+                    .map_err(|e| ForkError::LogRead(e.into()))?
+                    .map_ok(|(f, _)| f);
                 while let Some(res) = streamer.next().await {
                     match res {
                         Ok(frame) => {

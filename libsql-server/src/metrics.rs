@@ -117,3 +117,29 @@ pub static DIRTY_STARTUP: Lazy<Counter> = Lazy::new(|| {
     );
     register_counter!(NAME)
 });
+pub static REPLICATION_LATENCY: Lazy<Histogram> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_replication_latency";
+    describe_counter!(
+        NAME,
+        "Latency between the time a transaction was commited on the primary and the commit frame was received by the replica"
+    );
+    register_histogram!(NAME)
+});
+pub static REPLICATION_LATENCY_OUT_OF_SYNC: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_replication_latency_out_of_sync";
+    describe_counter!(
+        NAME,
+        "Number of replication latency timestamps that were out-of-sync (clocks likely not synchronized)"
+    );
+    register_counter!(NAME)
+});
+pub static REPLICATION_LATENCY_CACHE_MISS: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_replication_latencies_cache_misses";
+    describe_counter!(NAME, "Number of replication latency cache misses");
+    register_counter!(NAME)
+});
+pub static SERVER_COUNT: Lazy<Gauge> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_count";
+    describe_gauge!(NAME, "a gauge counting the number of active servers");
+    register_gauge!(NAME)
+});

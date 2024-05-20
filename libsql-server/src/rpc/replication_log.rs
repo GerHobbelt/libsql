@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 pub use libsql_replication::rpc::replication as rpc;
 use libsql_replication::rpc::replication::replication_log_server::ReplicationLog;
@@ -93,11 +94,12 @@ impl ReplicationLogService {
 }
 
 fn map_frame_stream_output(
-    r: Result<libsql_replication::frame::Frame, LogReadError>,
+    r: Result<(libsql_replication::frame::Frame, Option<DateTime<Utc>>), LogReadError>,
 ) -> Result<Frame, Status> {
     match r {
-        Ok(frame) => Ok(Frame {
+        Ok((frame, ts)) => Ok(Frame {
             data: frame.bytes(),
+            timestamp: ts.map(|ts| ts.timestamp_millis()),
         }),
         Err(LogReadError::SnapshotRequired) => Err(Status::new(
             tonic::Code::FailedPrecondition,
@@ -165,7 +167,7 @@ impl ReplicationLog for ReplicationLogService {
         let req = req.into_inner();
         let logger = self
             .namespaces
-            .with(namespace, |ns| ns.db.wal_manager.logger())
+            .with(namespace, |ns| ns.db.wal_manager.wrapped().logger())
             .await
             .map_err(|e| {
                 if let crate::error::Error::NamespaceDoesntExist(_) = e {
@@ -196,7 +198,7 @@ impl ReplicationLog for ReplicationLogService {
         let req = req.into_inner();
         let logger = self
             .namespaces
-            .with(namespace, |ns| ns.db.wal_manager.logger().clone())
+            .with(namespace, |ns| ns.db.wal_manager.wrapped().logger().clone())
             .await
             .map_err(|e| {
                 if let crate::error::Error::NamespaceDoesntExist(_) = e {
@@ -240,7 +242,7 @@ impl ReplicationLog for ReplicationLogService {
 
         let logger = self
             .namespaces
-            .with(namespace, |ns| ns.db.wal_manager.logger().clone())
+            .with(namespace, |ns| ns.db.wal_manager.wrapped().logger().clone())
             .await
             .map_err(|e| {
                 if let crate::error::Error::NamespaceDoesntExist(_) = e {
@@ -272,7 +274,7 @@ impl ReplicationLog for ReplicationLogService {
 
         let logger = self
             .namespaces
-            .with(namespace, |ns| ns.db.wal_manager.logger().clone())
+            .with(namespace, |ns| ns.db.wal_manager.wrapped().logger().clone())
             .await
             .unwrap();
         let offset = req.next_offset;
@@ -312,6 +314,7 @@ mod snapshot_stream {
 
                         yield Ok(Frame {
                             data: libsql_replication::frame::Frame::from(frame).bytes(),
+                            timestamp: None,
                         });
                     }
                     Err(e) => {

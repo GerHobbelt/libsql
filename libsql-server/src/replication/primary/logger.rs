@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 use anyhow::{bail, ensure};
 use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
 use libsql_replication::frame::{Frame, FrameHeader, FrameMut};
 use libsql_replication::snapshot::SnapshotFile;
+use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::ffi::SQLITE_CHECKPOINT_TRUNCATE;
 use tokio::sync::watch;
@@ -24,6 +26,10 @@ use zerocopy::{AsBytes, FromBytes};
 use crate::replication::snapshot::{find_snapshot_file, LogCompactor};
 use crate::replication::{FrameNo, SnapshotCallback, CRC_64_GO_ISO, WAL_MAGIC};
 use crate::LIBSQL_PAGE_SIZE;
+
+static REPLICATION_LATENCY_CACHE_SIZE: Lazy<u64> = Lazy::new(|| {
+    std::env::var("SQLD_REPLICATION_LATENCY_CACHE_SIZE").map_or(100, |s| s.parse().unwrap_or(100))
+});
 
 #[derive(PartialEq, Eq)]
 struct Version([u16; 4]);
@@ -481,6 +487,7 @@ impl Generation {
 pub struct ReplicationLogger {
     pub generation: Generation,
     pub log_file: RwLock<LogFile>,
+    pub commit_timestamp_cache: moka::sync::Cache<FrameNo, DateTime<Utc>>,
     compactor: LogCompactor,
     db_path: PathBuf,
     /// a notifier channel other tasks can subscribe to, and get notified when new frames become
@@ -550,7 +557,15 @@ impl ReplicationLogger {
 
         let (new_frame_notifier, _) = watch::channel(generation_start_frame_no);
         unsafe {
-            let conn = rusqlite::Connection::open(db_path.join("data"))?;
+            let conn = if cfg!(feature = "unix-excl-vfs") {
+                rusqlite::Connection::open_with_flags_and_vfs(
+                    db_path.join("data"),
+                    rusqlite::OpenFlags::default(),
+                    "unix-excl",
+                )
+            } else {
+                rusqlite::Connection::open(db_path.join("data"))
+            }?;
             let rc = rusqlite::ffi::sqlite3_wal_autocheckpoint(conn.handle(), auto_checkpoint as _);
             if rc != 0 {
                 bail!(
@@ -577,6 +592,8 @@ impl ReplicationLogger {
             closed_signal,
             new_frame_notifier,
             auto_checkpoint,
+            // we keep the last 100 commit transaction timestamps
+            commit_timestamp_cache: moka::sync::Cache::new(*REPLICATION_LATENCY_CACHE_SIZE),
         })
     }
 
@@ -656,6 +673,9 @@ impl ReplicationLogger {
     pub(crate) fn commit(&self) -> anyhow::Result<Option<FrameNo>> {
         let mut log_file = self.log_file.write();
         log_file.commit()?;
+        if let Some(frame_no) = log_file.header().last_frame_no() {
+            self.commit_timestamp_cache.insert(frame_no, Utc::now());
+        }
         Ok(log_file.header().last_frame_no())
     }
 
@@ -718,7 +738,15 @@ pub fn checkpoint_db(data_path: &Path) -> anyhow::Result<()> {
     }
 
     unsafe {
-        let conn = rusqlite::Connection::open(data_path)?;
+        let conn = if cfg!(feature = "unix-excl-vfs") {
+            rusqlite::Connection::open_with_flags_and_vfs(
+                data_path,
+                rusqlite::OpenFlags::default(),
+                "unix-excl",
+            )
+        } else {
+            rusqlite::Connection::open(data_path)
+        }?;
         conn.query_row("PRAGMA journal_mode=WAL", (), |_| Ok(()))?;
         tracing::info!("initialized journal_mode=WAL");
         conn.pragma_query(None, "page_size", |row| {

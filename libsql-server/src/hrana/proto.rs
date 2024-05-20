@@ -29,7 +29,7 @@ pub struct Stmt {
     #[serde(default)]
     #[prost(bool, optional, tag = "5")]
     pub want_rows: Option<bool>,
-    #[serde(default)]
+    #[serde(default, with = "option_u64_as_str")]
     #[prost(uint64, optional, tag = "6")]
     pub replication_index: Option<u64>,
 }
@@ -53,6 +53,9 @@ pub struct StmtResult {
     #[serde(with = "option_i64_as_str")]
     #[prost(sint64, optional, tag = "4")]
     pub last_insert_rowid: Option<i64>,
+    #[serde(with = "option_u64_as_str")]
+    #[prost(uint64, optional, tag = "5")]
+    pub replication_index: Option<u64>,
 }
 
 #[derive(Serialize, prost::Message)]
@@ -75,7 +78,7 @@ pub struct Batch {
     #[prost(message, repeated, tag = "1")]
     pub steps: Vec<BatchStep>,
     #[prost(uint64, optional, tag = "2")]
-    #[serde(default)]
+    #[serde(default, with = "option_u64_as_str")]
     pub replication_index: Option<u64>,
 }
 
@@ -92,6 +95,7 @@ pub struct BatchStep {
 pub struct BatchResult {
     pub step_results: Vec<Option<StmtResult>>,
     pub step_errors: Vec<Option<Error>>,
+    #[serde(default, with = "option_u64_as_str")]
     pub replication_index: Option<u64>,
 }
 
@@ -238,6 +242,82 @@ mod option_i64_as_str {
 
     pub fn serialize<S: ser::Serializer>(value: &Option<i64>, ser: S) -> Result<S::Ok, S::Error> {
         value.map(|v| v.to_string()).serialize(ser)
+    }
+}
+
+pub mod option_u64_as_str {
+    use serde::{de::Visitor, ser, Deserializer, Serialize as _};
+
+    pub fn serialize<S: ser::Serializer>(value: &Option<u64>, ser: S) -> Result<S::Ok, S::Error> {
+        value.map(|v| v.to_string()).serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = Option<u64>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(formatter, "a string representing an integer, or null")
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_any(V)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Some(v))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                v.parse().map_err(E::custom).map(Some)
+            }
+        }
+
+        d.deserialize_option(V)
+    }
+
+    #[cfg(test)]
+    mod test {
+        use serde::Deserialize;
+
+        #[test]
+        fn deserialize_ok() {
+            #[derive(Deserialize)]
+            struct Test {
+                #[serde(with = "super")]
+                value: Option<u64>,
+            }
+
+            let json = r#"{"value": null }"#;
+            let val: Test = serde_json::from_str(json).unwrap();
+            assert!(val.value.is_none());
+
+            let json = r#"{"value": "124" }"#;
+            let val: Test = serde_json::from_str(json).unwrap();
+            assert_eq!(val.value.unwrap(), 124);
+
+            let json = r#"{"value": 124 }"#;
+            let val: Test = serde_json::from_str(json).unwrap();
+            assert_eq!(val.value.unwrap(), 124);
+        }
     }
 }
 

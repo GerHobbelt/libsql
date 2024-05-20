@@ -452,7 +452,10 @@ fn replica_no_resync_on_restart() {
 
 #[test]
 fn replicate_with_snapshots() {
-    let mut sim = Builder::new().tcp_capacity(200).build();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .tcp_capacity(200)
+        .build();
 
     let tmp = tempdir().unwrap();
 
@@ -566,6 +569,50 @@ fn read_your_writes() {
         conn.execute("INSERT INTO user(id) VALUES (1)", ())
             .await
             .unwrap();
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn proxy_write_returning_row() {
+    let mut sim = Builder::new().build();
+
+    let tmp_embedded = tempdir().unwrap();
+    let tmp_host = tempdir().unwrap();
+    let tmp_embedded_path = tmp_embedded.path().to_owned();
+    let tmp_host_path = tmp_host.path().to_owned();
+
+    make_primary(&mut sim, tmp_host_path.clone());
+
+    sim.client("client", async move {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/foo/create", json!({}))
+            .await?;
+
+        let path = tmp_embedded_path.join("embedded");
+        let db = Database::open_with_remote_sync_connector(
+            path.to_str().unwrap(),
+            "http://foo.primary:8080",
+            "",
+            TurmoilConnector,
+            true,
+        )
+        .await?;
+
+        let conn = db.connect()?;
+
+        conn.execute("create table test (x)", ()).await?;
+
+        let mut rows = conn
+            .query("insert into test values (12) returning rowid as id", ())
+            .await
+            .unwrap();
+
+        rows.next().unwrap().unwrap();
 
         Ok(())
     });

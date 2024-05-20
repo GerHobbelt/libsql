@@ -2,6 +2,8 @@ use std::path::Path;
 use std::pin::Pin;
 
 use bytes::Bytes;
+use chrono::{DateTime, NaiveDateTime, Utc};
+use futures::TryStreamExt;
 use libsql_replication::frame::Frame;
 use libsql_replication::meta::WalIndexMeta;
 use libsql_replication::replicator::{map_frame_err, Error, ReplicatorClient};
@@ -15,6 +17,9 @@ use tonic::metadata::{AsciiMetadataValue, BinaryMetadataValue};
 use tonic::transport::Channel;
 use tonic::Request;
 
+use crate::metrics::{
+    REPLICATION_LATENCY, REPLICATION_LATENCY_CACHE_MISS, REPLICATION_LATENCY_OUT_OF_SYNC,
+};
 use crate::namespace::NamespaceName;
 use crate::replication::FrameNo;
 
@@ -108,6 +113,28 @@ impl ReplicatorClient for Client {
             .log_entries(req)
             .await?
             .into_inner()
+            .inspect_ok(|f| {
+                match f.timestamp {
+                    Some(ts_millis) => {
+                        if let Some(ts_millis) = NaiveDateTime::from_timestamp_millis(ts_millis) {
+                            let commited_at =
+                                DateTime::<Utc>::from_naive_utc_and_offset(ts_millis, Utc);
+                            let lat = Utc::now() - commited_at;
+                            match lat.to_std() {
+                                Ok(lat) => {
+                                    // we can record negative values if the clocks are out-of-sync. There is not
+                                    // point in recording those values.
+                                    REPLICATION_LATENCY.record(lat);
+                                }
+                                Err(_) => {
+                                    REPLICATION_LATENCY_OUT_OF_SYNC.increment(1);
+                                }
+                            }
+                        }
+                    }
+                    None => REPLICATION_LATENCY_CACHE_MISS.increment(1),
+                }
+            })
             .map(map_frame_err);
 
         Ok(Box::pin(stream))
