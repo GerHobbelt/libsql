@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use libsql_sys::wal::{CreateWal, Wal};
+use libsql_sys::wal::wrapper::{WalWrapper, WrapWal, WrappedWal};
+use libsql_sys::wal::{Wal, WalManager};
 use metrics::{histogram, increment_counter};
 use parking_lot::{Mutex, RwLock};
+use rusqlite::ffi::SQLITE_BUSY;
 use rusqlite::{DatabaseName, ErrorCode, OpenFlags, StatementStatus, TransactionState};
 use tokio::sync::{watch, Notify};
 use tokio::time::{Duration, Instant};
@@ -16,6 +18,7 @@ use crate::metrics::{
     DESCRIBE_COUNT, PROGRAM_EXEC_COUNT, READ_QUERY_COUNT, VACUUM_COUNT, WAL_CHECKPOINT_COUNT,
     WRITE_QUERY_COUNT, WRITE_TXN_DURATION,
 };
+use crate::namespace::meta_store::MetaStoreHandle;
 use crate::query::Query;
 use crate::query_analysis::{StmtKind, TxnStatus};
 use crate::query_result_builder::{QueryBuilderConfig, QueryResultBuilder};
@@ -23,15 +26,14 @@ use crate::replication::FrameNo;
 use crate::stats::Stats;
 use crate::Result;
 
-use super::config::DatabaseConfigStore;
 use super::program::{Cond, DescribeCol, DescribeParam, DescribeResponse};
 use super::{MakeConnection, Program, Step, TXN_TIMEOUT};
 
-pub struct MakeLibSqlConn<T: CreateWal> {
+pub struct MakeLibSqlConn<T: WalManager> {
     db_path: PathBuf,
-    create_wal: T,
+    wal_manager: T,
     stats: Arc<Stats>,
-    config_store: Arc<DatabaseConfigStore>,
+    config_store: MetaStoreHandle,
     extensions: Arc<[PathBuf]>,
     max_response_size: u64,
     max_total_response_size: u64,
@@ -45,15 +47,15 @@ pub struct MakeLibSqlConn<T: CreateWal> {
 
 impl<T> MakeLibSqlConn<T>
 where
-    T: CreateWal + Clone + Send + 'static,
+    T: WalManager + Clone + Send + 'static,
     T::Wal: Send + 'static,
 {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         db_path: PathBuf,
-        create_wal: T,
+        wal_manager: T,
         stats: Arc<Stats>,
-        config_store: Arc<DatabaseConfigStore>,
+        config_store: MetaStoreHandle,
         extensions: Arc<[PathBuf]>,
         max_response_size: u64,
         max_total_response_size: u64,
@@ -71,7 +73,7 @@ where
             current_frame_no_receiver,
             _db: None,
             state: Default::default(),
-            create_wal,
+            wal_manager,
         };
 
         let db = this.try_create_db().await?;
@@ -113,7 +115,7 @@ where
         LibSqlConnection::new(
             self.db_path.clone(),
             self.extensions.clone(),
-            self.create_wal.clone(),
+            self.wal_manager.clone(),
             self.stats.clone(),
             self.config_store.clone(),
             QueryBuilderConfig {
@@ -131,7 +133,7 @@ where
 #[async_trait::async_trait]
 impl<T> MakeConnection for MakeLibSqlConn<T>
 where
-    T: CreateWal + Clone + Send + Sync + 'static,
+    T: WalManager + Clone + Send + Sync + 'static,
     T::Wal: Send,
 {
     type Connection = LibSqlConnection<T::Wal>;
@@ -164,14 +166,49 @@ impl<T> std::fmt::Debug for LibSqlConnection<T> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct InhibitCheckpointWalWrapper;
+
+impl<W: Wal> WrapWal<W> for InhibitCheckpointWalWrapper {
+    fn checkpoint<B: libsql_sys::wal::BusyHandler>(
+        &mut self,
+        _wrapped: &mut W,
+        _db: &mut libsql_sys::wal::Sqlite3Db,
+        _mode: libsql_sys::wal::CheckpointMode,
+        _busy_handler: Option<&mut B>,
+        _sync_flags: u32,
+        _buf: &mut [u8],
+    ) -> libsql_sys::wal::Result<(u32, u32)> {
+        tracing::warn!(
+            "chackpoint inhibited: this connection is not allowed to perform checkpoints"
+        );
+        Err(rusqlite::ffi::Error::new(SQLITE_BUSY))
+    }
+
+    fn close<M: WalManager<Wal = W>>(
+        &self,
+        manager: &M,
+        wrapped: &mut W,
+        db: &mut libsql_sys::wal::Sqlite3Db,
+        sync_flags: c_int,
+        _scratch: Option<&mut [u8]>,
+    ) -> libsql_sys::wal::Result<()> {
+        // sqlite3 wall will not checkpoint if it's not provided with a scratch buffer. We take
+        // advantage of that to prevent checpoint on such connections.
+        manager.close(wrapped, db, sync_flags, None)
+    }
+}
+
+pub type InhibitCheckpoint<T> = WrappedWal<InhibitCheckpointWalWrapper, T>;
+
+// Opens a connection with checkpoint inhibited
 pub fn open_conn<T>(
     path: &Path,
-    create_wal: T,
+    wal_manager: T,
     flags: Option<OpenFlags>,
-    auto_checkpoint: u32,
-) -> Result<libsql_sys::Connection<T::Wal>, rusqlite::Error>
+) -> Result<libsql_sys::Connection<InhibitCheckpoint<T::Wal>>, rusqlite::Error>
 where
-    T: CreateWal,
+    T: WalManager,
 {
     let flags = flags.unwrap_or(
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -179,7 +216,33 @@ where
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     );
-    libsql_sys::Connection::open(path.join("data"), flags, create_wal, auto_checkpoint)
+
+    libsql_sys::Connection::open(
+        path.join("data"),
+        flags,
+        WalWrapper::new(InhibitCheckpointWalWrapper, wal_manager),
+        u32::MAX,
+    )
+}
+
+/// Same as open_conn, but with checkpointing activated.
+pub fn open_conn_active_checkpoint<T>(
+    path: &Path,
+    wal_manager: T,
+    flags: Option<OpenFlags>,
+    auto_checkpoint: u32,
+) -> Result<libsql_sys::Connection<T::Wal>, rusqlite::Error>
+where
+    T: WalManager,
+{
+    let flags = flags.unwrap_or(
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    );
+
+    libsql_sys::Connection::open(path.join("data"), flags, wal_manager, auto_checkpoint)
 }
 
 impl<W> LibSqlConnection<W>
@@ -189,22 +252,22 @@ where
     pub async fn new<T>(
         path: impl AsRef<Path> + Send + 'static,
         extensions: Arc<[PathBuf]>,
-        create_wal: T,
+        wal_manager: T,
         stats: Arc<Stats>,
-        config_store: Arc<DatabaseConfigStore>,
+        config_store: MetaStoreHandle,
         builder_config: QueryBuilderConfig,
         current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
         state: Arc<TxnState<W>>,
     ) -> crate::Result<Self>
     where
-        T: CreateWal<Wal = W> + Send + 'static,
+        T: WalManager<Wal = W> + Send + 'static,
     {
         let max_db_size = config_store.get().max_db_pages;
         let conn = tokio::task::spawn_blocking(move || -> crate::Result<_> {
             let conn = Connection::new(
                 path.as_ref(),
                 extensions,
-                create_wal,
+                wal_manager,
                 stats,
                 config_store,
                 builder_config,
@@ -240,9 +303,9 @@ impl LibSqlConnection<libsql_sys::wal::Sqlite3Wal> {
         let conn = Connection::new(
             path,
             Arc::new([]),
-            libsql_sys::wal::CreateSqlite3Wal::new(),
+            libsql_sys::wal::Sqlite3WalManager::new(),
             Default::default(),
-            DatabaseConfigStore::new_test().into(),
+            MetaStoreHandle::new_test().into(),
             QueryBuilderConfig::default(),
             rcv,
             Default::default(),
@@ -258,7 +321,7 @@ impl LibSqlConnection<libsql_sys::wal::Sqlite3Wal> {
 struct Connection<T> {
     conn: libsql_sys::Connection<T>,
     stats: Arc<Stats>,
-    config_store: Arc<DatabaseConfigStore>,
+    config_store: MetaStoreHandle,
     builder_config: QueryBuilderConfig,
     current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
     // must be dropped after the connection because the connection refers to it
@@ -432,17 +495,18 @@ impl From<TransactionState> for TxnStatus {
 }
 
 impl<W: Wal> Connection<W> {
-    fn new<T: CreateWal<Wal = W>>(
+    fn new<T: WalManager<Wal = W>>(
         path: &Path,
         extensions: Arc<[PathBuf]>,
-        create_wal: T,
+        wal_manager: T,
         stats: Arc<Stats>,
-        config_store: Arc<DatabaseConfigStore>,
+        config_store: MetaStoreHandle,
         builder_config: QueryBuilderConfig,
         current_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
         state: Arc<TxnState<W>>,
     ) -> Result<Self> {
-        let conn = open_conn(path, create_wal, None, builder_config.auto_checkpoint)?;
+        let conn =
+            open_conn_active_checkpoint(path, wal_manager, None, builder_config.auto_checkpoint)?;
 
         // register the lock-stealing busy handler
         unsafe {
@@ -623,6 +687,7 @@ impl<W: Wal> Connection<W> {
 
         let start = Instant::now();
         let config = self.config_store.get();
+
         let blocked = match query.stmt.kind {
             StmtKind::Read | StmtKind::TxnBegin | StmtKind::Other => config.block_reads,
             StmtKind::Write => config.block_reads || config.block_writes,
@@ -920,7 +985,7 @@ where
 #[cfg(test)]
 mod test {
     use itertools::Itertools;
-    use libsql_sys::wal::{CreateSqlite3Wal, Sqlite3Wal};
+    use libsql_sys::wal::{Sqlite3Wal, Sqlite3WalManager};
     use rand::Rng;
     use tempfile::tempdir;
     use tokio::task::JoinSet;
@@ -936,7 +1001,7 @@ mod test {
         let conn = Connection {
             conn: libsql_sys::Connection::test(),
             stats: Arc::new(Stats::default()),
-            config_store: Arc::new(DatabaseConfigStore::new_test()),
+            config_store: MetaStoreHandle::new_test(),
             builder_config: QueryBuilderConfig::default(),
             current_frame_no_receiver: watch::channel(None).1,
             state: Default::default(),
@@ -966,9 +1031,9 @@ mod test {
         let tmp = tempdir().unwrap();
         let make_conn = MakeLibSqlConn::new(
             tmp.path().into(),
-            CreateSqlite3Wal::new(),
+            Sqlite3WalManager::new(),
             Default::default(),
-            Arc::new(DatabaseConfigStore::load(tmp.path()).unwrap()),
+            MetaStoreHandle::load(tmp.path()).unwrap(),
             Arc::new([]),
             100000000,
             100000000,
@@ -1007,9 +1072,9 @@ mod test {
         let tmp = tempdir().unwrap();
         let make_conn = MakeLibSqlConn::new(
             tmp.path().into(),
-            CreateSqlite3Wal::new(),
+            Sqlite3WalManager::new(),
             Default::default(),
-            Arc::new(DatabaseConfigStore::load(tmp.path()).unwrap()),
+            MetaStoreHandle::load(tmp.path()).unwrap(),
             Arc::new([]),
             100000000,
             100000000,
@@ -1049,9 +1114,9 @@ mod test {
         let tmp = tempdir().unwrap();
         let make_conn = MakeLibSqlConn::new(
             tmp.path().into(),
-            CreateSqlite3Wal::new(),
+            Sqlite3WalManager::new(),
             Default::default(),
-            Arc::new(DatabaseConfigStore::load(tmp.path()).unwrap()),
+            MetaStoreHandle::load(tmp.path()).unwrap(),
             Arc::new([]),
             100000000,
             100000000,
@@ -1127,9 +1192,9 @@ mod test {
         let tmp = tempdir().unwrap();
         let make_conn = MakeLibSqlConn::new(
             tmp.path().into(),
-            CreateSqlite3Wal::new(),
+            Sqlite3WalManager::new(),
             Default::default(),
-            Arc::new(DatabaseConfigStore::load(tmp.path()).unwrap()),
+            MetaStoreHandle::load(tmp.path()).unwrap(),
             Arc::new([]),
             100000000,
             100000000,
@@ -1152,7 +1217,7 @@ mod test {
         )
         .await
         .unwrap();
-        let run_conn = |maker: Arc<MakeLibSqlConn<CreateSqlite3Wal>>| {
+        let run_conn = |maker: Arc<MakeLibSqlConn<Sqlite3WalManager>>| {
             let auth = auth.clone();
             async move {
                 for _ in 0..1000 {
@@ -1194,7 +1259,7 @@ mod test {
             }
         };
 
-        tokio::time::timeout(Duration::from_secs(30), join_all)
+        tokio::time::timeout(Duration::from_secs(60), join_all)
             .await
             .expect("timed out running connections");
     }

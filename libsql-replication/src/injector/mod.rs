@@ -10,7 +10,7 @@ use crate::frame::{Frame, FrameNo};
 pub use error::Error;
 
 use self::injector_wal::{
-    CreateInjectorWal, InjectorWal, LIBSQL_INJECT_FATAL, LIBSQL_INJECT_OK, LIBSQL_INJECT_OK_TXN,
+    InjectorWal, InjectorWalManager, LIBSQL_INJECT_FATAL, LIBSQL_INJECT_OK, LIBSQL_INJECT_OK_TXN,
 };
 
 mod error;
@@ -46,7 +46,7 @@ impl Injector {
         auto_checkpoint: u32,
     ) -> Result<Self, Error> {
         let buffer = FrameBuffer::default();
-        let create_wal = CreateInjectorWal::new(buffer.clone());
+        let wal_manager = InjectorWalManager::new(buffer.clone());
 
         let connection = libsql_sys::Connection::open(
             path,
@@ -54,7 +54,7 @@ impl Injector {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            create_wal,
+            wal_manager,
             auto_checkpoint,
         )?;
 
@@ -69,7 +69,7 @@ impl Injector {
 
     /// Inject a frame into the log. If this was a commit frame, returns Ok(Some(FrameNo)).
     pub fn inject_frame(&mut self, frame: Frame) -> Result<Option<FrameNo>, Error> {
-        let frame_close_txn = frame.header().size_after != 0;
+        let frame_close_txn = frame.header().size_after.get() != 0;
         self.buffer.lock().push_back(frame);
         if frame_close_txn || self.buffer.lock().len() >= self.capacity {
             return self.flush();
@@ -111,7 +111,7 @@ impl Injector {
         // (snapshot). Either way, we want to find the biggest frameno we're about to commit, and
         // that is either the front or the back of the buffer
         let last_frame_no = match lock.back().zip(lock.front()) {
-            Some((b, f)) => f.header().frame_no.max(b.header().frame_no),
+            Some((b, f)) => f.header().frame_no.get().max(b.header().frame_no.get()),
             None => {
                 tracing::trace!("nothing to inject");
                 return Ok(None);

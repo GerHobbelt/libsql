@@ -1,11 +1,11 @@
 use std::ffi::{c_int, CStr};
-use std::ops::Deref;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use libsql_sys::ffi::{SQLITE_BUSY, SQLITE_IOERR_WRITE};
 use libsql_sys::wal::{
-    CheckpointMode, CreateWal, Error, PageHeaders, Result, Sqlite3Db, Sqlite3File, UndoHandler,
-    Vfs, Wal,
+    CheckpointMode, Error, PageHeaders, Result, Sqlite3Db, Sqlite3File, UndoHandler, Vfs, Wal,
+    WalManager,
 };
 
 use crate::replicator::Replicator;
@@ -13,24 +13,27 @@ use crate::replicator::Replicator;
 #[derive(Clone)]
 pub struct CreateBottomlessWal<T> {
     inner: T,
-    replicator: Arc<Mutex<Replicator>>,
+    replicator: Arc<Mutex<Option<Replicator>>>,
 }
 
 impl<T> CreateBottomlessWal<T> {
-    pub fn new(inner: T, replicator: Arc<Mutex<Replicator>>) -> Self {
-        Self { inner, replicator }
+    pub fn new(inner: T, replicator: Replicator) -> Self {
+        Self {
+            inner,
+            replicator: Arc::new(Mutex::new(Some(replicator))),
+        }
     }
-}
 
-impl<T> Deref for CreateBottomlessWal<T> {
-    type Target = T;
+    pub fn shutdown(&self) -> Option<Replicator> {
+        self.replicator.lock().unwrap().take()
+    }
 
-    fn deref(&self) -> &Self::Target {
+    pub fn inner(&self) -> &T {
         &self.inner
     }
 }
 
-impl<T: CreateWal> CreateWal for CreateBottomlessWal<T> {
+impl<T: WalManager> WalManager for CreateBottomlessWal<T> {
     type Wal = BottomlessWal<T::Wal>;
 
     fn use_shared_memory(&self) -> bool {
@@ -59,7 +62,7 @@ impl<T: CreateWal> CreateWal for CreateBottomlessWal<T> {
         wal: &mut Self::Wal,
         db: &mut Sqlite3Db,
         sync_flags: c_int,
-        scratch: &mut [u8],
+        scratch: Option<&mut [u8]>,
     ) -> Result<()> {
         self.inner.close(&mut wal.inner, db, sync_flags, scratch)
     }
@@ -82,7 +85,17 @@ impl<T: CreateWal> CreateWal for CreateBottomlessWal<T> {
 
 pub struct BottomlessWal<T> {
     inner: T,
-    replicator: Arc<Mutex<Replicator>>,
+    replicator: Arc<Mutex<Option<Replicator>>>,
+}
+
+impl<T> BottomlessWal<T> {
+    fn try_with_replicator<Ret>(&self, f: impl FnOnce(&mut Replicator) -> Ret) -> Result<Ret> {
+        let mut lock = self.replicator.lock().unwrap();
+        match &mut *lock {
+            Some(replicator) => Ok(f(replicator)),
+            None => Err(Error::new(SQLITE_IOERR_WRITE)),
+        }
+    }
 }
 
 impl<T: Wal> Wal for BottomlessWal<T> {
@@ -98,11 +111,11 @@ impl<T: Wal> Wal for BottomlessWal<T> {
         self.inner.end_read_txn()
     }
 
-    fn find_frame(&mut self, page_no: u32) -> Result<u32> {
+    fn find_frame(&mut self, page_no: NonZeroU32) -> Result<Option<NonZeroU32>> {
         self.inner.find_frame(page_no)
     }
 
-    fn read_frame(&mut self, frame_no: u32, buffer: &mut [u8]) -> Result<()> {
+    fn read_frame(&mut self, frame_no: NonZeroU32, buffer: &mut [u8]) -> Result<()> {
         self.inner.read_frame(frame_no, buffer)
     }
 
@@ -131,12 +144,12 @@ impl<T: Wal> Wal for BottomlessWal<T> {
 
         {
             let last_valid_frame = rollback_data[0];
-            let mut replicator = self.replicator.lock().unwrap();
-            let prev_valid_frame = replicator.peek_last_valid_frame();
-            tracing::trace!(
-                "Savepoint: rolling back from frame {prev_valid_frame} to {last_valid_frame}",
-            );
-            replicator.rollback_to_frame(last_valid_frame);
+            self.try_with_replicator(|replicator| {
+                let prev_valid_frame = replicator.peek_last_valid_frame();
+                tracing::trace!(
+                    "Savepoint: rolling back from frame {prev_valid_frame} to {last_valid_frame}",
+                );
+            })?;
         }
 
         Ok(())
@@ -155,15 +168,15 @@ impl<T: Wal> Wal for BottomlessWal<T> {
         self.inner
             .insert_frames(page_size, page_headers, size_after, is_commit, sync_flags)?;
 
-        let mut replicator = self.replicator.lock().unwrap();
-        replicator.register_last_valid_frame(last_valid_frame);
-        if let Err(e) = replicator.set_page_size(page_size as usize) {
-            tracing::error!("fatal error during backup: {e}, exiting");
-            std::process::abort()
-        }
-
-        let new_valid_valid_frame_index = self.inner.last_fame_index();
-        replicator.submit_frames(new_valid_valid_frame_index - last_valid_frame);
+        self.try_with_replicator(|replicator| {
+            if let Err(e) = replicator.set_page_size(page_size as usize) {
+                tracing::error!("fatal error during backup: {e}, exiting");
+                std::process::abort()
+            }
+            replicator.register_last_valid_frame(last_valid_frame);
+            let new_valid_valid_frame_index = self.inner.last_fame_index();
+            replicator.submit_frames(new_valid_valid_frame_index - last_valid_frame);
+        })?;
 
         Ok(())
     }
@@ -199,29 +212,33 @@ impl<T: Wal> Wal for BottomlessWal<T> {
         // uncontended -> only gets called under a libSQL write lock
         {
             let runtime = tokio::runtime::Handle::current();
-            let mut replicator = self.replicator.lock().unwrap();
-            let last_known_frame = replicator.last_known_frame();
-            replicator.request_flush();
-            if last_known_frame == 0 {
-                tracing::debug!("No committed changes in this generation, not snapshotting");
-                replicator.skip_snapshot_for_current_generation();
-                return Err(Error::new(SQLITE_BUSY));
-            }
-            if let Err(e) = runtime.block_on(replicator.wait_until_committed(last_known_frame)) {
-                tracing::error!(
-                    "Failed to wait for S3 replicator to confirm {} frames backup: {}",
-                    last_known_frame,
-                    e
-                );
-                return Err(Error::new(SQLITE_IOERR_WRITE));
-            }
-            if let Err(e) = runtime.block_on(replicator.wait_until_snapshotted()) {
-                tracing::error!(
-                    "Failed to wait for S3 replicator to confirm database snapshot backup: {}",
-                    e
-                );
-                return Err(Error::new(SQLITE_IOERR_WRITE));
-            }
+            self.try_with_replicator(|replicator| {
+                let last_known_frame = replicator.last_known_frame();
+                replicator.request_flush();
+                if last_known_frame == 0 {
+                    tracing::debug!("No committed changes in this generation, not snapshotting");
+                    replicator.skip_snapshot_for_current_generation();
+                    return Err(Error::new(SQLITE_BUSY));
+                }
+                if let Err(e) = runtime.block_on(replicator.wait_until_committed(last_known_frame))
+                {
+                    tracing::error!(
+                        "Failed to wait for S3 replicator to confirm {} frames backup: {}",
+                        last_known_frame,
+                        e
+                    );
+                    return Err(Error::new(SQLITE_IOERR_WRITE));
+                }
+                if let Err(e) = runtime.block_on(replicator.wait_until_snapshotted()) {
+                    tracing::error!(
+                        "Failed to wait for S3 replicator to confirm database snapshot backup: {}",
+                        e
+                    );
+                    return Err(Error::new(SQLITE_IOERR_WRITE));
+                }
+
+                Ok(())
+            })??;
         }
 
         let ret = self
@@ -232,14 +249,16 @@ impl<T: Wal> Wal for BottomlessWal<T> {
         // uncontended -> only gets called under a libSQL write lock
         {
             let runtime = tokio::runtime::Handle::current();
-            let mut replicator = self.replicator.lock().unwrap();
-            let _prev = replicator.new_generation();
-            if let Err(e) =
-                runtime.block_on(async move { replicator.snapshot_main_db_file().await })
-            {
-                tracing::error!("Failed to snapshot the main db file during checkpoint: {e}");
-                return Err(Error::new(SQLITE_IOERR_WRITE));
-            }
+            self.try_with_replicator(|replicator| {
+                let _prev = replicator.new_generation();
+                if let Err(e) =
+                    runtime.block_on(async move { replicator.snapshot_main_db_file().await })
+                {
+                    tracing::error!("Failed to snapshot the main db file during checkpoint: {e}");
+                    return Err(Error::new(SQLITE_IOERR_WRITE));
+                }
+                Ok(())
+            })??;
         }
 
         Ok(ret)

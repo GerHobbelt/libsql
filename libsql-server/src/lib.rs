@@ -100,6 +100,7 @@ pub struct Server<C = HttpConnector, A = AddrIncoming, D = HttpsConnector<HttpCo
     pub heartbeat_config: Option<HeartbeatConfig>,
     pub disable_namespaces: bool,
     pub shutdown: Arc<Notify>,
+    pub max_active_namespaces: usize,
 }
 
 impl<C, A, D> Default for Server<C, A, D> {
@@ -117,6 +118,7 @@ impl<C, A, D> Default for Server<C, A, D> {
             heartbeat_config: Default::default(),
             disable_namespaces: true,
             shutdown: Default::default(),
+            max_active_namespaces: 100,
         }
     }
 }
@@ -285,24 +287,16 @@ where
 {
     /// Setup sqlite global environment
     fn init_sqlite_globals(&self) {
-        if self.db_config.bottomless_replication.is_some() {
-            bottomless::static_init::register_bottomless_methods();
-        }
-
         if let Some(soft_limit_mb) = self.db_config.soft_heap_limit_mb {
             tracing::warn!("Setting soft heap limit to {soft_limit_mb}MiB");
             unsafe {
-                sqld_libsql_bindings::ffi::sqlite3_soft_heap_limit64(
-                    soft_limit_mb as i64 * 1024 * 1024,
-                )
+                libsql_sys::ffi::sqlite3_soft_heap_limit64(soft_limit_mb as i64 * 1024 * 1024)
             };
         }
         if let Some(hard_limit_mb) = self.db_config.hard_heap_limit_mb {
             tracing::warn!("Setting hard heap limit to {hard_limit_mb}MiB");
             unsafe {
-                sqld_libsql_bindings::ffi::sqlite3_hard_heap_limit64(
-                    hard_limit_mb as i64 * 1024 * 1024,
-                )
+                libsql_sys::ffi::sqlite3_hard_heap_limit64(hard_limit_mb as i64 * 1024 * 1024)
             };
         }
     }
@@ -341,7 +335,7 @@ where
                     let heartbeat_auth = config.heartbeat_auth.clone();
                     let heartbeat_period = config.heartbeat_period;
                     let heartbeat_url = if let Some(url) = &config.heartbeat_url {
-                        Some(Url::from_str(&url).context("invalid heartbeat URL")?)
+                        Some(Url::from_str(url).context("invalid heartbeat URL")?)
                     } else {
                         None
                     };
@@ -392,6 +386,7 @@ where
                     db_config: self.db_config.clone(),
                     base_path: self.path.clone(),
                     auth: auth.clone(),
+                    max_active_namespaces: self.max_active_namespaces,
                 };
                 let (namespaces, proxy_service, replication_service) = replica.configure().await?;
                 self.rpc_client_config = None;
@@ -430,6 +425,7 @@ where
                     extensions,
                     base_path: self.path.clone(),
                     disable_namespaces: self.disable_namespaces,
+                    max_active_namespaces: self.max_active_namespaces,
                     join_set: &mut join_set,
                     auth: auth.clone(),
                 };
@@ -495,6 +491,7 @@ struct Primary<'a, A> {
     extensions: Arc<[PathBuf]>,
     base_path: Arc<Path>,
     disable_namespaces: bool,
+    max_active_namespaces: usize,
     auth: Arc<Auth>,
     join_set: &'a mut JoinSet<anyhow::Result<()>>,
 }
@@ -516,7 +513,7 @@ where
             db_is_dirty: self.db_is_dirty,
             max_log_duration: self.db_config.max_log_duration.map(Duration::from_secs_f32),
             snapshot_callback: self.snapshot_callback,
-            bottomless_replication: self.db_config.bottomless_replication,
+            bottomless_replication: self.db_config.bottomless_replication.clone(),
             extensions: self.extensions,
             stats_sender: self.stats_sender.clone(),
             max_response_size: self.db_config.max_response_size,
@@ -524,8 +521,17 @@ where
             checkpoint_interval: self.db_config.checkpoint_interval,
             disable_namespace: self.disable_namespaces,
         };
+
+        let meta_store_path = conf.base_path.join("metastore");
+
         let factory = PrimaryNamespaceMaker::new(conf);
-        let namespaces = NamespaceStore::new(factory, false);
+        let namespaces = NamespaceStore::new(
+            factory,
+            false,
+            self.db_config.snapshot_at_shutdown,
+            meta_store_path,
+            self.max_active_namespaces,
+        );
 
         // eagerly load the default namespace when namespaces are disabled
         if self.disable_namespaces {
@@ -536,6 +542,15 @@ where
                     NamespaceBottomlessDbId::NotProvided,
                 )
                 .await?;
+        }
+
+        // if namespaces are enabled, then bottomless must have set DB ID
+        if !self.disable_namespaces {
+            if let Some(bottomless) = &self.db_config.bottomless_replication {
+                if bottomless.db_id.is_none() {
+                    anyhow::bail!("bottomless replication with namespaces requires a DB ID");
+                }
+            }
         }
 
         if let Some(config) = self.rpc_config.take() {
@@ -591,6 +606,7 @@ struct Replica<C> {
     db_config: DbConfig,
     base_path: Arc<Path>,
     auth: Arc<Auth>,
+    max_active_namespaces: usize,
 }
 
 impl<C: Connector> Replica<C> {
@@ -612,8 +628,17 @@ impl<C: Connector> Replica<C> {
             max_response_size: self.db_config.max_response_size,
             max_total_response_size: self.db_config.max_total_response_size,
         };
+
+        let meta_store_path = conf.base_path.join("metastore");
+
         let factory = ReplicaNamespaceMaker::new(conf);
-        let namespaces = NamespaceStore::new(factory, true);
+        let namespaces = NamespaceStore::new(
+            factory,
+            true,
+            false,
+            meta_store_path,
+            self.max_active_namespaces,
+        );
         let replication_service = ReplicationLogProxyService::new(channel.clone(), uri.clone());
         let proxy_service = ReplicaProxyService::new(channel, uri, self.auth.clone());
 

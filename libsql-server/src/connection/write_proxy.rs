@@ -8,7 +8,7 @@ use libsql_replication::rpc::proxy::{
     exec_req, exec_resp, ExecReq, ExecResp, StreamDescribeReq, StreamProgramReq,
 };
 use libsql_replication::rpc::replication::NAMESPACE_METADATA_KEY;
-use libsql_sys::wal::{CreateSqlite3Wal, Sqlite3Wal};
+use libsql_sys::wal::{Sqlite3Wal, Sqlite3WalManager};
 use parking_lot::Mutex as PMutex;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_stream::StreamExt;
@@ -20,6 +20,7 @@ use crate::auth::Authenticated;
 use crate::connection::program::{DescribeCol, DescribeParam};
 use crate::error::Error;
 use crate::metrics::{REPLICA_LOCAL_EXEC_MISPREDICT, REPLICA_LOCAL_PROGRAM_EXEC};
+use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::NamespaceName;
 use crate::query_analysis::TxnStatus;
 use crate::query_result_builder::{QueryBuilderConfig, QueryResultBuilder};
@@ -27,7 +28,6 @@ use crate::replication::FrameNo;
 use crate::stats::Stats;
 use crate::{Result, DEFAULT_AUTO_CHECKPOINT};
 
-use super::config::DatabaseConfigStore;
 use super::libsql::{LibSqlConnection, MakeLibSqlConn};
 use super::program::DescribeResponse;
 use super::Connection;
@@ -43,7 +43,7 @@ pub struct MakeWriteProxyConn {
     max_total_response_size: u64,
     namespace: NamespaceName,
     primary_replication_index: Option<FrameNo>,
-    make_read_only_conn: MakeLibSqlConn<CreateSqlite3Wal>,
+    make_read_only_conn: MakeLibSqlConn<Sqlite3WalManager>,
 }
 
 impl MakeWriteProxyConn {
@@ -54,7 +54,7 @@ impl MakeWriteProxyConn {
         channel: Channel,
         uri: tonic::transport::Uri,
         stats: Arc<Stats>,
-        config_store: Arc<DatabaseConfigStore>,
+        config_store: MetaStoreHandle,
         applied_frame_no_receiver: watch::Receiver<Option<FrameNo>>,
         max_response_size: u64,
         max_total_response_size: u64,
@@ -64,7 +64,7 @@ impl MakeWriteProxyConn {
         let client = ProxyClient::with_origin(channel, uri);
         let make_read_only_conn = MakeLibSqlConn::new(
             db_path.clone(),
-            CreateSqlite3Wal::new(),
+            Sqlite3WalManager::new(),
             stats.clone(),
             config_store.clone(),
             extensions.clone(),

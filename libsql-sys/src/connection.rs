@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::path::Path;
 
-use crate::wal::{ffi::make_create_wal, CreateWal, Wal};
+use crate::wal::{ffi::make_wal_manager, Wal, WalManager};
 
 #[cfg(not(feature = "rusqlite"))]
 type RawConnection = *mut crate::ffi::sqlite3;
@@ -57,11 +57,11 @@ impl<W: Wal> Connection<W> {
     pub fn open<T>(
         path: impl AsRef<Path>,
         flags: OpenFlags,
-        create_wal: T,
+        wal_manager: T,
         auto_checkpoint: u32,
     ) -> Result<Self, Error>
     where
-        T: CreateWal<Wal = W>,
+        T: WalManager<Wal = W>,
     {
         tracing::trace!(
             "Opening a connection with regular WAL at {}",
@@ -73,7 +73,7 @@ impl<W: Wal> Connection<W> {
             let conn = rusqlite::Connection::open_with_flags_and_wal(
                 path,
                 flags,
-                make_create_wal(create_wal),
+                make_wal_manager(wal_manager),
             )?;
             conn.pragma_update(None, "journal_mode", "WAL")?;
             unsafe {
@@ -101,12 +101,12 @@ impl<W: Wal> Connection<W> {
             // We pass a pointer to the WAL methods data to the database connection. This means
             // that the reference must outlive the connection. This is guaranteed by the marker in
             // the returned connection.
-            let mut rc = libsql_ffi::libsql_open(
+            let mut rc = libsql_ffi::libsql_open_v3(
                 path.as_ptr(),
                 &mut conn as *mut _,
                 flags,
                 std::ptr::null_mut(),
-                make_create_wal(create_wal),
+                make_wal_manager(wal_manager),
             );
 
             if rc == 0 {

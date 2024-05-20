@@ -1,9 +1,10 @@
 use std::ffi::{c_int, CStr};
+use std::num::NonZeroU32;
 
 use libsql_sys::ffi::PgHdr;
 use libsql_sys::wal::{
-    BusyHandler, CheckpointMode, CreateSqlite3Wal, CreateWal, PageHeaders, Result, Sqlite3Db,
-    Sqlite3File, Sqlite3Wal, UndoHandler, Vfs, Wal,
+    BusyHandler, CheckpointMode, PageHeaders, Result, Sqlite3Db, Sqlite3File, Sqlite3Wal,
+    Sqlite3WalManager, UndoHandler, Vfs, Wal, WalManager,
 };
 
 use crate::frame::FrameBorrowed;
@@ -17,21 +18,21 @@ pub const LIBSQL_INJECT_OK_TXN: c_int = 201;
 /// Injection succeeded
 pub const LIBSQL_INJECT_OK: c_int = 202;
 
-pub struct CreateInjectorWal {
-    inner: CreateSqlite3Wal,
+pub struct InjectorWalManager {
+    inner: Sqlite3WalManager,
     buffer: FrameBuffer,
 }
 
-impl CreateInjectorWal {
-    pub(crate) fn new(buffer: FrameBuffer) -> CreateInjectorWal {
+impl InjectorWalManager {
+    pub(crate) fn new(buffer: FrameBuffer) -> InjectorWalManager {
         Self {
-            inner: CreateSqlite3Wal::new(),
+            inner: Sqlite3WalManager::new(),
             buffer,
         }
     }
 }
 
-impl CreateWal for CreateInjectorWal {
+impl WalManager for InjectorWalManager {
     type Wal = InjectorWal;
 
     fn use_shared_memory(&self) -> bool {
@@ -61,7 +62,7 @@ impl CreateWal for CreateInjectorWal {
         wal: &mut Self::Wal,
         db: &mut Sqlite3Db,
         sync_flags: c_int,
-        scratch: &mut [u8],
+        scratch: Option<&mut [u8]>,
     ) -> Result<()> {
         self.inner.close(&mut wal.inner, db, sync_flags, scratch)
     }
@@ -101,11 +102,11 @@ impl Wal for InjectorWal {
         self.inner.end_read_txn()
     }
 
-    fn find_frame(&mut self, page_no: u32) -> Result<u32> {
+    fn find_frame(&mut self, page_no: NonZeroU32) -> Result<Option<NonZeroU32>> {
         self.inner.find_frame(page_no)
     }
 
-    fn read_frame(&mut self, frame_no: u32, buffer: &mut [u8]) -> Result<()> {
+    fn read_frame(&mut self, frame_no: NonZeroU32, buffer: &mut [u8]) -> Result<()> {
         self.inner.read_frame(frame_no, buffer)
     }
 
@@ -223,7 +224,7 @@ fn make_page_header<'a>(frames: impl Iterator<Item = &'a FrameBorrowed>) -> (Hea
     while let Some(frame) = frames.next() {
         // the last frame in a batch marks the end of the txn
         if frames.peek().is_none() {
-            size_after = frame.header().size_after;
+            size_after = frame.header().size_after.get();
         }
 
         let page = PgHdr {
@@ -233,7 +234,7 @@ fn make_page_header<'a>(frames: impl Iterator<Item = &'a FrameBorrowed>) -> (Hea
             pCache: std::ptr::null_mut(),
             pDirty: std::ptr::null_mut(),
             pPager: std::ptr::null_mut(),
-            pgno: frame.header().page_no,
+            pgno: frame.header().page_no.get(),
             pageHash: 0,
             flags: 0x02, // PGHDR_DIRTY - it works without the flag, but why risk it
             nRef: 0,

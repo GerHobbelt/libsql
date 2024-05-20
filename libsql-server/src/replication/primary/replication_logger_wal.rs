@@ -1,36 +1,44 @@
 use std::ffi::{c_int, CStr};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use libsql_sys::wal::Vfs;
-use libsql_sys::wal::{BusyHandler, CreateSqlite3Wal, CreateWal, Result, Sqlite3Wal};
+use libsql_sys::ffi::Sqlite3DbHeader;
+use libsql_sys::wal::{BusyHandler, Result, Sqlite3Wal, Sqlite3WalManager, WalManager};
 use libsql_sys::wal::{PageHeaders, Sqlite3Db, Sqlite3File, UndoHandler};
-use rusqlite::ffi::SQLITE_IOERR;
+use libsql_sys::wal::{Vfs, Wal};
+use rusqlite::ffi::{libsql_pghdr, SQLITE_IOERR, SQLITE_SYNC_NORMAL};
+use zerocopy::FromBytes;
 
 use crate::replication::ReplicationLogger;
+use crate::LIBSQL_PAGE_SIZE;
 
 use super::logger::WalPage;
 
 #[derive(Clone)]
-pub struct CreateReplicationLoggerWal {
-    sqlite_create_wal: CreateSqlite3Wal,
+pub struct ReplicationLoggerWalManager {
+    sqlite_wal_manager: Sqlite3WalManager,
     logger: Arc<ReplicationLogger>,
 }
 
-impl CreateReplicationLoggerWal {
+impl ReplicationLoggerWalManager {
     pub fn new(logger: Arc<ReplicationLogger>) -> Self {
         Self {
-            sqlite_create_wal: CreateSqlite3Wal::new(),
+            sqlite_wal_manager: Sqlite3WalManager::new(),
             logger,
         }
     }
+
+    pub fn logger(&self) -> Arc<ReplicationLogger> {
+        self.logger.clone()
+    }
 }
 
-impl CreateWal for CreateReplicationLoggerWal {
+impl WalManager for ReplicationLoggerWalManager {
     type Wal = ReplicationLoggerWal;
 
     fn use_shared_memory(&self) -> bool {
-        self.sqlite_create_wal.use_shared_memory()
+        self.sqlite_wal_manager.use_shared_memory()
     }
 
     fn open(
@@ -42,7 +50,7 @@ impl CreateWal for CreateReplicationLoggerWal {
         db_path: &CStr,
     ) -> Result<Self::Wal> {
         let inner = self
-            .sqlite_create_wal
+            .sqlite_wal_manager
             .open(vfs, file, no_shm_mode, max_log_size, db_path)?;
         Ok(Self::Wal {
             inner,
@@ -56,25 +64,25 @@ impl CreateWal for CreateReplicationLoggerWal {
         wal: &mut Self::Wal,
         db: &mut Sqlite3Db,
         sync_flags: c_int,
-        scratch: &mut [u8],
+        scratch: Option<&mut [u8]>,
     ) -> Result<()> {
-        self.sqlite_create_wal
+        self.sqlite_wal_manager
             .close(&mut wal.inner, db, sync_flags, scratch)
     }
 
     fn destroy_log(&self, vfs: &mut Vfs, db_path: &CStr) -> Result<()> {
-        self.sqlite_create_wal.destroy_log(vfs, db_path)
+        self.sqlite_wal_manager.destroy_log(vfs, db_path)
     }
 
     fn log_exists(&self, vfs: &mut Vfs, db_path: &CStr) -> Result<bool> {
-        self.sqlite_create_wal.log_exists(vfs, db_path)
+        self.sqlite_wal_manager.log_exists(vfs, db_path)
     }
 
     fn destroy(self)
     where
         Self: Sized,
     {
-        self.sqlite_create_wal.destroy()
+        self.sqlite_wal_manager.destroy()
     }
 }
 
@@ -122,7 +130,7 @@ impl ReplicationLoggerWal {
     }
 }
 
-impl libsql_sys::wal::Wal for ReplicationLoggerWal {
+impl Wal for ReplicationLoggerWal {
     fn limit(&mut self, size: i64) {
         self.inner.limit(size)
     }
@@ -135,11 +143,11 @@ impl libsql_sys::wal::Wal for ReplicationLoggerWal {
         self.inner.end_read_txn()
     }
 
-    fn find_frame(&mut self, page_no: u32) -> Result<u32> {
+    fn find_frame(&mut self, page_no: NonZeroU32) -> Result<Option<NonZeroU32>> {
         self.inner.find_frame(page_no)
     }
 
-    fn read_frame(&mut self, frame_no: u32, buffer: &mut [u8]) -> Result<()> {
+    fn read_frame(&mut self, frame_no: NonZeroU32, buffer: &mut [u8]) -> Result<()> {
         self.inner.read_frame(frame_no, buffer)
     }
 
@@ -177,7 +185,7 @@ impl libsql_sys::wal::Wal for ReplicationLoggerWal {
         sync_flags: c_int,
     ) -> Result<()> {
         assert_eq!(page_size, 4096);
-        let iter = unsafe { page_headers.iter() };
+        let iter = page_headers.iter();
         for (page_no, data) in iter {
             self.write_frame(page_no, data);
         }
@@ -200,11 +208,12 @@ impl libsql_sys::wal::Wal for ReplicationLoggerWal {
                 std::process::abort();
             }
 
-            if let Err(e) = self.logger.log_file.write().maybe_compact(
-                self.logger.compactor().clone(),
-                size_after,
-                self.logger.db_path(),
-            ) {
+            if let Err(e) = self
+                .logger
+                .log_file
+                .write()
+                .maybe_compact(self.logger.compactor().clone(), self.logger.db_path())
+            {
                 tracing::error!("fatal error: {e}, exiting");
                 std::process::abort()
             }
@@ -219,9 +228,9 @@ impl libsql_sys::wal::Wal for ReplicationLoggerWal {
         mode: libsql_sys::wal::CheckpointMode,
         busy_handler: Option<&mut B>,
         sync_flags: u32,
-        // temporary scratch buffer
         buf: &mut [u8],
     ) -> Result<(u32, u32)> {
+        self.inject_replication_index()?;
         self.inner
             .checkpoint(db, mode, busy_handler, sync_flags, buf)
     }
@@ -244,5 +253,186 @@ impl libsql_sys::wal::Wal for ReplicationLoggerWal {
 
     fn last_fame_index(&self) -> u32 {
         self.inner.last_fame_index()
+    }
+}
+
+impl ReplicationLoggerWal {
+    fn inject_replication_index(&mut self) -> Result<()> {
+        let data = &mut [0; LIBSQL_PAGE_SIZE as _];
+        // We retreive the freshest version of page 1. Either most recent page 1 is in the WAL, or
+        // it is in the main db file
+        match self.find_frame(NonZeroU32::new(1).unwrap())? {
+            Some(fno) => {
+                self.read_frame(fno, data)?;
+            }
+            None => {
+                self.inner.db_file().read_at(data, 0)?;
+            }
+        }
+
+        let header = Sqlite3DbHeader::mut_from_prefix(data).expect("invalid database header");
+        header.replication_index =
+            (self.logger().new_frame_notifier.borrow().unwrap_or(0) + 1).into();
+        let mut header = libsql_pghdr {
+            pPage: std::ptr::null_mut(),
+            pData: data.as_mut_ptr() as _,
+            pExtra: std::ptr::null_mut(),
+            pCache: std::ptr::null_mut(),
+            pDirty: std::ptr::null_mut(),
+            pPager: std::ptr::null_mut(),
+            pgno: 1,
+            pageHash: 0x02, // DIRTY
+            flags: 0,
+            nRef: 0,
+            pDirtyNext: std::ptr::null_mut(),
+            pDirtyPrev: std::ptr::null_mut(),
+        };
+
+        let mut headers = unsafe { PageHeaders::from_raw(&mut header) };
+
+        // to retrieve the database size, you must be within a read transaction
+        self.begin_read_txn()?;
+        let db_size = self.db_size();
+        self.end_read_txn();
+
+        self.begin_write_txn()?;
+        self.insert_frames(
+            LIBSQL_PAGE_SIZE as _,
+            &mut headers,
+            db_size, // the database doesn't change; there's always a page 1.
+            true,
+            SQLITE_SYNC_NORMAL, // we'll checkpoint right after, no need for full sync
+        )?;
+        self.end_write_txn()?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use libsql_sys::wal::wrapper::{WalWrapper, WrapWal};
+    use metrics::atomics::AtomicU64;
+    use rusqlite::ffi::{sqlite3_wal_checkpoint_v2, SQLITE_CHECKPOINT_FULL};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    /// In this test, we will perform a bunch of additions, and then checkpoint. We then check that
+    /// the replication index has been flushed to the main db file.
+    #[tokio::test]
+    async fn check_replication_index() {
+        // a wrap wal implementation that catches call to checkpoint, and store the value of the
+        // replication index found on page 1 of the main database file.
+        #[derive(Clone, Default)]
+        struct VerifyReplicationIndex(Arc<AtomicU64>);
+
+        impl WrapWal<ReplicationLoggerWal> for VerifyReplicationIndex {
+            fn checkpoint<B: libsql_sys::wal::BusyHandler>(
+                &mut self,
+                wrapped: &mut ReplicationLoggerWal,
+                db: &mut libsql_sys::wal::Sqlite3Db,
+                mode: libsql_sys::wal::CheckpointMode,
+                busy_handler: Option<&mut B>,
+                sync_flags: u32,
+                // temporary scratch buffer
+                buf: &mut [u8],
+            ) -> libsql_sys::wal::Result<(u32, u32)> {
+                let ret = wrapped.checkpoint(db, mode, busy_handler, sync_flags, buf)?;
+                let buf = &mut [0; LIBSQL_PAGE_SIZE as _];
+                wrapped.inner.db_file().read_at(buf, 0).unwrap();
+                let header = Sqlite3DbHeader::mut_from_prefix(buf).unwrap();
+                self.0.store(
+                    header.replication_index.into(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+
+                Ok(ret)
+            }
+        }
+
+        let tmp = tempdir().unwrap();
+        let verify_replication_index = VerifyReplicationIndex::default();
+        let logger = Arc::new(
+            ReplicationLogger::open(
+                tmp.path(),
+                10000000,
+                None,
+                false,
+                100000,
+                Box::new(|_| Ok(())),
+            )
+            .unwrap(),
+        );
+        let wal_manager = WalWrapper::new(
+            verify_replication_index.clone(),
+            ReplicationLoggerWalManager::new(logger.clone()),
+        );
+        let db = crate::connection::libsql::open_conn_active_checkpoint(
+            tmp.path(),
+            wal_manager,
+            None,
+            u32::MAX,
+        )
+        .unwrap();
+
+        db.execute("create table test (x)", ()).unwrap();
+        for _ in 0..100 {
+            db.execute("insert into test values (42)", ()).unwrap();
+        }
+
+        unsafe {
+            let rc = sqlite3_wal_checkpoint_v2(
+                db.handle(),
+                std::ptr::null_mut(),
+                SQLITE_CHECKPOINT_FULL,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(rc, 0);
+        };
+
+        assert_eq!(
+            verify_replication_index
+                .0
+                .load(std::sync::atomic::Ordering::Relaxed),
+            logger.new_frame_notifier.borrow().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_empty_database() {
+        let tmp = tempdir().unwrap();
+        let logger = Arc::new(
+            ReplicationLogger::open(
+                tmp.path(),
+                10000000,
+                None,
+                false,
+                100000,
+                Box::new(|_| Ok(())),
+            )
+            .unwrap(),
+        );
+
+        let wal_manager = ReplicationLoggerWalManager::new(logger.clone());
+        let db = crate::connection::libsql::open_conn_active_checkpoint(
+            tmp.path(),
+            wal_manager,
+            None,
+            u32::MAX,
+        )
+        .unwrap();
+
+        unsafe {
+            let rc = sqlite3_wal_checkpoint_v2(
+                db.handle(),
+                std::ptr::null_mut(),
+                SQLITE_CHECKPOINT_FULL,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(rc, 0);
+        };
     }
 }

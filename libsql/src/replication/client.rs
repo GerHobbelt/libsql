@@ -3,7 +3,6 @@ use std::task::{Context, Poll};
 
 use anyhow::Context as _;
 use http::Uri;
-use hyper_rustls::HttpsConnectorBuilder;
 use libsql_replication::rpc::proxy::{
     proxy_client::ProxyClient, DescribeRequest, DescribeResult, ExecuteResults, ProgramReq,
 };
@@ -48,7 +47,7 @@ impl Client {
         auth_token: impl AsRef<str>,
         version: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let ver = version.unwrap_or_else(|| env!("CARGO_PKG_VERSION"));
+        let ver = version.unwrap_or(env!("CARGO_PKG_VERSION"));
 
         let version: AsciiMetadataValue = format!("libsql-rpc-{ver}")
             .try_into()
@@ -121,13 +120,7 @@ pub struct GrpcChannel {
 
 impl GrpcChannel {
     pub fn new(connector: ConnectorService) -> Self {
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(connector);
-
-        let client = hyper::Client::builder().build(https);
+        let client = hyper::Client::builder().build(connector);
         let client = GrpcWebClientService::new(client);
 
         let classifier = GrpcErrorsAsFailures::new().with_success(GrpcCode::FailedPrecondition);

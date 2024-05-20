@@ -314,7 +314,7 @@ impl<C: ReplicatorClient> Replicator<C> {
 /// Helper function to convert rpc frames results to replicator frames
 pub fn map_frame_err(f: Result<RpcFrame, Status>) -> Result<Frame, Error> {
     let frame = f?;
-    Ok(Frame::try_from(&*frame.data).map_err(|e| Error::Client(e.into()))?)
+    Frame::try_from(&*frame.data).map_err(|e| Error::Client(e.into()))
 }
 
 #[cfg(test)]
@@ -683,13 +683,13 @@ mod test {
                 .chunks(size_of::<FrameBorrowed>())
                 .map(|b| FrameMut::try_from(b).unwrap())
                 .map(|mut f| {
-                    f.header_mut().size_after = 0;
+                    f.header_mut().size_after.set(0);
                     f
                 })
                 .collect::<Vec<_>>();
 
             let size_after = frames.len();
-            frames.last_mut().unwrap().header_mut().size_after = size_after as _;
+            frames.last_mut().unwrap().header_mut().size_after = (size_after as u32).into();
 
             frames.into_iter().map(Into::into).collect()
         }

@@ -1,41 +1,43 @@
 use std::ffi::{c_int, c_void, CStr};
 use std::mem::MaybeUninit;
+use std::num::NonZeroU32;
+use std::ptr::null_mut;
 
 use libsql_ffi::{
-    libsql_create_wal, libsql_wal, sqlite3_create_wal, sqlite3_wal, Error, SQLITE_OK,
+    libsql_wal, libsql_wal_manager, sqlite3_wal, sqlite3_wal_manager, Error, SQLITE_OK,
     WAL_SAVEPOINT_NDATA,
 };
 
 use super::{
-    BusyHandler, CheckpointMode, CreateWal, PageHeaders, Result, Sqlite3Db, Sqlite3File,
-    UndoHandler, Vfs, Wal,
+    BusyHandler, CheckpointMode, PageHeaders, Result, Sqlite3Db, Sqlite3File, UndoHandler, Vfs,
+    Wal, WalManager,
 };
 
-/// SQLite3 default create_wal implementation.
+/// SQLite3 default wal_manager implementation.
 #[derive(Clone, Copy)]
-pub struct CreateSqlite3Wal {
-    inner: libsql_create_wal,
+pub struct Sqlite3WalManager {
+    inner: libsql_wal_manager,
 }
 
 /// Safety: the create pointer is an immutable global pointer
-unsafe impl Send for CreateSqlite3Wal {}
-unsafe impl Sync for CreateSqlite3Wal {}
+unsafe impl Send for Sqlite3WalManager {}
+unsafe impl Sync for Sqlite3WalManager {}
 
-impl CreateSqlite3Wal {
+impl Sqlite3WalManager {
     pub fn new() -> Self {
         Self {
-            inner: unsafe { sqlite3_create_wal },
+            inner: unsafe { sqlite3_wal_manager },
         }
     }
 }
 
-impl Default for CreateSqlite3Wal {
+impl Default for Sqlite3WalManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CreateWal for CreateSqlite3Wal {
+impl WalManager for Sqlite3WalManager {
     type Wal = Sqlite3Wal;
 
     fn use_shared_memory(&self) -> bool {
@@ -77,16 +79,18 @@ impl CreateWal for CreateSqlite3Wal {
         wal: &mut Self::Wal,
         db: &mut Sqlite3Db,
         sync_flags: c_int,
-        scratch: &mut [u8],
+        scratch: Option<&mut [u8]>,
     ) -> Result<()> {
+        let scratch_len = scratch.as_ref().map(|s| s.len()).unwrap_or(0);
+        let scratch_ptr = scratch.map(|s| s.as_mut_ptr()).unwrap_or(null_mut());
         let rc = unsafe {
             (self.inner.xClose.unwrap())(
                 self.inner.pData,
                 wal.inner.pData,
                 db.as_ptr(),
                 sync_flags,
-                scratch.len() as _,
-                scratch.as_mut_ptr() as _,
+                scratch_len as _,
+                scratch_ptr as _,
             )
         };
 
@@ -142,6 +146,15 @@ pub struct Sqlite3Wal {
     inner: libsql_wal,
 }
 
+impl Sqlite3Wal {
+    pub fn db_file(&mut self) -> &mut Sqlite3File {
+        unsafe {
+            let ptr = &mut (*(self.inner.pData as *mut sqlite3_wal)).pDbFd;
+            std::mem::transmute(ptr)
+        }
+    }
+}
+
 impl Wal for Sqlite3Wal {
     fn limit(&mut self, size: i64) {
         unsafe {
@@ -170,23 +183,24 @@ impl Wal for Sqlite3Wal {
         }
     }
 
-    fn find_frame(&mut self, page_no: u32) -> Result<u32> {
+    fn find_frame(&mut self, page_no: NonZeroU32) -> Result<Option<NonZeroU32>> {
         let mut out: u32 = 0;
         let rc = unsafe {
-            (self.inner.methods.xFindFrame.unwrap())(self.inner.pData, page_no, &mut out as *mut _)
+            (self.inner.methods.xFindFrame.unwrap())(self.inner.pData, page_no.into(), &mut out)
         };
+
         if rc != 0 {
             Err(Error::new(rc))
         } else {
-            Ok(out as _)
+            Ok(NonZeroU32::new(out))
         }
     }
 
-    fn read_frame(&mut self, frame_no: u32, buffer: &mut [u8]) -> Result<()> {
+    fn read_frame(&mut self, frame_no: NonZeroU32, buffer: &mut [u8]) -> Result<()> {
         let rc = unsafe {
             (self.inner.methods.xReadFrame.unwrap())(
                 self.inner.pData,
-                frame_no,
+                frame_no.into(),
                 buffer.len() as _,
                 buffer.as_mut_ptr(),
             )
@@ -279,7 +293,7 @@ impl Wal for Sqlite3Wal {
             (self.inner.methods.xFrames.unwrap())(
                 self.inner.pData,
                 page_size,
-                page_headers.as_ptr(),
+                page_headers.as_mut_ptr(),
                 size_after,
                 is_commit as _,
                 sync_flags,

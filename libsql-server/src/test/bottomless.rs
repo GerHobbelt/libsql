@@ -5,17 +5,58 @@ use aws_sdk_s3::Client;
 use futures_core::Future;
 use itertools::Itertools;
 use libsql_client::{Connection, QueryResult, Statement, Value};
+use s3s::auth::SimpleAuth;
+use s3s::service::S3ServiceBuilder;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::Once;
 use tokio::time::sleep;
 use tokio::time::Duration;
 use url::Url;
+use uuid::Uuid;
 
 use crate::config::{DbConfig, UserApiConfig};
 use crate::net::AddrIncoming;
 use crate::Server;
 
 const S3_URL: &str = "http://localhost:9000/";
+
+const S3_SERVER: Once = Once::new();
+
+async fn start_s3_server() {
+    std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://localhost:9000");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY", "foo");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID", "bar");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION", "us-east-1");
+    std::env::set_var("LIBSQL_BOTTOMLESS_BUCKET", "my-bucket");
+
+    S3_SERVER.call_once(|| {
+        let tmp = std::env::temp_dir().join(format!("s3s-{}", Uuid::new_v4().as_simple()));
+
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        tracing::info!("starting mock s3 server with path: {}", tmp.display());
+
+        let s3_impl = s3s_fs::FileSystem::new(tmp).unwrap();
+
+        let key = std::env::var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID").unwrap();
+        let secret = std::env::var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY").unwrap();
+
+        let auth = SimpleAuth::from_single(key, secret);
+
+        let mut s3 = S3ServiceBuilder::new(s3_impl);
+        s3.set_auth(auth);
+        let s3 = s3.build().into_shared().into_make_service();
+
+        tokio::spawn(async move {
+            let addr = ([127, 0, 0, 1], 9000).into();
+
+            hyper::Server::bind(&addr).serve(s3).await.unwrap();
+        });
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
 
 /// returns a future that once polled will shutdown the server and wait for cleanup
 fn start_db(step: u32, server: Server) -> impl Future<Output = ()> {
@@ -50,6 +91,7 @@ async fn configure_server(
             max_total_response_size: 10000000 * 4096,
             snapshot_exec: None,
             checkpoint_interval: Some(Duration::from_secs(3)),
+            snapshot_at_shutdown: false,
         },
         admin_api_config: None,
         disable_namespaces: true,
@@ -63,6 +105,7 @@ async fn configure_server(
         },
         path: path.into().into(),
         disable_default_namespace: false,
+        max_active_namespaces: 100,
         heartbeat_config: None,
         idle_shutdown_timeout: None,
         initial_idle_shutdown_timeout: None,
@@ -74,7 +117,10 @@ async fn configure_server(
 
 #[tokio::test]
 async fn backup_restore() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = tracing_subscriber::fmt::try_init();
+
+    start_s3_server().await;
+
     const DB_ID: &str = "testbackuprestore";
     const BUCKET: &str = "testbackuprestore";
     const PATH: &str = "backup_restore.sqld";
@@ -121,6 +167,8 @@ async fn backup_restore() {
         .unwrap();
 
         perform_updates(&connection_addr, ROWS, OPS, "A").await;
+
+        assert_updates(&connection_addr, ROWS, OPS, "A").await;
 
         sleep(Duration::from_secs(2)).await;
 
@@ -202,7 +250,10 @@ async fn backup_restore() {
 
 #[tokio::test]
 async fn rollback_restore() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = tracing_subscriber::fmt::try_init();
+
+    start_s3_server().await;
+
     const DB_ID: &str = "testrollbackrestore";
     const BUCKET: &str = "testrollbackrestore";
     const PATH: &str = "rollback_restore.sqld";

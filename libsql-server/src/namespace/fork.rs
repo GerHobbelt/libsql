@@ -16,6 +16,7 @@ use crate::replication::primary::frame_stream::FrameStream;
 use crate::replication::{LogReadError, ReplicationLogger};
 use crate::{BLOCKING_RT, LIBSQL_PAGE_SIZE};
 
+use super::meta_store::MetaStore;
 use super::{MakeNamespace, NamespaceBottomlessDbId, NamespaceName, RestoreOption};
 
 type Result<T> = crate::Result<T, ForkError>;
@@ -43,7 +44,7 @@ impl From<tokio::task::JoinError> for ForkError {
 }
 
 async fn write_frame(frame: &FrameBorrowed, temp_file: &mut tokio::fs::File) -> Result<()> {
-    let page_no = frame.header().page_no;
+    let page_no = frame.header().page_no.get();
     let page_pos = (page_no - 1) as usize * LIBSQL_PAGE_SIZE as usize;
     temp_file.seek(SeekFrom::Start(page_pos as u64)).await?;
     temp_file.write_all(frame.page()).await?;
@@ -58,6 +59,7 @@ pub struct ForkTask<'a> {
     pub make_namespace: &'a dyn MakeNamespace<Database = PrimaryDatabase>,
     pub restore_to: Option<PointInTimeRestore>,
     pub bottomless_db_id: NamespaceBottomlessDbId,
+    pub meta_store: &'a MetaStore,
 }
 
 pub struct PointInTimeRestore {
@@ -112,6 +114,7 @@ impl ForkTask<'_> {
                 // PrimaryNamespaceMaker::create ignores
                 // reset_cb param
                 Box::new(|_op| {}),
+                &self.meta_store,
             )
             .await
             .map_err(|e| ForkError::CreateNamespace(Box::new(e)))
@@ -132,7 +135,7 @@ impl ForkTask<'_> {
                 while let Some(res) = streamer.next().await {
                     match res {
                         Ok(frame) => {
-                            next_frame_no = next_frame_no.max(frame.header().frame_no + 1);
+                            next_frame_no = next_frame_no.max(frame.header().frame_no.get() + 1);
                             write_frame(&frame, &mut data_file).await?;
                         }
                         Err(LogReadError::SnapshotRequired) => {
@@ -153,7 +156,8 @@ impl ForkTask<'_> {
                             tokio::pin!(frames);
                             while let Some(frame) = frames.next().await {
                                 let frame = frame.map_err(|e| ForkError::LogRead(anyhow!(e)))?;
-                                next_frame_no = next_frame_no.max(frame.header().frame_no + 1);
+                                next_frame_no =
+                                    next_frame_no.max(frame.header().frame_no.get() + 1);
                                 write_frame(&frame, &mut data_file).await?;
                             }
                         }

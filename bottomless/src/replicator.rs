@@ -155,12 +155,19 @@ impl Options {
     pub fn from_env() -> Result<Self> {
         fn env_var(key: &str) -> Result<String> {
             match std::env::var(key) {
-                Ok(res) => Ok(res),
+                Ok(res) => {
+                    let res = res.trim().to_string();
+                    if res.is_empty() {
+                        bail!("{} environment variable is empty", key)
+                    } else {
+                        Ok(res)
+                    }
+                }
                 Err(_) => bail!("{} environment variable not set", key),
             }
         }
         fn env_var_or<S: ToString>(key: &str, default_value: S) -> String {
-            match std::env::var(key) {
+            match env_var(key) {
                 Ok(res) => res,
                 Err(_) => default_value.to_string(),
             }
@@ -370,14 +377,22 @@ impl Replicator {
     }
 
     pub async fn shutdown_gracefully(&mut self) -> Result<()> {
+        tracing::info!("bottomless replicator: shutting down...");
+        // 1. wait for all committed WAL frames to be committed locally
         let last_frame_no = self.last_known_frame();
-        // drop flush trigger, which will cause background task for local WAL copier to complete
-        self.flush_trigger.take();
         self.wait_until_committed(last_frame_no).await?;
+        // 2. wait for snapshot upload to S3 to finish
         self.wait_until_snapshotted().await?;
+        // 3. drop flush trigger, which will cause WAL upload loop to close. Since this action will
+        // close the channel used by wait_until_committed, it must happen after wait_until_committed
+        // has finished. If trigger won't be dropped, tasks from join_set will never finish.
+        self.flush_trigger.take();
         while let Some(t) = self.join_set.join_next().await {
+            // one of the tasks we're waiting for is upload of local WAL segment from pt.1 to S3
+            // this should ensure that all WAL frames are one S3
             t?;
         }
+        tracing::info!("bottomless replicator: shutdown complete");
         Ok(())
     }
 
@@ -676,6 +691,9 @@ impl Replicator {
         db_path: &Path,
         compression: CompressionKind,
     ) -> Result<ByteStream> {
+        if !tokio::fs::try_exists(db_path).await? {
+            bail!("database file was not found at `{}`", db_path.display())
+        }
         match compression {
             CompressionKind::None => Ok(ByteStream::from_path(db_path).await?),
             CompressionKind::Gzip => {
@@ -832,8 +850,9 @@ impl Replicator {
                 Ok(file) => file,
                 Err(e) => {
                     tracing::error!(
-                        "Failed to compress db file (generation {}): {:?}",
+                        "Failed to compress db file (generation `{}`, path: `{}`): {:?}",
                         generation,
+                        db_path.display(),
                         e
                     );
                     let _ = snapshot_notifier.send(Err(e));
@@ -878,10 +897,12 @@ impl Replicator {
     // FIXME: assumes that this bucket stores *only* generations for databases,
     // it should be more robust and continue looking if the first item does not
     // match the <db-name>-<generation-uuid>/ pattern.
+    #[tracing::instrument(skip(self))]
     pub async fn latest_generation_before(
         &self,
         timestamp: Option<&NaiveDateTime>,
     ) -> Option<Uuid> {
+        tracing::debug!("last generation before");
         let mut next_marker: Option<String> = None;
         let prefix = format!("{}-", self.db_name);
         let threshold = timestamp.map(|ts| ts.timestamp() as u64);
@@ -896,6 +917,7 @@ impl Replicator {
             let response = request.send().await.ok()?;
             let objs = response.contents()?;
             if objs.is_empty() {
+                tracing::debug!("no objects found in bucket");
                 break;
             }
             let mut last_key = None;
@@ -908,6 +930,7 @@ impl Replicator {
                         Some(index) => &key[self.db_name.len() + 1..index],
                         None => key,
                     };
+
                     if Some(key) != last_gen {
                         last_gen = Some(key);
                         if let Ok(generation) = Uuid::parse_str(key) {
@@ -1003,11 +1026,13 @@ impl Replicator {
 
     /// Restores the database state from given remote generation
     /// On success, returns the RestoreAction, and whether the database was recovered from backup.
+    #[tracing::instrument(skip(self))]
     async fn restore_from(
         &mut self,
         generation: Uuid,
         timestamp: Option<NaiveDateTime>,
     ) -> Result<(RestoreAction, bool)> {
+        tracing::debug!("restoring from");
         if let Some(tombstone) = self.get_tombstone().await? {
             if let Some(timestamp) = Self::generation_to_timestamp(&generation) {
                 if tombstone.timestamp() as u64 >= timestamp.to_unix().0 {
@@ -1025,6 +1050,8 @@ impl Replicator {
         // first check if there are any remaining files that we didn't manage to upload
         // on time in the last run
         self.upload_remaining_files(&generation).await?;
+
+        tracing::debug!("done uploading remaining files");
 
         let last_frame = self.get_last_consistent_frame(&generation).await?;
         tracing::debug!("Last consistent remote frame in generation {generation}: {last_frame}.");
@@ -1407,6 +1434,7 @@ impl Replicator {
         generation: Option<Uuid>,
         timestamp: Option<NaiveDateTime>,
     ) -> Result<(RestoreAction, bool)> {
+        tracing::debug!("restoring with {generation:?} at {timestamp:?}");
         let generation = match generation {
             Some(gen) => gen,
             None => match self.latest_generation_before(timestamp.as_ref()).await {
@@ -1425,7 +1453,9 @@ impl Replicator {
         Ok((action, recovered))
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn get_last_consistent_frame(&self, generation: &Uuid) -> Result<u32> {
+        tracing::debug!("get last consistent frame");
         let prefix = format!("{}-{}/", self.db_name, generation);
         let mut marker: Option<String> = None;
         let mut last_frame = 0;

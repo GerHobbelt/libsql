@@ -191,6 +191,14 @@ struct Cli {
     /// the default namespace.
     #[clap(long)]
     enable_namespaces: bool,
+
+    /// Enable snapshot at shutdown
+    #[clap(long)]
+    snapshot_at_shutdown: bool,
+
+    /// Max active namespaces kept in-memory
+    #[clap(long, env = "SQLD_MAX_ACTIVE_NAMESPACES", default_value = "100")]
+    max_active_namespaces: usize,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -296,6 +304,7 @@ fn make_db_config(config: &Cli) -> anyhow::Result<DbConfig> {
         max_total_response_size: config.max_total_response_size.as_u64(),
         snapshot_exec: config.snapshot_exec.clone(),
         checkpoint_interval: config.checkpoint_interval_s.map(Duration::from_secs),
+        snapshot_at_shutdown: config.snapshot_at_shutdown,
     })
 }
 
@@ -501,6 +510,7 @@ async fn build_server(config: &Cli) -> anyhow::Result<Server> {
         disable_default_namespace: config.disable_default_namespace,
         disable_namespaces: !config.enable_namespaces,
         shutdown,
+        max_active_namespaces: config.max_active_namespaces,
     })
 }
 

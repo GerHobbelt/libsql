@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use libsql_sys::rusqlite::Connection;
 
 #[test]
 fn test_update_column_check() {
@@ -59,6 +59,9 @@ fn test_update_not_null_constraint() {
 #[test]
 fn test_update_references_foreign_key() {
     let conn = Connection::open_in_memory().unwrap();
+
+    // default foreign key is set to 1 in compile options.
+    conn.execute("PRAGMA foreign_keys = OFF", ()).unwrap();
 
     conn.execute("CREATE TABLE t1(id int primary key)", ())
         .unwrap();
