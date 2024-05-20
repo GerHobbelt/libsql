@@ -4,9 +4,10 @@ use std::io::Write;
 use std::mem::size_of;
 use std::os::unix::prelude::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use anyhow::{bail, ensure};
+use bottomless::replicator::Replicator;
 use bytemuck::{bytes_of, pod_read_unaligned, Pod, Zeroable};
 use bytes::{Bytes, BytesMut};
 use libsql_replication::frame::{Frame, FrameHeader, FrameMut};
@@ -51,7 +52,7 @@ pub enum ReplicationLoggerHook {}
 pub struct ReplicationLoggerHookCtx {
     buffer: Vec<WalPage>,
     logger: Arc<ReplicationLogger>,
-    bottomless_replicator: Option<Arc<std::sync::Mutex<bottomless::replicator::Replicator>>>,
+    bottomless_replicator: Option<Arc<std::sync::Mutex<Option<Replicator>>>>,
 }
 
 /// This implementation of WalHook intercepts calls to `on_frame`, and writes them to a
@@ -83,6 +84,21 @@ unsafe impl WalHook for ReplicationLoggerHook {
         let last_valid_frame = wal.hdr.mxFrame;
         tracing::trace!("Last valid frame before applying: {last_valid_frame}");
         let ctx = Self::wal_extract_ctx(wal);
+
+        let mut binding = ctx.bottomless_replicator.clone();
+        let replicator_mutex: Option<&mut Replicator>;
+        let mut replicator_lock: MutexGuard<Option<Replicator>>;
+        if let Some(replicator) = binding.as_mut() {
+            replicator_lock = replicator.lock().unwrap();
+            if replicator_lock.is_none() {
+                tracing::error!("fatal error: expected a replicator, exiting");
+                return SQLITE_IOERR;
+            } else {
+                replicator_mutex = Option::from(replicator_lock.as_mut().unwrap());
+            }
+        } else {
+            replicator_mutex = None;
+        }
 
         let mut frame_count = 0;
         for (page_no, data) in PageHdrIter::new(page_headers, page_size as _) {
@@ -118,8 +134,7 @@ unsafe impl WalHook for ReplicationLoggerHook {
 
             // do backup after log replication as we don't want to replicate potentially
             // inconsistent frames
-            if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
-                let mut replicator = replicator.lock().unwrap();
+            if let Some(replicator) = replicator_mutex {
                 replicator.register_last_valid_frame(last_valid_frame);
                 if let Err(e) = replicator.set_page_size(page_size as usize) {
                     tracing::error!("fatal error during backup: {e}, exiting");
@@ -128,11 +143,12 @@ unsafe impl WalHook for ReplicationLoggerHook {
                 replicator.submit_frames(frame_count as u32);
             }
 
-            if let Err(e) = ctx.logger.log_file.write().maybe_compact(
-                ctx.logger.compactor.clone(),
-                ntruncate,
-                &ctx.logger.db_path,
-            ) {
+            if let Err(e) = ctx
+                .logger
+                .log_file
+                .write()
+                .maybe_compact(ctx.logger.compactor.clone(), &ctx.logger.db_path)
+            {
                 tracing::error!("fatal error: {e}, exiting");
                 std::process::abort()
             }
@@ -162,12 +178,16 @@ unsafe impl WalHook for ReplicationLoggerHook {
             let ctx = Self::wal_extract_ctx(wal);
             if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
                 let last_valid_frame = unsafe { *wal_data };
-                let mut replicator = replicator.lock().unwrap();
-                let prev_valid_frame = replicator.peek_last_valid_frame();
-                tracing::trace!(
+                if let Some(replicator) = replicator.lock().unwrap().as_mut() {
+                    let prev_valid_frame = replicator.peek_last_valid_frame();
+                    tracing::trace!(
                     "Savepoint: rolling back from frame {prev_valid_frame} to {last_valid_frame}",
                 );
-                replicator.rollback_to_frame(last_valid_frame);
+                    replicator.rollback_to_frame(last_valid_frame);
+                } else {
+                    tracing::error!("fatal error: expected a replicator, exiting");
+                    return SQLITE_IOERR;
+                }
             }
         }
 
@@ -215,29 +235,36 @@ unsafe impl WalHook for ReplicationLoggerHook {
             let ctx = Self::wal_extract_ctx(wal);
             let runtime = tokio::runtime::Handle::current();
             if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
-                let mut replicator = replicator.lock().unwrap();
-                let last_known_frame = replicator.last_known_frame();
-                replicator.request_flush();
-                if last_known_frame == 0 {
-                    tracing::debug!("No committed changes in this generation, not snapshotting");
-                    replicator.skip_snapshot_for_current_generation();
-                    return SQLITE_OK;
-                }
-                if let Err(e) = runtime.block_on(replicator.wait_until_committed(last_known_frame))
-                {
-                    tracing::error!(
-                        "Failed to wait for S3 replicator to confirm {} frames backup: {}",
-                        last_known_frame,
-                        e
-                    );
-                    return SQLITE_IOERR_WRITE;
-                }
-                if let Err(e) = runtime.block_on(replicator.wait_until_snapshotted()) {
-                    tracing::error!(
+                if let Some(replicator) = replicator.lock().unwrap().as_mut() {
+                    let last_known_frame = replicator.last_known_frame();
+                    replicator.request_flush();
+                    if last_known_frame == 0 {
+                        tracing::debug!(
+                            "No committed changes in this generation, not snapshotting"
+                        );
+                        replicator.skip_snapshot_for_current_generation();
+                        return SQLITE_OK;
+                    }
+                    if let Err(e) =
+                        runtime.block_on(replicator.wait_until_committed(last_known_frame))
+                    {
+                        tracing::error!(
+                            "Failed to wait for S3 replicator to confirm {} frames backup: {}",
+                            last_known_frame,
+                            e
+                        );
+                        return SQLITE_IOERR_WRITE;
+                    }
+                    if let Err(e) = runtime.block_on(replicator.wait_until_snapshotted()) {
+                        tracing::error!(
                         "Failed to wait for S3 replicator to confirm database snapshot backup: {}",
                         e
                     );
-                    return SQLITE_IOERR_WRITE;
+                        return SQLITE_IOERR_WRITE;
+                    }
+                } else {
+                    tracing::error!("fatal error: expected a replicator, exiting");
+                    return SQLITE_IOERR;
                 }
             }
         }
@@ -266,13 +293,19 @@ unsafe impl WalHook for ReplicationLoggerHook {
             let ctx = Self::wal_extract_ctx(wal);
             let runtime = tokio::runtime::Handle::current();
             if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
-                let mut replicator = replicator.lock().unwrap();
-                let _prev = replicator.new_generation();
-                if let Err(e) =
-                    runtime.block_on(async move { replicator.snapshot_main_db_file().await })
-                {
-                    tracing::error!("Failed to snapshot the main db file during checkpoint: {e}");
-                    return SQLITE_IOERR_WRITE;
+                if let Some(replicator) = replicator.lock().unwrap().as_mut() {
+                    let _prev = replicator.new_generation();
+                    if let Err(e) =
+                        runtime.block_on(async move { replicator.snapshot_main_db_file().await })
+                    {
+                        tracing::error!(
+                            "Failed to snapshot the main db file during checkpoint: {e}"
+                        );
+                        return SQLITE_IOERR_WRITE;
+                    }
+                } else {
+                    tracing::error!("fatal error: expected a replicator, exiting");
+                    return SQLITE_IOERR;
                 }
             }
         }
@@ -291,7 +324,7 @@ pub struct WalPage {
 impl ReplicationLoggerHookCtx {
     pub fn new(
         logger: Arc<ReplicationLogger>,
-        bottomless_replicator: Option<Arc<std::sync::Mutex<bottomless::replicator::Replicator>>>,
+        bottomless_replicator: Option<Arc<std::sync::Mutex<Option<Replicator>>>>,
     ) -> Self {
         if bottomless_replicator.is_some() {
             tracing::trace!("bottomless replication enabled");
@@ -604,26 +637,16 @@ impl LogFile {
         compact
     }
 
-    fn maybe_compact(
-        &mut self,
-        compactor: LogCompactor,
-        size_after: u32,
-        path: &Path,
-    ) -> anyhow::Result<()> {
+    fn maybe_compact(&mut self, compactor: LogCompactor, path: &Path) -> anyhow::Result<()> {
         if self.should_compact() {
-            self.do_compaction(compactor, size_after, path)
+            self.do_compaction(compactor, path)
         } else {
             Ok(())
         }
     }
 
     /// perform the log compaction.
-    fn do_compaction(
-        &mut self,
-        compactor: LogCompactor,
-        size_after: u32,
-        path: &Path,
-    ) -> anyhow::Result<()> {
+    fn do_compaction(&mut self, compactor: LogCompactor, path: &Path) -> anyhow::Result<()> {
         assert_eq!(self.uncommitted_frame_count, 0);
 
         // nothing to compact
@@ -632,12 +655,18 @@ impl LogFile {
         }
 
         tracing::info!("performing log compaction");
-        let temp_log_path = path.join("temp_log");
+        // To perform the compaction, we create a new, empty file in the `to_compact` directory.
+        // We will then atomically swap that file with the current log file.
+        // In case of a crash, when filling the compactor job queue, if we find that we find a log
+        // file that doesn't contains only a header, we can safely assume that it was from a
+        // previous crash that happenned in the middle of this operation.
+        let to_compact_id = Uuid::new_v4();
+        let to_compact_log_path = path.join("to_compact").join(to_compact_id.to_string());
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(&temp_log_path)?;
+            .open(&to_compact_log_path)?;
         let mut new_log_file = LogFile::new(file, self.max_log_frame_count, self.max_log_duration)?;
         let new_header = LogFileHeader {
             start_frame_no: self.header.last_frame_no().unwrap() + 1,
@@ -648,9 +677,10 @@ impl LogFile {
         new_log_file.header = new_header;
         new_log_file.write_header().unwrap();
         // swap old and new snapshot
-        atomic_rename(&temp_log_path, path.join("wallog")).unwrap();
+        // FIXME(marin): the dest path never changes, store it somewhere.
+        atomic_rename(&to_compact_log_path, path.join("wallog")).unwrap();
         let old_log_file = std::mem::replace(self, new_log_file);
-        compactor.compact(old_log_file, temp_log_path, size_after)?;
+        compactor.compact(old_log_file, to_compact_log_path)?;
 
         Ok(())
     }
@@ -783,6 +813,7 @@ pub struct ReplicationLogger {
     pub new_frame_notifier: watch::Sender<Option<FrameNo>>,
     pub closed_signal: watch::Sender<bool>,
     pub auto_checkpoint: u32,
+    pub bottomless_replicator: Option<Arc<std::sync::Mutex<Option<Replicator>>>>,
 }
 
 impl ReplicationLogger {
@@ -793,6 +824,7 @@ impl ReplicationLogger {
         dirty: bool,
         auto_checkpoint: u32,
         callback: SnapshotCallback,
+        bottomless_replicator: Option<Arc<std::sync::Mutex<Option<Replicator>>>>,
     ) -> anyhow::Result<Self> {
         let log_path = db_path.join("wallog");
         let data_path = db_path.join("data");
@@ -810,8 +842,13 @@ impl ReplicationLogger {
         let header = log_file.header();
 
         let should_recover = if dirty {
-            tracing::info!("Replication log is dirty, recovering from database file.");
-            true
+            if data_path.try_exists()? {
+                tracing::info!("Replication log is dirty, recovering from database file.");
+                true
+            } else {
+                // there is no database; nothing to recover
+                false
+            }
         } else if header.version < 2 || header.sqld_version() != Version::current() {
             tracing::info!("replication log version not compatible with current sqld version, recovering from database file.");
             true
@@ -823,9 +860,21 @@ impl ReplicationLogger {
         };
 
         if should_recover {
-            Self::recover(log_file, data_path, callback, auto_checkpoint)
+            Self::recover(
+                log_file,
+                data_path,
+                callback,
+                auto_checkpoint,
+                bottomless_replicator,
+            )
         } else {
-            Self::from_log_file(db_path.to_path_buf(), log_file, callback, auto_checkpoint)
+            Self::from_log_file(
+                db_path.to_path_buf(),
+                log_file,
+                callback,
+                auto_checkpoint,
+                bottomless_replicator,
+            )
         }
     }
 
@@ -834,6 +883,7 @@ impl ReplicationLogger {
         log_file: LogFile,
         callback: SnapshotCallback,
         auto_checkpoint: u32,
+        bottomless_replicator: Option<Arc<std::sync::Mutex<Option<Replicator>>>>,
     ) -> anyhow::Result<Self> {
         let header = log_file.header();
         let generation_start_frame_no = header.last_frame_no();
@@ -867,6 +917,7 @@ impl ReplicationLogger {
             closed_signal,
             new_frame_notifier,
             auto_checkpoint,
+            bottomless_replicator,
         })
     }
 
@@ -875,6 +926,7 @@ impl ReplicationLogger {
         mut data_path: PathBuf,
         callback: SnapshotCallback,
         auto_checkpoint: u32,
+        bottomless_replicator: Option<Arc<std::sync::Mutex<Option<Replicator>>>>,
     ) -> anyhow::Result<Self> {
         // It is necessary to checkpoint before we restore the replication log, since the WAL may
         // contain pages that are not in the database file.
@@ -907,7 +959,13 @@ impl ReplicationLogger {
 
         assert!(data_path.pop());
 
-        Self::from_log_file(data_path, log_file, callback, auto_checkpoint)
+        Self::from_log_file(
+            data_path,
+            log_file,
+            callback,
+            auto_checkpoint,
+            bottomless_replicator,
+        )
     }
 
     pub fn log_id(&self) -> Uuid {
@@ -976,7 +1034,7 @@ impl ReplicationLogger {
         let size_after = last_frame.header().size_after;
         assert!(size_after != 0);
 
-        log_file.do_compaction(self.compactor.clone(), size_after, &self.db_path)?;
+        log_file.do_compaction(self.compactor.clone(), &self.db_path)?;
         Ok(true)
     }
 }
@@ -1052,6 +1110,7 @@ mod test {
             false,
             DEFAULT_AUTO_CHECKPOINT,
             Box::new(|_| Ok(())),
+            None,
         )
         .unwrap();
 
@@ -1088,6 +1147,7 @@ mod test {
             false,
             DEFAULT_AUTO_CHECKPOINT,
             Box::new(|_| Ok(())),
+            None,
         )
         .unwrap();
         let log_file = logger.log_file.write();
@@ -1105,6 +1165,7 @@ mod test {
             false,
             DEFAULT_AUTO_CHECKPOINT,
             Box::new(|_| Ok(())),
+            None,
         )
         .unwrap();
         let entry = WalPage {
@@ -1172,6 +1233,7 @@ mod test {
                 false,
                 100000,
                 Box::new(|_| Ok(())),
+                None,
             )
             .unwrap(),
         );

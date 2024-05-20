@@ -1,8 +1,12 @@
 [package]
-name = "sqld"
-version = "0.22.1"
+name = "libsql-server"
+version = "0.22.6"
 edition = "2021"
 default-run = "sqld"
+
+[[bin]]
+name = "sqld"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.66"
@@ -68,7 +72,6 @@ tonic-web = "0.10"
 tower = { version = "0.4.13", features = ["make"] }
 tower-http = { version = "0.3.5", features = ["compression-full", "cors", "trace"] }
 tracing = "0.1.37"
-tracing-panic = "0.1"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 http-body = "0.4"
 url = { version = "2.3", features = ["serde"] }

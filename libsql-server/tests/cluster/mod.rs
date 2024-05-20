@@ -4,8 +4,8 @@ use super::common;
 
 use insta::assert_snapshot;
 use libsql::{Database, Value};
+use libsql_server::config::{AdminApiConfig, RpcClientConfig, RpcServerConfig, UserApiConfig};
 use serde_json::json;
-use sqld::config::{AdminApiConfig, RpcClientConfig, RpcServerConfig, UserApiConfig};
 use tempfile::tempdir;
 use tokio::{task::JoinSet, time::Duration};
 use turmoil::{Builder, Sim};
@@ -15,6 +15,7 @@ use common::net::{init_tracing, TestServer, TurmoilAcceptor, TurmoilConnector};
 use crate::common::{http::Client, net::SimServer, snapshot_metrics};
 
 mod replica_restart;
+mod replication;
 
 fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
     init_tracing();

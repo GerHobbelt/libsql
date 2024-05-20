@@ -1,6 +1,8 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
@@ -8,6 +10,7 @@ use std::sync::{Arc, Weak};
 use crate::auth::Auth;
 use crate::connection::{Connection, MakeConnection};
 use crate::error::Error;
+use crate::metrics::DIRTY_STARTUP;
 use crate::migration::maybe_migrate;
 use crate::net::Accept;
 use crate::rpc::proxy::rpc::proxy_server::Proxy;
@@ -26,8 +29,8 @@ use http::user::UserApi;
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
 use namespace::{
-    MakeNamespace, NamespaceName, NamespaceStore, PrimaryNamespaceConfig, PrimaryNamespaceMaker,
-    ReplicaNamespaceConfig, ReplicaNamespaceMaker,
+    MakeNamespace, NamespaceBottomlessDbId, NamespaceName, NamespaceStore, PrimaryNamespaceConfig,
+    PrimaryNamespaceMaker, ReplicaNamespaceConfig, ReplicaNamespaceMaker,
 };
 use net::Connector;
 use once_cell::sync::Lazy;
@@ -247,6 +250,10 @@ fn sentinel_file_path(path: &Path) -> PathBuf {
 fn init_sentinel_file(path: &Path) -> anyhow::Result<bool> {
     let path = sentinel_file_path(path);
     if path.try_exists()? {
+        DIRTY_STARTUP.increment(1);
+        tracing::warn!(
+            "sentinel file found: sqld was not shutdown gracefully, namespaces will be recovered."
+        );
         return Ok(true);
     }
 
@@ -374,6 +381,7 @@ where
         let snapshot_callback = self.make_snapshot_callback();
         let auth = self.user_api_config.get_auth().map(Arc::new)?;
         let extensions = self.db_config.validate_extensions()?;
+        let namespace_store_shutdown_fut: Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
         match self.rpc_client_config {
             Some(rpc_config) => {
@@ -389,6 +397,10 @@ where
                 let (namespaces, proxy_service, replication_service) = replica.configure().await?;
                 self.rpc_client_config = None;
                 self.spawn_monitoring_tasks(&mut join_set, stats_receiver, namespaces.clone())?;
+                namespace_store_shutdown_fut = {
+                    let namespaces = namespaces.clone();
+                    Box::pin(async move { namespaces.shutdown().await })
+                };
 
                 let services = Services {
                     namespaces,
@@ -425,6 +437,10 @@ where
                 let (namespaces, proxy_service, replication_service) = primary.configure().await?;
                 self.rpc_server_config = None;
                 self.spawn_monitoring_tasks(&mut join_set, stats_receiver, namespaces.clone())?;
+                namespace_store_shutdown_fut = {
+                    let namespaces = namespaces.clone();
+                    Box::pin(async move { namespaces.shutdown().await })
+                };
 
                 let services = Services {
                     namespaces,
@@ -448,8 +464,10 @@ where
         tokio::select! {
             _ = self.shutdown.notified() => {
                 join_set.shutdown().await;
+                namespace_store_shutdown_fut.await?;
                 // clean shutdown, remove sentinel file
                 std::fs::remove_file(sentinel_file_path(&self.path))?;
+                tracing::info!("sqld was shutdown gracefully. Bye!");
             }
             Some(res) = join_set.join_next() => {
                 res??;
@@ -516,7 +534,7 @@ where
                 .create(
                     NamespaceName::default(),
                     namespace::RestoreOption::Latest,
-                    None,
+                    NamespaceBottomlessDbId::NotProvided,
                 )
                 .await?;
         }

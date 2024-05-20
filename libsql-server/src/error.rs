@@ -14,7 +14,7 @@ pub enum Error {
     #[error("Server can't handle additional transactions")]
     LibSqlTxBusy,
     #[error(transparent)]
-    IOError(#[from] std::io::Error),
+    IOError(std::io::Error),
     #[error(transparent)]
     RusqliteError(#[from] rusqlite::Error),
     #[error("{0}")]
@@ -22,7 +22,7 @@ pub enum Error {
     #[error("Failed to execute query via RPC. Error code: {}, message: {}", .0.code, .0.message)]
     RpcQueryError(crate::rpc::proxy::rpc::Error),
     #[error("Failed to execute queries via RPC protocol: `{0}`")]
-    RpcQueryExecutionError(tonic::Status),
+    RpcQueryExecutionError(#[from] tonic::Status),
     #[error("Database value error: `{0}`")]
     DbValueError(String),
     // Dedicated for most generic internal errors. Please use it sparingly.
@@ -82,7 +82,6 @@ pub enum Error {
     Fork(#[from] ForkError),
     #[error("Fatal replication error")]
     FatalReplicationError,
-
     #[error("Connection with primary broken")]
     PrimaryStreamDisconnect,
     #[error("Proxy protocal misuse")]
@@ -91,6 +90,8 @@ pub enum Error {
     PrimaryStreamInterupted,
     #[error("Wrong URL: {0}")]
     UrlParseError(#[from] url::ParseError),
+    #[error("Namespace store has shutdown")]
+    NamespaceStoreShutdown,
 }
 
 trait ResponseError: std::error::Error {
@@ -148,7 +149,18 @@ impl IntoResponse for Error {
             PrimaryStreamMisuse => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             PrimaryStreamInterupted => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             UrlParseError(_) => self.format_err(StatusCode::BAD_REQUEST),
+            NamespaceStoreShutdown => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
         }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        tracing::error!("IO error reported: {}, {:?}", value, backtrace);
+
+        Error::IOError(value)
     }
 }
 

@@ -20,7 +20,10 @@ use url::Url;
 use crate::database::Database;
 use crate::error::LoadDumpError;
 use crate::hrana;
-use crate::namespace::{DumpStream, MakeNamespace, NamespaceName, NamespaceStore, RestoreOption};
+use crate::namespace::{
+    DumpStream, MakeNamespace, NamespaceBottomlessDbId, NamespaceName, NamespaceStore,
+    RestoreOption,
+};
 use crate::net::Connector;
 use crate::LIBSQL_PAGE_SIZE;
 
@@ -73,6 +76,7 @@ where
     let prom_handle = if !disable_metrics {
         let lock = PROM_HANDLE.lock();
         let prom_handle = lock.get_or_init(|| {
+            tracing::info!("initializing prometheus metrics");
             let b = PrometheusBuilder::new().idle_timeout(
                 metrics_util::MetricKindMask::ALL,
                 Some(Duration::from_secs(120)),
@@ -246,10 +250,14 @@ async fn handle_create_namespace<M: MakeNamespace, C: Connector>(
         None => RestoreOption::Latest,
     };
 
+    let bottomless_db_id = match req.bottomless_db_id {
+        Some(db_id) => NamespaceBottomlessDbId::Namespace(db_id),
+        None => NamespaceBottomlessDbId::NotProvided,
+    };
     let namespace = NamespaceName::from_string(namespace)?;
     app_state
         .namespaces
-        .create(namespace.clone(), dump, req.bottomless_db_id)
+        .create(namespace.clone(), dump, bottomless_db_id)
         .await?;
 
     let store = app_state.namespaces.config_store(namespace).await?;

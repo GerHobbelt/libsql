@@ -32,6 +32,7 @@ pub struct Injector {
     /// Injector connection
     // connection must be dropped before the hook context
     connection: Arc<Mutex<sqld_libsql_bindings::Connection<InjectorHook>>>,
+    biggest_uncommitted_seen: FrameNo,
 }
 
 /// Methods from this trait are called before and after performing a frame injection.
@@ -64,6 +65,7 @@ impl Injector {
             buffer,
             capacity: buffer_capacity,
             connection: Arc::new(Mutex::new(connection)),
+            biggest_uncommitted_seen: 0,
         })
     }
 
@@ -82,9 +84,25 @@ impl Injector {
     /// Trigger a dummy write, and flush the cache to trigger a call to xFrame. The buffer's frame
     /// are then injected into the wal.
     pub fn flush(&mut self) -> Result<Option<FrameNo>, Error> {
+        match self.try_flush() {
+            Err(e) => {
+                // something went wrong, rollback the connection to make sure we can retry in a
+                // clean state
+                self.biggest_uncommitted_seen = 0;
+                let connection = self.connection.lock();
+                let mut rollback = connection.prepare_cached("ROLLBACK")?;
+                let _ = rollback.execute(());
+                Err(e)
+            }
+            Ok(ret) => Ok(ret),
+        }
+    }
+
+    fn try_flush(&mut self) -> Result<Option<FrameNo>, Error> {
         if !self.is_txn {
             self.begin_txn()?;
         }
+
         let lock = self.buffer.lock();
         // the frames in the buffer are either monotonically increasing (log) or decreasing
         // (snapshot). Either way, we want to find the biggest frameno we're about to commit, and
@@ -96,6 +114,8 @@ impl Injector {
                 return Ok(None);
             }
         };
+
+        self.biggest_uncommitted_seen = self.biggest_uncommitted_seen.max(last_frame_no);
 
         drop(lock);
 
@@ -119,7 +139,9 @@ impl Injector {
                         let _ = rollback.execute(());
                         self.is_txn = false;
                         assert!(self.buffer.lock().is_empty());
-                        return Ok(Some(last_frame_no));
+                        let commit_frame_no = self.biggest_uncommitted_seen;
+                        self.biggest_uncommitted_seen = 0;
+                        return Ok(Some(commit_frame_no));
                     } else if e.extended_code == LIBSQL_INJECT_OK_TXN {
                         self.is_txn = true;
                         assert!(self.buffer.lock().is_empty());
