@@ -1,9 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use bottomless::SavepointTracker;
+use bottomless::replicator::Replicator;
 
 use crate::connection::{MakeConnection, RequestContext};
+use crate::replication::ReplicationLogger;
 
 pub use self::primary::{PrimaryConnection, PrimaryConnectionMaker, PrimaryDatabase};
 pub use self::replica::{ReplicaConnection, ReplicaDatabase};
@@ -178,6 +179,14 @@ impl Database {
         }
     }
 
+    pub fn logger(&self) -> Option<Arc<ReplicationLogger>> {
+        match self {
+            Database::Primary(p) => Some(p.wal_wrapper.wrapper().logger()),
+            Database::Replica(_) => None,
+            Database::Schema(s) => Some(s.wal_wrapper.wrapper().logger()),
+        }
+    }
+
     pub fn as_primary(&self) -> Option<&PrimaryDatabase> {
         if let Self::Primary(v) = self {
             Some(v)
@@ -194,11 +203,11 @@ impl Database {
         }
     }
 
-    pub(crate) fn backup_savepoint(&self) -> Option<SavepointTracker> {
+    pub(crate) fn replicator(&self) -> Option<Arc<tokio::sync::Mutex<Option<Replicator>>>> {
         match self {
-            Database::Primary(db) => db.backup_savepoint(),
+            Database::Primary(db) => db.replicator(),
             Database::Replica(_) => None,
-            Database::Schema(db) => db.backup_savepoint(),
+            Database::Schema(db) => db.replicator(),
         }
     }
 }

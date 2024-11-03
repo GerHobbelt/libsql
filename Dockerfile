@@ -18,15 +18,24 @@ RUN cat rust-toolchain.toml | grep "channel" | awk '{print $3}' | sed 's/\"//g' 
     && cargo install cargo-chef
 
 FROM chef AS planner
+ARG BUILD_DEBUG=false
+ENV CARGO_PROFILE_RELEASE_DEBUG=$BUILD_DEBUG
+RUN echo $CARGO_PROFILE_RELEASE_DEBUG
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
+ARG BUILD_DEBUG=false
+ENV CARGO_PROFILE_RELEASE_DEBUG=$BUILD_DEBUG
 COPY --from=planner /recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
-RUN cargo build -p libsql-server --release
-
+ARG ENABLE_FEATURES=""
+RUN if [ "$ENABLE_FEATURES" == "" ]; then \
+        cargo build -p libsql-server --release ; \
+    else \
+        cargo build -p libsql-server --features "$ENABLE_FEATURES" --release ; \
+    fi
 # runtime
 FROM debian:bullseye-slim
 RUN apt update
