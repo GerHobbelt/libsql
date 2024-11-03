@@ -8,12 +8,13 @@ use libsql_sys::name::NamespaceName;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::io::Io;
+use crate::io::{FileExt, Io, StdIO};
+use crate::segment::compacted::CompactedSegment;
 use crate::segment::Segment;
 
 use super::backend::Backend;
 use super::scheduler::Scheduler;
-use super::{Storage, StoreSegmentRequest};
+use super::{OnStoreCallback, RestoreOptions, Storage, StoreSegmentRequest};
 
 /// Background loop task state.
 ///
@@ -22,7 +23,7 @@ use super::{Storage, StoreSegmentRequest};
 /// On shutdown, attempts to empty the queue, and flush the receiver. When the last handle of the
 /// receiver is dropped, and the queue is empty, exit.
 pub struct AsyncStorageLoop<B: Backend, IO: Io, S> {
-    receiver: mpsc::UnboundedReceiver<StoreSegmentRequest<B::Config, S>>,
+    receiver: mpsc::UnboundedReceiver<StorageLoopMessage<B::Config, S>>,
     scheduler: Scheduler<B::Config, S>,
     backend: Arc<B>,
     io: Arc<IO>,
@@ -84,8 +85,11 @@ where
                 }
                 msg = self.receiver.recv(), if !shutting_down => {
                     match msg {
-                        Some(req) => {
+                        Some(StorageLoopMessage::StoreReq(req)) => {
                             self.scheduler.register(req);
+                        }
+                        Some(StorageLoopMessage::DurableFrameNoReq { namespace, ret, config_override }) => {
+                            self.fetch_durable_frame_no_async(namespace, ret, config_override);
                         }
                         None => {
                             shutting_down = true;
@@ -104,6 +108,20 @@ where
             }
         }
     }
+
+    fn fetch_durable_frame_no_async(
+        &self,
+        namespace: NamespaceName,
+        ret: oneshot::Sender<u64>,
+        config_override: Option<Arc<B::Config>>,
+    ) {
+        let backend = self.backend.clone();
+        let config = config_override.unwrap_or_else(|| backend.default_config());
+        tokio::spawn(async move {
+            let meta = backend.meta(&config, &namespace).await.unwrap();
+            let _ = ret.send(meta.max_frame_no);
+        });
+    }
 }
 
 pub struct BottomlessConfig<C> {
@@ -114,62 +132,159 @@ pub struct BottomlessConfig<C> {
     pub config: C,
 }
 
-pub struct AsyncStorage<C, S> {
-    /// send request to the main loop
-    job_sender: mpsc::UnboundedSender<StoreSegmentRequest<C, S>>,
-    /// receiver for the current max durable index
-    durable_notifier: mpsc::Receiver<(NamespaceName, u64)>,
-    force_shutdown: oneshot::Sender<()>,
+enum StorageLoopMessage<C, S> {
+    StoreReq(StoreSegmentRequest<C, S>),
+    DurableFrameNoReq {
+        namespace: NamespaceName,
+        config_override: Option<Arc<C>>,
+        ret: oneshot::Sender<u64>,
+    },
 }
 
-impl<C, S> Storage for AsyncStorage<C, S>
+pub struct AsyncStorage<B: Backend, S> {
+    /// send request to the main loop
+    job_sender: mpsc::UnboundedSender<StorageLoopMessage<B::Config, S>>,
+    force_shutdown: oneshot::Sender<()>,
+    backend: Arc<B>,
+}
+
+impl<B, S> Storage for AsyncStorage<B, S>
 where
-    C: Send + Sync + 'static,
+    B: Backend,
     S: Segment,
 {
     type Segment = S;
-    fn store(&self, namespace: &NamespaceName, segment: Self::Segment) {
+    type Config = B::Config;
+
+    fn store(
+        &self,
+        namespace: &NamespaceName,
+        segment: Self::Segment,
+        config_override: Option<Arc<Self::Config>>,
+        on_store_callback: OnStoreCallback,
+    ) {
         let req = StoreSegmentRequest {
             namespace: namespace.clone(),
             segment,
             created_at: Utc::now(),
-            storage_config_override: None,
+            storage_config_override: config_override,
+            on_store_callback,
         };
 
         self.job_sender
-            .send(req)
+            .send(StorageLoopMessage::StoreReq(req))
             .expect("bottomless loop was closed before the handle was dropped");
     }
 
-    fn durable_frame_no(&self, _namespace: &NamespaceName) -> u64 {
-        todo!()
+    async fn durable_frame_no(
+        &self,
+        namespace: &NamespaceName,
+        config_override: Option<Arc<Self::Config>>,
+    ) -> u64 {
+        let config = config_override.unwrap_or_else(|| self.backend.default_config());
+        let meta = self.backend.meta(&config, namespace).await.unwrap();
+        meta.max_frame_no
+    }
+
+    async fn restore(
+        &self,
+        file: impl crate::io::FileExt,
+        namespace: &NamespaceName,
+        restore_options: RestoreOptions,
+        config_override: Option<Arc<Self::Config>>,
+    ) -> super::Result<()> {
+        let config = config_override.unwrap_or_else(|| self.backend.default_config());
+        self.backend
+            .restore(&config, &namespace, restore_options, file)
+            .await
+    }
+
+    fn durable_frame_no_sync(
+        &self,
+        namespace: &NamespaceName,
+        config_override: Option<Arc<Self::Config>>,
+    ) -> u64 {
+        tokio::runtime::Handle::current()
+            .block_on(self.durable_frame_no(namespace, config_override))
+    }
+
+    async fn find_segment(
+        &self,
+        namespace: &NamespaceName,
+        frame_no: u64,
+        config_override: Option<Arc<Self::Config>>,
+    ) -> super::Result<super::SegmentKey> {
+        let config = config_override.unwrap_or_else(|| self.backend.default_config());
+        let key = self
+            .backend
+            .find_segment(&config, namespace, frame_no)
+            .await?;
+        Ok(key)
+    }
+
+    async fn fetch_segment_index(
+        &self,
+        namespace: &NamespaceName,
+        key: &super::SegmentKey,
+        config_override: Option<Arc<Self::Config>>,
+    ) -> super::Result<fst::Map<Arc<[u8]>>> {
+        let config = config_override.unwrap_or_else(|| self.backend.default_config());
+        let index = self
+            .backend
+            .fetch_segment_index(&config, namespace, key)
+            .await?;
+        Ok(index)
+    }
+
+    async fn fetch_segment_data(
+        &self,
+        namespace: &NamespaceName,
+        key: &super::SegmentKey,
+        config_override: Option<Arc<Self::Config>>,
+    ) -> super::Result<CompactedSegment<impl FileExt>> {
+        // TODO: make async
+        let config = config_override.unwrap_or_else(|| self.backend.default_config());
+        let backend = self.backend.clone();
+        let file = backend
+            .fetch_segment_data(config, namespace.clone(), *key)
+            .await?;
+        let segment = CompactedSegment::open(file).await?;
+        Ok(segment)
     }
 }
 
-pub struct AsyncStorageInitConfig<S> {
-    storage: S,
-    max_in_flight_jobs: usize,
+pub struct AsyncStorageInitConfig<B> {
+    pub backend: Arc<B>,
+    pub max_in_flight_jobs: usize,
 }
 
-impl<C, S> AsyncStorage<C, S> {
-    pub async fn new<B, IO>(
+impl<B: Backend, S> AsyncStorage<B, S> {
+    pub async fn new(
+        config: AsyncStorageInitConfig<B>,
+    ) -> (AsyncStorage<B, S>, AsyncStorageLoop<B, StdIO, S>)
+    where
+        B: Backend,
+        S: Segment,
+    {
+        Self::new_with_io(config, Arc::new(StdIO(()))).await
+    }
+
+    pub async fn new_with_io<IO>(
         config: AsyncStorageInitConfig<B>,
         io: Arc<IO>,
-    ) -> (AsyncStorage<C, S>, AsyncStorageLoop<B, IO, S>)
+    ) -> (AsyncStorage<B, S>, AsyncStorageLoop<B, IO, S>)
     where
-        B: Backend<Config = C>,
+        B: Backend,
         IO: Io,
         S: Segment,
-        C: Send + Sync + 'static,
     {
         let (job_snd, job_rcv) = tokio::sync::mpsc::unbounded_channel();
-        let (durable_notifier_snd, durable_notifier_rcv) = tokio::sync::mpsc::channel(16);
         let (shutdown_snd, shutdown_rcv) = tokio::sync::oneshot::channel();
-        let scheduler = Scheduler::new(durable_notifier_snd);
+        let scheduler = Scheduler::new();
         let storage_loop = AsyncStorageLoop {
             receiver: job_rcv,
             scheduler,
-            backend: Arc::new(config.storage),
+            backend: config.backend.clone(),
             io,
             max_in_flight: config.max_in_flight_jobs,
             force_shutdown: shutdown_rcv,
@@ -177,8 +292,8 @@ impl<C, S> AsyncStorage<C, S> {
 
         let this = Self {
             job_sender: job_snd,
-            durable_notifier: durable_notifier_rcv,
             force_shutdown: shutdown_snd,
+            backend: config.backend,
         };
 
         (this, storage_loop)

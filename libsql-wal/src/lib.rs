@@ -11,6 +11,8 @@ pub mod storage;
 pub mod transaction;
 pub mod wal;
 
+const LIBSQL_MAGIC: u64 = u64::from_be_bytes(*b"LIBSQL\0\0");
+
 #[cfg(any(debug_assertions, test))]
 pub mod test {
     use std::fs::OpenOptions;
@@ -19,7 +21,9 @@ pub mod test {
 
     use libsql_sys::{name::NamespaceName, rusqlite::OpenFlags};
     use tempfile::{tempdir, TempDir};
+    use tokio::sync::mpsc;
 
+    use crate::checkpointer::LibsqlCheckpointer;
     use crate::io::StdIO;
     use crate::registry::WalRegistry;
     use crate::shared_wal::SharedWal;
@@ -34,6 +38,10 @@ pub mod test {
 
     impl TestEnv {
         pub fn new() -> Self {
+            Self::new_store(false)
+        }
+
+        pub fn new_store(store: bool) -> Self {
             let tmp = tempdir().unwrap();
             let resolver = |path: &Path| {
                 let name = path
@@ -46,9 +54,19 @@ pub mod test {
                 NamespaceName::from_string(name.to_string())
             };
 
+            let (sender, receiver) = mpsc::channel(128);
             let registry = Arc::new(
-                WalRegistry::new(tmp.path().join("test/wals"), TestStorage::new()).unwrap(),
+                WalRegistry::new(
+                    tmp.path().join("test/wals"),
+                    TestStorage::new_io(store, StdIO(())),
+                    sender,
+                )
+                .unwrap(),
             );
+            if store {
+                let checkpointer = LibsqlCheckpointer::new(registry.clone(), receiver, 5);
+                tokio::spawn(checkpointer.run());
+            }
             let wal = LibsqlWalManager::new(registry.clone(), Arc::new(resolver));
 
             Self { tmp, registry, wal }
@@ -56,23 +74,26 @@ pub mod test {
 
         pub fn shared(&self, namespace: &str) -> Arc<SharedWal<StdIO>> {
             let path = self.tmp.path().join(namespace).join("data");
-            self.registry
-                .clone()
-                .open(path.as_ref(), &NamespaceName::from_string(namespace.into()))
-                .unwrap()
+            let registry = self.registry.clone();
+            let namespace = NamespaceName::from_string(namespace.into());
+            registry.clone().open(path.as_ref(), &namespace).unwrap()
         }
 
         pub fn db_path(&self, namespace: &str) -> PathBuf {
             self.tmp.path().join(namespace)
         }
 
-        pub fn open_conn(&self, namespace: &str) -> libsql_sys::Connection<LibsqlWal<StdIO>> {
+        pub fn open_conn(
+            &self,
+            namespace: &'static str,
+        ) -> libsql_sys::Connection<LibsqlWal<StdIO>> {
             let path = self.db_path(namespace);
+            let wal = self.wal.clone();
             std::fs::create_dir_all(&path).unwrap();
             libsql_sys::Connection::open(
                 path.join("data"),
                 OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
-                self.wal.clone(),
+                wal,
                 100000,
                 None,
             )

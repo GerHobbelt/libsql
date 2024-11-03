@@ -14,6 +14,7 @@ use zerocopy::{AsBytes, FromZeroes};
 use crate::error::Result;
 use crate::io::buf::{IoBufMut, ZeroCopyBuf};
 use crate::io::file::{BufCopy, FileExt};
+use crate::LIBSQL_MAGIC;
 
 use super::compacted::{CompactedSegmentDataFooter, CompactedSegmentDataHeader};
 use super::{frame_offset, page_offset, Frame, FrameHeader, Segment, SegmentHeader};
@@ -82,10 +83,13 @@ where
         let mut hasher = crc32fast::Hasher::new();
 
         let header = CompactedSegmentDataHeader {
-            frame_count: (self.index().len() as u64).into(),
+            frame_count: (self.index().len() as u32).into(),
             segment_id: id.as_u128().into(),
             start_frame_no: self.header().start_frame_no,
             end_frame_no: self.header().last_commited_frame_no,
+            size_after: self.header.size_after,
+            version: 1.into(),
+            magic: LIBSQL_MAGIC.into(),
         };
 
         hasher.update(header.as_bytes());
@@ -95,7 +99,6 @@ where
         ret?;
 
         let mut pages = self.index().stream();
-        // todo: use Frame::Zeroed somehow, so that header is aligned?
         let mut buffer = Box::new(ZeroCopyBuf::<Frame>::new_uninit());
         let mut out_index = fst::MapBuilder::memory();
         let mut current_offset = 0;
