@@ -4000,6 +4000,7 @@ void sqlite3CreateIndex(
   int nExtraCol;                   /* Number of extra columns needed */
   char *zExtra = 0;                /* Extra space after the Index object */
   Index *pPk = 0;      /* PRIMARY KEY index for WITHOUT ROWID tables */
+  int vectorIdxRc = 0, skipRefill = 0;
 
   assert( db->pParse==pParse );
   if( pParse->nErr ){
@@ -4307,14 +4308,6 @@ void sqlite3CreateIndex(
     pIndex->aSortOrder[i] = (u8)requestedSortOrder;
   }
 
-
-#ifndef SQLITE_OMIT_VECTOR
-  if( vectorIndexCreate(pParse, pIndex, db->aDb[iDb].zDbSName, pUsing) != SQLITE_OK ) {
-    goto exit_create_index;
-  }
-  idxType = pIndex->idxType; // vectorIndexCreate can update idxType to 4 (VECTOR INDEX)
-#endif
-
   /* Append the table key to the end of the index.  For WITHOUT ROWID
   ** tables (when pPk!=0) this will be the declared PRIMARY KEY.  For
   ** normal tables (when pPk==0) this will be the rowid.
@@ -4340,6 +4333,26 @@ void sqlite3CreateIndex(
   }
   sqlite3DefaultRowEst(pIndex);
   if( pParse->pNewTable==0 ) estimateIndexWidth(pIndex);
+
+#ifndef SQLITE_OMIT_VECTOR
+  // we want to have complete information about index columns before invocation of vectorIndexCreate method
+  vectorIdxRc = vectorIndexCreate(pParse, pIndex, db->aDb[iDb].zDbSName, pUsing);
+  if( vectorIdxRc < 0 ){
+    goto exit_create_index;
+  }
+  if( vectorIdxRc >= 1 ){
+    idxType = SQLITE_IDXTYPE_VECTOR;
+    /*
+     * SQLite can use B-Tree indices in some optimizations (like SELECT COUNT(*) can use any full B-Tree index instead of PK index)
+     * But, SQLite pretty conservative about usage of unordered indices - that's what we need here
+    */
+    pIndex->bUnordered = 1;
+    pIndex->idxType = idxType;
+  }
+  if( vectorIdxRc == 1 ){
+    skipRefill = 1;
+  }
+#endif
 
   /* If this index contains every column of its table, then mark
   ** it as a covering index */
@@ -4515,7 +4528,9 @@ void sqlite3CreateIndex(
       ** to invalidate all pre-compiled statements.
       */
       if( pTblName ){
-        sqlite3RefillIndex(pParse, pIndex, iMem);
+        if( !skipRefill ){
+          sqlite3RefillIndex(pParse, pIndex, iMem);
+        }
         sqlite3ChangeCookie(pParse, iDb);
         sqlite3VdbeAddParseSchemaOp(v, iDb,
             sqlite3MPrintf(db, "name='%q' AND type='index'", pIndex->zName), 0);
@@ -5635,12 +5650,20 @@ KeyInfo *sqlite3KeyInfoOfIndex(Parse *pParse, Index *pIdx){
     pKey = sqlite3KeyInfoAlloc(pParse->db, nCol, 0);
   }
   if( pKey ){
-    iDb = sqlite3SchemaToIndex(pParse->db, pIdx->pSchema);
     assert( sqlite3KeyInfoIsWriteable(pKey) );
-    pKey->zIndexName = sqlite3DbStrDup(pParse->db, pIdx->zName);
+
+    iDb = sqlite3SchemaToIndex(pParse->db, pIdx->pSchema);
     if( 0 <= iDb && iDb < pParse->db->nDb ){
       pKey->zDbSName = sqlite3DbStrDup(pParse->db, pParse->db->aDb[iDb].zDbSName);
+      if( pKey->zDbSName == NULL ){
+        goto out_nomem;
+      }
     }
+    pKey->zIndexName = sqlite3DbStrDup(pParse->db, pIdx->zName);
+    if( pKey->zIndexName == NULL ){
+      goto out_nomem;
+    }
+
     for(i=0; i<nCol; i++){
       const char *zColl = pIdx->azColl[i];
       pKey->aColl[i] = zColl==sqlite3StrBINARY ? 0 :
@@ -5666,6 +5689,11 @@ KeyInfo *sqlite3KeyInfoOfIndex(Parse *pParse, Index *pIdx){
     }
   }
   return pKey;
+out_nomem:
+  if( pKey != NULL ){
+    sqlite3KeyInfoUnref(pKey);
+  }
+  return sqlite3OomFault(pParse->db);
 }
 
 #ifndef SQLITE_OMIT_CTE

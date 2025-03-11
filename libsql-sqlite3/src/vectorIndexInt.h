@@ -30,6 +30,9 @@ struct DiskAnnIndex {
   float pruningAlpha;  /* Alpha parameter for edge pruning during INSERT operation */
   int insertL;         /* Max size of candidate set (L) visited during INSERT operation */
   int searchL;         /* Max size of candidate set (L) visited during SEARCH operation (can be overriden from query in future) */
+
+  int nReads;
+  int nWrites;
 };
 
 /*
@@ -55,8 +58,8 @@ struct BlobSpot {
 
 /* BlobSpot operations */
 int blobSpotCreate(const DiskAnnIndex *pIndex, BlobSpot **ppBlobSpot, u64 nRowid, int nBufferSize, int isWritable);
-int blobSpotReload(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, int nBufferSize);
-int blobSpotFlush(BlobSpot *pBlobSpot);
+int blobSpotReload(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, int nBufferSize);
+int blobSpotFlush(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot);
 void blobSpotFree(BlobSpot *pBlobSpot);
 
 /*
@@ -130,6 +133,8 @@ typedef u8 MetricType;
 #define VECTOR_SEARCH_L_PARAM_ID       9
 #define VECTOR_SEARCH_L_DEFAULT        200
 
+#define VECTOR_MAX_NEIGHBORS_PARAM_ID  10
+
 /* total amount of vector index parameters */
 #define VECTOR_PARAM_IDS_COUNT         9
 
@@ -185,13 +190,19 @@ struct VectorOutRows {
   sqlite3_value **ppValues;
 };
 
+// limit to the sql part which we render in order to perform operations with shadow tables
+// we render this parts of SQL on stack - thats why we have hard limit on this
+// stack simplify memory managment code and also doesn't impose very strict limits here since 128 bytes for column names should be enough for almost all use cases
+#define VECTOR_INDEX_SQL_RENDER_LIMIT 128
+
 void vectorIdxParamsInit(VectorIdxParams *, u8 *, int);
 u64 vectorIdxParamsGetU64(const VectorIdxParams *, char);
 double vectorIdxParamsGetF64(const VectorIdxParams *, char);
 int vectorIdxParamsPutU64(VectorIdxParams *, char, u64);
 int vectorIdxParamsPutF64(VectorIdxParams *, char, double);
 
-int vectorIdxKeyGet(Table*, VectorIdxKey *, const char **);
+int vectorIdxKeyGet(const Index *, VectorIdxKey *, const char **);
+int vectorIdxKeyRowidLike(const VectorIdxKey *);
 int vectorIdxKeyDefsRender(const VectorIdxKey *, const char *, char *, int);
 int vectorIdxKeyNamesRender(int, const char *, char *, int);
 
@@ -202,7 +213,7 @@ i64 vectorInRowLegacyId(const VectorInRow *);
 int vectorInRowPlaceholderRender(const VectorInRow *, char *, int);
 void vectorInRowFree(sqlite3 *, VectorInRow *);
 
-int vectorOutRowsAlloc(sqlite3 *, VectorOutRows *, int, int, char);
+int vectorOutRowsAlloc(sqlite3 *, VectorOutRows *, int, int, int);
 int vectorOutRowsPut(VectorOutRows *, int, int, const u64 *, sqlite3_value *);
 void vectorOutRowsGet(sqlite3_context *, const VectorOutRows *, int, int);
 void vectorOutRowsFree(sqlite3 *, VectorOutRows *);
@@ -212,9 +223,9 @@ int diskAnnClearIndex(sqlite3 *, const char *, const char *);
 int diskAnnDropIndex(sqlite3 *, const char *, const char *);
 int diskAnnOpenIndex(sqlite3 *, const char *, const char *, const VectorIdxParams *, DiskAnnIndex **);
 void diskAnnCloseIndex(DiskAnnIndex *);
-int diskAnnInsert(const DiskAnnIndex *, const VectorInRow *, char **);
-int diskAnnDelete(const DiskAnnIndex *, const VectorInRow *, char **);
-int diskAnnSearch(const DiskAnnIndex *, const Vector *, int, const VectorIdxKey *, VectorOutRows *, char **);
+int diskAnnInsert(DiskAnnIndex *, const VectorInRow *, char **);
+int diskAnnDelete(DiskAnnIndex *, const VectorInRow *, char **);
+int diskAnnSearch(DiskAnnIndex *, const Vector *, int, const VectorIdxKey *, VectorOutRows *, char **);
 
 typedef struct VectorIdxCursor VectorIdxCursor;
 
@@ -224,14 +235,14 @@ typedef struct VectorIdxCursor VectorIdxCursor;
 
 int vectorIdxParseColumnType(const char *, int *, int *, const char **);
 
-int vectorIndexCreate(Parse*, Index*, const char *, const IdList*);
+int vectorIndexCreate(Parse*, const Index*, const char *, const IdList*);
 int vectorIndexClear(sqlite3 *, const char *, const char *);
 int vectorIndexDrop(sqlite3 *, const char *, const char *);
+int vectorIndexSearch(sqlite3 *, const char *, int, sqlite3_value **, VectorOutRows *, int *, int *, char **);
 int vectorIndexCursorInit(sqlite3 *, const char *, const char *, VectorIdxCursor **);
-void vectorIndexCursorClose(sqlite3 *, VectorIdxCursor *);
+void vectorIndexCursorClose(sqlite3 *, VectorIdxCursor *, int *, int *);
 int vectorIndexInsert(VectorIdxCursor *, const UnpackedRecord *, char **);
 int vectorIndexDelete(VectorIdxCursor *, const UnpackedRecord *, char **);
-int vectorIndexSearch(sqlite3 *, const char *, int, sqlite3_value **, VectorOutRows *, char **);
 
 #ifdef __cplusplus
 }  /* end of the 'extern "C"' block */

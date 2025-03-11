@@ -23550,6 +23550,7 @@ struct VdbeCursor {
   Bool isEphemeral:1;     /* True for an ephemeral table */
   Bool useRandomRowid:1;  /* Generate new record numbers semi-randomly */
   Bool isOrdered:1;       /* True if the table is not BTREE_UNORDERED */
+  Bool isTracked:1;       /* True if cursor created for virtual table which track reads/writes */
   Bool noReuse:1;         /* OpenEphemeral may not reuse this cursor */
   Bool colCache:1;        /* pCache pointer is initialized and non-NULL */
   u16 seekHit;            /* See the OP_SeekHit and OP_IfNoHope opcodes */
@@ -23981,6 +23982,8 @@ struct Vdbe {
 #endif
 };
 
+void libsql_inc_row_read(Vdbe *p, int count);
+void libsql_inc_row_written(Vdbe *p, int count);
 /*
 ** The following are allowed values for Vdbe.eVdbeState
 */
@@ -84936,6 +84939,9 @@ struct DiskAnnIndex {
   float pruningAlpha;  /* Alpha parameter for edge pruning during INSERT operation */
   int insertL;         /* Max size of candidate set (L) visited during INSERT operation */
   int searchL;         /* Max size of candidate set (L) visited during SEARCH operation (can be overriden from query in future) */
+
+  int nReads;
+  int nWrites;
 };
 
 /*
@@ -84961,8 +84967,8 @@ struct BlobSpot {
 
 /* BlobSpot operations */
 int blobSpotCreate(const DiskAnnIndex *pIndex, BlobSpot **ppBlobSpot, u64 nRowid, int nBufferSize, int isWritable);
-int blobSpotReload(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, int nBufferSize);
-int blobSpotFlush(BlobSpot *pBlobSpot);
+int blobSpotReload(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, int nBufferSize);
+int blobSpotFlush(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot);
 void blobSpotFree(BlobSpot *pBlobSpot);
 
 /*
@@ -85036,6 +85042,8 @@ typedef u8 MetricType;
 #define VECTOR_SEARCH_L_PARAM_ID       9
 #define VECTOR_SEARCH_L_DEFAULT        200
 
+#define VECTOR_MAX_NEIGHBORS_PARAM_ID  10
+
 /* total amount of vector index parameters */
 #define VECTOR_PARAM_IDS_COUNT         9
 
@@ -85091,13 +85099,19 @@ struct VectorOutRows {
   sqlite3_value **ppValues;
 };
 
+// limit to the sql part which we render in order to perform operations with shadow tables
+// we render this parts of SQL on stack - thats why we have hard limit on this
+// stack simplify memory managment code and also doesn't impose very strict limits here since 128 bytes for column names should be enough for almost all use cases
+#define VECTOR_INDEX_SQL_RENDER_LIMIT 128
+
 void vectorIdxParamsInit(VectorIdxParams *, u8 *, int);
 u64 vectorIdxParamsGetU64(const VectorIdxParams *, char);
 double vectorIdxParamsGetF64(const VectorIdxParams *, char);
 int vectorIdxParamsPutU64(VectorIdxParams *, char, u64);
 int vectorIdxParamsPutF64(VectorIdxParams *, char, double);
 
-int vectorIdxKeyGet(Table*, VectorIdxKey *, const char **);
+int vectorIdxKeyGet(const Index *, VectorIdxKey *, const char **);
+int vectorIdxKeyRowidLike(const VectorIdxKey *);
 int vectorIdxKeyDefsRender(const VectorIdxKey *, const char *, char *, int);
 int vectorIdxKeyNamesRender(int, const char *, char *, int);
 
@@ -85108,7 +85122,7 @@ i64 vectorInRowLegacyId(const VectorInRow *);
 int vectorInRowPlaceholderRender(const VectorInRow *, char *, int);
 void vectorInRowFree(sqlite3 *, VectorInRow *);
 
-int vectorOutRowsAlloc(sqlite3 *, VectorOutRows *, int, int, char);
+int vectorOutRowsAlloc(sqlite3 *, VectorOutRows *, int, int, int);
 int vectorOutRowsPut(VectorOutRows *, int, int, const u64 *, sqlite3_value *);
 void vectorOutRowsGet(sqlite3_context *, const VectorOutRows *, int, int);
 void vectorOutRowsFree(sqlite3 *, VectorOutRows *);
@@ -85118,9 +85132,9 @@ int diskAnnClearIndex(sqlite3 *, const char *, const char *);
 int diskAnnDropIndex(sqlite3 *, const char *, const char *);
 int diskAnnOpenIndex(sqlite3 *, const char *, const char *, const VectorIdxParams *, DiskAnnIndex **);
 void diskAnnCloseIndex(DiskAnnIndex *);
-int diskAnnInsert(const DiskAnnIndex *, const VectorInRow *, char **);
-int diskAnnDelete(const DiskAnnIndex *, const VectorInRow *, char **);
-int diskAnnSearch(const DiskAnnIndex *, const Vector *, int, const VectorIdxKey *, VectorOutRows *, char **);
+int diskAnnInsert(DiskAnnIndex *, const VectorInRow *, char **);
+int diskAnnDelete(DiskAnnIndex *, const VectorInRow *, char **);
+int diskAnnSearch(DiskAnnIndex *, const Vector *, int, const VectorIdxKey *, VectorOutRows *, char **);
 
 typedef struct VectorIdxCursor VectorIdxCursor;
 
@@ -85130,14 +85144,14 @@ typedef struct VectorIdxCursor VectorIdxCursor;
 
 int vectorIdxParseColumnType(const char *, int *, int *, const char **);
 
-int vectorIndexCreate(Parse*, Index*, const char *, const IdList*);
+int vectorIndexCreate(Parse*, const Index*, const char *, const IdList*);
 int vectorIndexClear(sqlite3 *, const char *, const char *);
 int vectorIndexDrop(sqlite3 *, const char *, const char *);
+int vectorIndexSearch(sqlite3 *, const char *, int, sqlite3_value **, VectorOutRows *, int *, int *, char **);
 int vectorIndexCursorInit(sqlite3 *, const char *, const char *, VectorIdxCursor **);
-void vectorIndexCursorClose(sqlite3 *, VectorIdxCursor *);
+void vectorIndexCursorClose(sqlite3 *, VectorIdxCursor *, int *, int *);
 int vectorIndexInsert(VectorIdxCursor *, const UnpackedRecord *, char **);
 int vectorIndexDelete(VectorIdxCursor *, const UnpackedRecord *, char **);
-int vectorIndexSearch(sqlite3 *, const char *, int, sqlite3_value **, VectorOutRows *, char **);
 
 #if 0
 }  /* end of the 'extern "C"' block */
@@ -87844,6 +87858,13 @@ SQLITE_PRIVATE void sqlite3VdbeMakeReady(
 SQLITE_PRIVATE void sqlite3VdbeFreeCursor(Vdbe *p, VdbeCursor *pCx){
   if( pCx ) sqlite3VdbeFreeCursorNN(p,pCx);
 }
+
+struct sqlite3_vtab_cursor_tracked {
+  sqlite3_vtab_cursor base;  /* Base class - must be first */
+  int nReads;                /* Number of row read from the storage backing virtual table */
+  int nWrites;               /* Number of row written to the storage backing virtual table */
+};
+
 static SQLITE_NOINLINE void freeCursorWithCache(Vdbe *p, VdbeCursor *pCx){
   VdbeTxtBlbCache *pCache = pCx->pCache;
   assert( pCx->colCache );
@@ -87873,9 +87894,15 @@ SQLITE_PRIVATE void sqlite3VdbeFreeCursorNN(Vdbe *p, VdbeCursor *pCx){
     }
 #ifndef SQLITE_OMIT_VIRTUALTABLE
     case CURTYPE_VTAB: {
+      struct sqlite3_vtab_cursor_tracked *pTracked;
       sqlite3_vtab_cursor *pVCur = pCx->uc.pVCur;
       const sqlite3_module *pModule = pVCur->pVtab->pModule;
       assert( pVCur->pVtab->nRef>0 );
+      if( pCx->isTracked ){
+        pTracked = (struct sqlite3_vtab_cursor_tracked*)pVCur;
+        libsql_inc_row_read(p, pTracked->nReads);
+        libsql_inc_row_written(p, pTracked->nWrites);
+      }
       pVCur->pVtab->nRef--;
       pModule->xClose(pVCur);
       break;
@@ -87883,7 +87910,10 @@ SQLITE_PRIVATE void sqlite3VdbeFreeCursorNN(Vdbe *p, VdbeCursor *pCx){
 #endif
 #ifndef SQLITE_OMIT_VECTOR
     case CURTYPE_VECTOR_IDX: {
-      vectorIndexCursorClose(p->db, pCx->uc.pVecIdx);
+      int nReads, nWrites;
+      vectorIndexCursorClose(p->db, pCx->uc.pVecIdx, &nReads, &nWrites);
+      libsql_inc_row_read(p, nReads);
+      libsql_inc_row_written(p, nWrites);
       break;
     }
 #endif
@@ -94173,12 +94203,12 @@ static u32 saturating_add(u32 lhs, u32 rhs) {
     return (u32)MIN(0xFFFFFFFF, sum);
 }
 
-static void inc_row_read(Vdbe *p, int count) {
+void libsql_inc_row_read(Vdbe *p, int count) {
     u32 *read = &p->aLibsqlCounter[LIBSQL_STMTSTATUS_ROWS_READ - LIBSQL_STMTSTATUS_BASE];
     *read = saturating_add(*read, count);
 }
 
-static void inc_row_written(Vdbe *p, int count) {
+void libsql_inc_row_written(Vdbe *p, int count) {
     u32 *write = &p->aLibsqlCounter[LIBSQL_STMTSTATUS_ROWS_WRITTEN - LIBSQL_STMTSTATUS_BASE];
     *write = saturating_add(*write, count);
 }
@@ -97098,7 +97128,7 @@ case OP_Count: {         /* out2 */
     nEntry = 0;  /* Not needed.  Only used to silence a warning. */
     i64 nPages = 0;
     rc = sqlite3BtreeCount(db, pCrsr, &nEntry, &nPages);
-    inc_row_read(p, nPages);
+    libsql_inc_row_read(p, nPages);
     if( rc ) goto abort_due_to_error;
   }
   pOut = out2Prerelease(p, pOp);
@@ -98300,7 +98330,7 @@ case OP_SeekGT: {       /* jump, in3, group, ncycle */
       goto seek_not_found;
     }
   }
-  inc_row_read(p, 1);
+  libsql_inc_row_read(p, 1);
 #ifdef SQLITE_TEST
   sqlite3_search_count++;
 #endif
@@ -98870,7 +98900,7 @@ notExistsWithKey:
   pC->deferredMoveto = 0;
   VdbeBranchTaken(res!=0,2);
   pC->seekResult = res;
-  inc_row_read(p, 1);
+  libsql_inc_row_read(p, 1);
   if( res!=0 ){
     assert( rc==SQLITE_OK );
     if( pOp->p2==0 ){
@@ -99172,7 +99202,7 @@ case OP_Insert: {
 #endif
 
   assert( (pOp->p5 & OPFLAG_LASTROWID)==0 || (pOp->p5 & OPFLAG_NCHANGE)!=0 );
-  if (!pC->isEphemeral) inc_row_written(p, 1);
+  if (!pC->isEphemeral) libsql_inc_row_written(p, 1);
 
   if( pOp->p5 & OPFLAG_NCHANGE ){
     p->nChange++;
@@ -99367,7 +99397,7 @@ case OP_Delete: {
 
   /* Invoke the update-hook if required. */
   if( opflags & OPFLAG_NCHANGE ){
-    if (!pC->isEphemeral) inc_row_written(p, 1);
+    if (!pC->isEphemeral) libsql_inc_row_written(p, 1);
     p->nChange++;
     if( db->xUpdateCallback && ALWAYS(pTab!=0) && HasRowid(pTab) ){
       db->xUpdateCallback(db->pUpdateArg, SQLITE_DELETE, zDb, pTab->zName,
@@ -99655,7 +99685,7 @@ case OP_Last: {              /* jump, ncycle */
   pC->deferredMoveto = 0;
   pC->cacheStatus = CACHE_STALE;
   if( rc ) goto abort_due_to_error;
-  inc_row_read(p, 1);
+  libsql_inc_row_read(p, 1);
   if( pOp->p2>0 ){
     VdbeBranchTaken(res!=0,2);
     if( res ) goto jump_to_p2;
@@ -99765,7 +99795,7 @@ case OP_Rewind: {        /* jump, ncycle */
   }
   if( rc ) goto abort_due_to_error;
   pC->nullRow = (u8)res;
-  inc_row_read(p, 1);
+  libsql_inc_row_read(p, 1);
   if( pOp->p2>0 ){
     VdbeBranchTaken(res!=0,2);
     if( res ) goto jump_to_p2;
@@ -99871,7 +99901,7 @@ next_tail:
   if( rc==SQLITE_OK ){
     pC->nullRow = 0;
     p->aCounter[pOp->p5]++;
-  inc_row_read(p, 1);
+  libsql_inc_row_read(p, 1);
 #ifdef SQLITE_TEST
     sqlite3_search_count++;
 #endif
@@ -99923,7 +99953,7 @@ case OP_IdxInsert: {        /* in2 */
   pIn2 = &aMem[pOp->p2];
   assert( (pIn2->flags & MEM_Blob) || (pOp->p5 & OPFLAG_PREFORMAT) );
   if( pOp->p5 & OPFLAG_NCHANGE ) p->nChange++;
-  if (!pC->isEphemeral) inc_row_written(p, 1);
+  if (!pC->isEphemeral) libsql_inc_row_written(p, 1);
 #ifndef SQLITE_OMIT_VECTOR
   if( isVectorCursor(pC) ) {
     UnpackedRecord idxKeyStatic;
@@ -100375,7 +100405,7 @@ case OP_Clear: {
   rc = sqlite3BtreeClearTable(db->aDb[pOp->p2].pBt, (u32)pOp->p1, &nChange);
   if( pOp->p3 ){
     p->nChange += nChange;
-    inc_row_written(p, nChange);
+    libsql_inc_row_written(p, nChange);
     if( pOp->p3>0 ){
       assert( memIsValid(&aMem[pOp->p3]) );
       memAboutToChange(p, &aMem[pOp->p3]);
@@ -101688,6 +101718,11 @@ case OP_VOpen: {             /* ncycle */
   if( pCur ){
     pCur->uc.pVCur = pVCur;
     pVtab->nRef++;
+#ifndef SQLITE_OMIT_VECTOR
+    if( sqlite3StrICmp(pOp->p4.pVtab->pMod->zName, VECTOR_INDEX_VTAB_NAME) == 0 ){
+      pCur->isTracked = 1;
+    }
+#endif
   }else{
     assert( db->mallocFailed );
     pModule->xClose(pVCur);
@@ -101962,7 +101997,7 @@ case OP_VNext: {   /* jump, ncycle */
   rc = pModule->xNext(pCur->uc.pVCur);
   sqlite3VtabImportErrmsg(p, pVtab);
   if( rc ) goto abort_due_to_error;
-  inc_row_read(p, 1);
+  libsql_inc_row_read(p, 1);
   res = pModule->xEof(pCur->uc.pVCur);
   VdbeBranchTaken(!res,2);
   if( !res ){
@@ -102084,7 +102119,7 @@ case OP_VUpdate: {
         p->errorAction = ((pOp->p5==OE_Replace) ? OE_Abort : pOp->p5);
       }
     }else{
-        inc_row_written(p, 1);
+        libsql_inc_row_written(p, 1);
         p->nChange++;
     }
     if( rc ) goto abort_due_to_error;
@@ -125791,6 +125826,7 @@ SQLITE_PRIVATE void sqlite3CreateIndex(
   int nExtraCol;                   /* Number of extra columns needed */
   char *zExtra = 0;                /* Extra space after the Index object */
   Index *pPk = 0;      /* PRIMARY KEY index for WITHOUT ROWID tables */
+  int vectorIdxRc = 0, skipRefill = 0;
 
   assert( db->pParse==pParse );
   if( pParse->nErr ){
@@ -126098,14 +126134,6 @@ SQLITE_PRIVATE void sqlite3CreateIndex(
     pIndex->aSortOrder[i] = (u8)requestedSortOrder;
   }
 
-
-#ifndef SQLITE_OMIT_VECTOR
-  if( vectorIndexCreate(pParse, pIndex, db->aDb[iDb].zDbSName, pUsing) != SQLITE_OK ) {
-    goto exit_create_index;
-  }
-  idxType = pIndex->idxType; // vectorIndexCreate can update idxType to 4 (VECTOR INDEX)
-#endif
-
   /* Append the table key to the end of the index.  For WITHOUT ROWID
   ** tables (when pPk!=0) this will be the declared PRIMARY KEY.  For
   ** normal tables (when pPk==0) this will be the rowid.
@@ -126131,6 +126159,26 @@ SQLITE_PRIVATE void sqlite3CreateIndex(
   }
   sqlite3DefaultRowEst(pIndex);
   if( pParse->pNewTable==0 ) estimateIndexWidth(pIndex);
+
+#ifndef SQLITE_OMIT_VECTOR
+  // we want to have complete information about index columns before invocation of vectorIndexCreate method
+  vectorIdxRc = vectorIndexCreate(pParse, pIndex, db->aDb[iDb].zDbSName, pUsing);
+  if( vectorIdxRc < 0 ){
+    goto exit_create_index;
+  }
+  if( vectorIdxRc >= 1 ){
+    idxType = SQLITE_IDXTYPE_VECTOR;
+    /*
+     * SQLite can use B-Tree indices in some optimizations (like SELECT COUNT(*) can use any full B-Tree index instead of PK index)
+     * But, SQLite pretty conservative about usage of unordered indices - that's what we need here
+    */
+    pIndex->bUnordered = 1;
+    pIndex->idxType = idxType;
+  }
+  if( vectorIdxRc == 1 ){
+    skipRefill = 1;
+  }
+#endif
 
   /* If this index contains every column of its table, then mark
   ** it as a covering index */
@@ -126306,7 +126354,9 @@ SQLITE_PRIVATE void sqlite3CreateIndex(
       ** to invalidate all pre-compiled statements.
       */
       if( pTblName ){
-        sqlite3RefillIndex(pParse, pIndex, iMem);
+        if( !skipRefill ){
+          sqlite3RefillIndex(pParse, pIndex, iMem);
+        }
         sqlite3ChangeCookie(pParse, iDb);
         sqlite3VdbeAddParseSchemaOp(v, iDb,
             sqlite3MPrintf(db, "name='%q' AND type='index'", pIndex->zName), 0);
@@ -127426,12 +127476,20 @@ SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoOfIndex(Parse *pParse, Index *pIdx){
     pKey = sqlite3KeyInfoAlloc(pParse->db, nCol, 0);
   }
   if( pKey ){
-    iDb = sqlite3SchemaToIndex(pParse->db, pIdx->pSchema);
     assert( sqlite3KeyInfoIsWriteable(pKey) );
-    pKey->zIndexName = sqlite3DbStrDup(pParse->db, pIdx->zName);
+
+    iDb = sqlite3SchemaToIndex(pParse->db, pIdx->pSchema);
     if( 0 <= iDb && iDb < pParse->db->nDb ){
       pKey->zDbSName = sqlite3DbStrDup(pParse->db, pParse->db->aDb[iDb].zDbSName);
+      if( pKey->zDbSName == NULL ){
+        goto out_nomem;
+      }
     }
+    pKey->zIndexName = sqlite3DbStrDup(pParse->db, pIdx->zName);
+    if( pKey->zIndexName == NULL ){
+      goto out_nomem;
+    }
+
     for(i=0; i<nCol; i++){
       const char *zColl = pIdx->azColl[i];
       pKey->aColl[i] = zColl==sqlite3StrBINARY ? 0 :
@@ -127457,6 +127515,11 @@ SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoOfIndex(Parse *pParse, Index *pIdx){
     }
   }
   return pKey;
+out_nomem:
+  if( pKey != NULL ){
+    sqlite3KeyInfoUnref(pKey);
+  }
+  return sqlite3OomFault(pParse->db);
 }
 
 #ifndef SQLITE_OMIT_CTE
@@ -208907,6 +208970,22 @@ float vectorDistanceL2(const Vector *pVector1, const Vector *pVector2){
   return 0;
 }
 
+SQLITE_API const char *sqlite3_type_repr(int type){
+  switch( type ){
+    case SQLITE_NULL:
+      return "NULL";
+    case SQLITE_INTEGER:
+      return "INTEGER";
+    case SQLITE_FLOAT:
+      return "FLOAT";
+    case SQLITE_BLOB:
+      return "BLOB";
+    case SQLITE_TEXT:
+      return "TEXT";
+    default:
+      return "UNKNOWN";
+  }
+}
 /*
  * Parses vector from text representation (e.g. '[1,2,3]'); vector type must be set
 */
@@ -208926,16 +209005,12 @@ static int vectorParseSqliteText(
   int iBuf = 0;
 
   assert( pVector->type == VECTOR_TYPE_FLOAT32 || pVector->type == VECTOR_TYPE_FLOAT64 );
+  assert( sqlite3_value_type(arg) == SQLITE_TEXT );
 
   if( pVector->type == VECTOR_TYPE_FLOAT32 ){
     elemsFloat = pVector->data;
   } else if( pVector->type == VECTOR_TYPE_FLOAT64 ){
     elemsDouble = pVector->data;
-  }
-
-  if( sqlite3_value_type(arg) != SQLITE_TEXT ){
-    *pzErrMsg = sqlite3_mprintf("invalid vector: not a text type");
-    goto error;
   }
 
   pzText = sqlite3_value_text(arg);
@@ -208945,7 +209020,7 @@ static int vectorParseSqliteText(
     pzText++;
 
   if( *pzText != '[' ){
-    *pzErrMsg = sqlite3_mprintf("invalid vector: doesn't start with '['");
+    *pzErrMsg = sqlite3_mprintf("vector: must start with '['");
     goto error;
   }
   pzText++;
@@ -208960,7 +209035,7 @@ static int vectorParseSqliteText(
     }
     if( this != ',' && this != ']' ){
       if( iBuf > MAX_FLOAT_CHAR_SZ ){
-        *pzErrMsg = sqlite3_mprintf("float too big while parsing vector: '%s'", valueBuf);
+        *pzErrMsg = sqlite3_mprintf("vector: float string length exceeded %d characters: '%s'", MAX_FLOAT_CHAR_SZ, valueBuf);
         goto error;
       }
       valueBuf[iBuf++] = this;
@@ -208971,11 +209046,11 @@ static int vectorParseSqliteText(
       break;
     }
     if( sqlite3AtoF(valueBuf, &elem, iBuf, SQLITE_UTF8) <= 0 ){
-      *pzErrMsg = sqlite3_mprintf("invalid number: '%s'", valueBuf);
+      *pzErrMsg = sqlite3_mprintf("vector: invalid float at position %d: '%s'", iElem, valueBuf);
       goto error;
     }
     if( iElem >= MAX_VECTOR_SZ ){
-      *pzErrMsg = sqlite3_mprintf("vector is larger than the maximum: (%d)", MAX_VECTOR_SZ);
+      *pzErrMsg = sqlite3_mprintf("vector: max size exceeded %d", MAX_VECTOR_SZ);
       goto error;
     }
     // clear only first bufidx positions - all other are zero
@@ -208994,7 +209069,7 @@ static int vectorParseSqliteText(
     pzText++;
 
   if( *pzText != ']' ){
-    *pzErrMsg = sqlite3_mprintf("malformed vector, doesn't end with ']'");
+    *pzErrMsg = sqlite3_mprintf("vector: must end with ']'");
     goto error;
   }
   pzText++;
@@ -209003,7 +209078,7 @@ static int vectorParseSqliteText(
     pzText++;
 
   if( *pzText != '\0' ){
-    *pzErrMsg = sqlite3_mprintf("malformed vector, extra data after closing ']'");
+    *pzErrMsg = sqlite3_mprintf("vector: non-space symbols after closing ']' are forbidden");
     goto error;
   }
   pVector->dims = iElem;
@@ -209048,11 +209123,11 @@ int detectBlobVectorParameters(sqlite3_value *arg, int *pType, int *pDims, char 
   } else if( *pType == VECTOR_TYPE_FLOAT64 ){
     *pDims = nBlobSize / sizeof(double);
   } else{
-    *pzErrMsg = sqlite3_mprintf("invalid binary vector: unexpected type: %d", *pType);
+    *pzErrMsg = sqlite3_mprintf("vector: unexpected binary type: got %d, expected %d or %d", *pType, VECTOR_TYPE_FLOAT32, VECTOR_TYPE_FLOAT64);
     return -1;
   }
   if( *pDims > MAX_VECTOR_SZ ){
-    *pzErrMsg = sqlite3_mprintf("invalid binary vector: max size exceeded: %d > %d", *pDims, MAX_VECTOR_SZ);
+    *pzErrMsg = sqlite3_mprintf("vector: max size exceeded: %d > %d", *pDims, MAX_VECTOR_SZ);
     return -1;
   }
   return 0;
@@ -209094,15 +209169,12 @@ int detectTextVectorParameters(sqlite3_value *arg, int typeHint, int *pType, int
 
 int detectVectorParameters(sqlite3_value *arg, int typeHint, int *pType, int *pDims, char **pzErrMsg) {
   switch( sqlite3_value_type(arg) ){
-    case SQLITE_NULL:
-      *pzErrMsg = sqlite3_mprintf("invalid vector: NULL");
-      return -1;
     case SQLITE_BLOB:
       return detectBlobVectorParameters(arg, pType, pDims, pzErrMsg);
     case SQLITE_TEXT:
       return detectTextVectorParameters(arg, typeHint, pType, pDims, pzErrMsg);
     default:
-      *pzErrMsg = sqlite3_mprintf("invalid vector: not a text or blob type");
+      *pzErrMsg = sqlite3_mprintf("vector: unexpected value type: got %s, expected TEXT or BLOB", sqlite3_type_repr(sqlite3_value_type(arg)));
       return -1;
   }
 }
@@ -209113,15 +209185,12 @@ int vectorParse(
   char **pzErrMsg
 ){
   switch( sqlite3_value_type(arg) ){
-    case SQLITE_NULL:
-      *pzErrMsg = sqlite3_mprintf("invalid vector: NULL");
-      return -1;
     case SQLITE_BLOB:
       return vectorParseSqliteBlob(arg, pVector, pzErrMsg);
     case SQLITE_TEXT:
       return vectorParseSqliteText(arg, pVector, pzErrMsg);
     default:
-      *pzErrMsg = sqlite3_mprintf("invalid vector: not a text or blob type");
+      *pzErrMsg = sqlite3_mprintf("vector: unexpected value type: got %s, expected TEXT or BLOB", sqlite3_type_repr(sqlite3_value_type(arg)));
       return -1;
   }
 }
@@ -209322,11 +209391,15 @@ static void vectorDistanceCosFunc(
     goto out_free;
   }
   if( type1 != type2 ){
-    sqlite3_result_error(context, "vectors must have the same type", -1);
+    pzErrMsg = sqlite3_mprintf("vector_distance_cos: vectors must have the same type: %d != %d", type1, type2);
+    sqlite3_result_error(context, pzErrMsg, -1);
+    sqlite3_free(pzErrMsg);
     goto out_free;
   }
   if( dims1 != dims2 ){
-    sqlite3_result_error(context, "vectors must have the same length", -1);
+    pzErrMsg = sqlite3_mprintf("vector_distance_cos: vectors must have the same length: %d != %d", dims1, dims2);
+    sqlite3_result_error(context, pzErrMsg, -1);
+    sqlite3_free(pzErrMsg);
     goto out_free;
   }
   pVector1 = vectorContextAlloc(context, type1, dims1);
@@ -209436,6 +209509,7 @@ SQLITE_PRIVATE void sqlite3RegisterVectorFunctions(void){
 */
 #ifndef SQLITE_OMIT_VECTOR
 
+/* #include "math.h" */
 /* #include "sqliteInt.h" */
 /* #include "vectorIndexInt.h" */
 
@@ -209450,6 +209524,11 @@ SQLITE_PRIVATE void sqlite3RegisterVectorFunctions(void){
 // we render this parts of SQL on stack - thats why we have hard limit on this
 // stack simplify memory managment code and also doesn't impose very strict limits here since 128 bytes for column names should be enough for almost all use cases
 #define DISKANN_SQL_RENDER_LIMIT 128
+
+// limit to the maximum size of DiskANN block (128 MB)
+// even with 1MB we can store tens of thousands of nodes in several GBs - which is already too much
+// but we are "generous" here and allow user to store up to 128MB blobs
+#define DISKANN_MAX_BLOCK_SZ 134217728
 
 /*
  * Due to historical reasons parameter for index block size were stored as u16 value and divided by 512 (2^9)
@@ -209581,7 +209660,7 @@ out:
   return rc;
 }
 
-int blobSpotReload(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, int nBufferSize) {
+int blobSpotReload(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, int nBufferSize) {
   int rc;
 
   DiskAnnTrace(("blob spot reload: rowid=%lld\n", nRowid));
@@ -209623,6 +209702,7 @@ int blobSpotReload(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, 
   if( rc != SQLITE_OK ){
     goto abort;
   }
+  pIndex->nReads++;
   pBlobSpot->isInitialized = 1;
   return SQLITE_OK;
 
@@ -209632,8 +209712,13 @@ abort:
   return rc;
 }
 
-int blobSpotFlush(BlobSpot *pBlobSpot) {
-  return sqlite3_blob_write(pBlobSpot->pBlob, pBlobSpot->pBuffer, pBlobSpot->nBufferSize, 0);
+int blobSpotFlush(DiskAnnIndex* pIndex, BlobSpot *pBlobSpot) {
+  int rc = sqlite3_blob_write(pBlobSpot->pBlob, pBlobSpot->pBuffer, pBlobSpot->nBufferSize, 0);
+  if( rc != SQLITE_OK ){
+    return rc;
+  }
+  pIndex->nWrites++;
+  return rc;
 }
 
 void blobSpotFree(BlobSpot *pBlobSpot) {
@@ -209650,8 +209735,16 @@ void blobSpotFree(BlobSpot *pBlobSpot) {
 ** Layout specific utilities
 **************************************************************************/
 
+int nodeEdgeOverhead(int nEdgeVectorSize){
+  return nEdgeVectorSize + VECTOR_EDGE_METADATA_SIZE;
+}
+
+int nodeOverhead(int nNodeVectorSize){
+  return nNodeVectorSize + VECTOR_NODE_METADATA_SIZE;
+}
+
 int nodeEdgesMaxCount(const DiskAnnIndex *pIndex){
-  unsigned int nMaxEdges = (pIndex->nBlockSize - pIndex->nNodeVectorSize - VECTOR_NODE_METADATA_SIZE) / (pIndex->nEdgeVectorSize + VECTOR_EDGE_METADATA_SIZE);
+  unsigned int nMaxEdges = (pIndex->nBlockSize - nodeOverhead(pIndex->nNodeVectorSize)) / nodeEdgeOverhead(pIndex->nEdgeVectorSize);
   assert( nMaxEdges > 0);
   return nMaxEdges;
 }
@@ -209806,9 +209899,11 @@ int diskAnnCreateIndex(
   VectorIdxParams *pParams
 ){
   int rc;
+  int type, dims;
+  u64 maxNeighborsParam, blockSizeBytes;
   char *zSql;
-  char columnSqlDefs[DISKANN_SQL_RENDER_LIMIT]; // definition of columns (e.g. index_key INTEGER BINARY, index_key1 TEXT, ...)
-  char columnSqlNames[DISKANN_SQL_RENDER_LIMIT]; // just column names (e.g. index_key, index_key1, index_key2, ...)
+  char columnSqlDefs[VECTOR_INDEX_SQL_RENDER_LIMIT]; // definition of columns (e.g. index_key INTEGER BINARY, index_key1 TEXT, ...)
+  char columnSqlNames[VECTOR_INDEX_SQL_RENDER_LIMIT]; // just column names (e.g. index_key, index_key1, index_key2, ...)
   if( vectorIdxKeyDefsRender(pKey, "index_key", columnSqlDefs, sizeof(columnSqlDefs)) != 0 ){
     return SQLITE_ERROR;
   }
@@ -209818,13 +209913,31 @@ int diskAnnCreateIndex(
   if( vectorIdxParamsPutU64(pParams, VECTOR_INDEX_TYPE_PARAM_ID, VECTOR_INDEX_TYPE_DISKANN) != 0 ){
     return SQLITE_ERROR;
   }
+  type = vectorIdxParamsGetU64(pParams, VECTOR_TYPE_PARAM_ID);
+  if( type == 0 ){
+    return SQLITE_ERROR;
+  }
+  dims = vectorIdxParamsGetU64(pParams, VECTOR_DIM_PARAM_ID);
+  if( dims == 0 ){
+    return SQLITE_ERROR;
+  }
+  assert( 0 < dims && dims <= MAX_VECTOR_SZ );
+
+  maxNeighborsParam = vectorIdxParamsGetU64(pParams, VECTOR_MAX_NEIGHBORS_PARAM_ID);
+  if( maxNeighborsParam == 0 ){
+    // 3 D**(1/2) gives good recall values (90%+)
+    // we also want to keep disk overhead at moderate level - 50x of the disk size increase is the current upper bound
+    maxNeighborsParam = MIN(3 * ((int)(sqrt(dims)) + 1), (50 * nodeOverhead(vectorDataSize(type, dims))) / nodeEdgeOverhead(vectorDataSize(type, dims)) + 1);
+  }
+  blockSizeBytes = nodeOverhead(vectorDataSize(type, dims)) + maxNeighborsParam * (u64)nodeEdgeOverhead(vectorDataSize(type, dims));
+  if( blockSizeBytes > DISKANN_MAX_BLOCK_SZ ){
+    return SQLITE_ERROR;
+  }
+  if( vectorIdxParamsPutU64(pParams, VECTOR_BLOCK_SIZE_PARAM_ID, MAX(256, blockSizeBytes))  != 0 ){
+    return SQLITE_ERROR;
+  }
   if( vectorIdxParamsGetU64(pParams, VECTOR_METRIC_TYPE_PARAM_ID) == 0 ){
     if( vectorIdxParamsPutU64(pParams, VECTOR_METRIC_TYPE_PARAM_ID, VECTOR_METRIC_TYPE_COS) != 0 ){
-      return SQLITE_ERROR;
-    }
-  }
-  if( vectorIdxParamsGetU64(pParams, VECTOR_BLOCK_SIZE_PARAM_ID) == 0 ){
-    if( vectorIdxParamsPutU64(pParams, VECTOR_BLOCK_SIZE_PARAM_ID, VECTOR_BLOCK_SIZE_DEFAULT) != 0 ){
       return SQLITE_ERROR;
     }
   }
@@ -209843,14 +209956,29 @@ int diskAnnCreateIndex(
       return SQLITE_ERROR;
     }
   }
-  zSql = sqlite3MPrintf(
-      db,
-      "CREATE TABLE IF NOT EXISTS \"%w\".%s_shadow (%s, data BLOB, PRIMARY KEY (%s))",
-      zDbSName,
-      zIdxName,
-      columnSqlDefs,
-      columnSqlNames
-  );
+  // we want to preserve rowid - so it must be explicit in the schema
+  // also, we don't want to store redundant set of fields - so the strategy is like that:
+  // 1. If we have single PK with INTEGER affinity and BINARY collation we only need single PK of same type
+  // 2. In other case we need rowid PK and unique index over other fields
+  if( vectorIdxKeyRowidLike(pKey) ){
+    zSql = sqlite3MPrintf(
+        db,
+        "CREATE TABLE IF NOT EXISTS \"%w\".%s_shadow (%s, data BLOB, PRIMARY KEY (%s))",
+        zDbSName,
+        zIdxName,
+        columnSqlDefs,
+        columnSqlNames
+        );
+  }else{
+    zSql = sqlite3MPrintf(
+        db,
+        "CREATE TABLE IF NOT EXISTS \"%w\".%s_shadow (rowid INTEGER PRIMARY KEY, %s, data BLOB, UNIQUE (%s))",
+        zDbSName,
+        zIdxName,
+        columnSqlDefs,
+        columnSqlNames
+        );
+  }
   rc = sqlite3_exec(db, zSql, 0, 0, 0);
   sqlite3DbFree(db, zSql);
   return rc;
@@ -209923,8 +210051,8 @@ static int diskAnnGetShadowRowid(const DiskAnnIndex *pIndex, const VectorInRow *
   sqlite3_stmt *pStmt = NULL;
   char *zSql = NULL;
 
-  char columnSqlNames[DISKANN_SQL_RENDER_LIMIT]; // just column names (e.g. index_key, index_key1, index_key2, ...)
-  char columnSqlPlaceholders[DISKANN_SQL_RENDER_LIMIT]; // just placeholders (e.g. ?,?,?, ...)
+  char columnSqlNames[VECTOR_INDEX_SQL_RENDER_LIMIT]; // just column names (e.g. index_key, index_key1, index_key2, ...)
+  char columnSqlPlaceholders[VECTOR_INDEX_SQL_RENDER_LIMIT]; // just placeholders (e.g. ?,?,?, ...)
   if( vectorIdxKeyNamesRender(pInRow->nKeys, "index_key", columnSqlNames, sizeof(columnSqlNames)) != 0 ){
     rc = SQLITE_ERROR;
     goto out;
@@ -209981,7 +210109,7 @@ static int diskAnnGetShadowRowKeys(const DiskAnnIndex *pIndex, u64 nRowid, const
   sqlite3_stmt *pStmt = NULL;
   char *zSql = NULL;
 
-  char columnSqlNames[DISKANN_SQL_RENDER_LIMIT]; // just column names (e.g. index_key, index_key1, index_key2, ...)
+  char columnSqlNames[VECTOR_INDEX_SQL_RENDER_LIMIT]; // just column names (e.g. index_key, index_key1, index_key2, ...)
   if( vectorIdxKeyNamesRender(pKey->nKeyColumns, "index_key", columnSqlNames, sizeof(columnSqlNames)) != 0 ){
     rc = SQLITE_ERROR;
     goto out;
@@ -210035,15 +210163,19 @@ static int diskAnnInsertShadowRow(const DiskAnnIndex *pIndex, const VectorInRow 
   sqlite3_stmt *pStmt = NULL;
   char *zSql = NULL;
 
-  char columnSqlPlaceholders[DISKANN_SQL_RENDER_LIMIT]; // just placeholders (e.g. ?,?,?, ...)
+  char columnSqlPlaceholders[VECTOR_INDEX_SQL_RENDER_LIMIT]; // just placeholders (e.g. ?,?,?, ...)
+  char columnSqlNames[VECTOR_INDEX_SQL_RENDER_LIMIT]; // just column names (e.g. index_key, index_key1, index_key2, ...)
   if( vectorInRowPlaceholderRender(pVectorInRow, columnSqlPlaceholders, sizeof(columnSqlPlaceholders)) != 0 ){
     rc = SQLITE_ERROR;
     goto out;
   }
+  if( vectorIdxKeyNamesRender(pVectorInRow->nKeys, "index_key", columnSqlNames, sizeof(columnSqlNames)) != 0 ){
+    return SQLITE_ERROR;
+  }
   zSql = sqlite3MPrintf(
       pIndex->db,
-      "INSERT INTO \"%w\".%s VALUES (%s, ?) RETURNING rowid",
-      pIndex->zDbSName, pIndex->zShadow, columnSqlPlaceholders
+      "INSERT INTO \"%w\".%s(%s, data) VALUES (%s, ?) RETURNING rowid",
+      pIndex->zDbSName, pIndex->zShadow, columnSqlNames, columnSqlPlaceholders
   );
   if( zSql == NULL ){
     rc = SQLITE_NOMEM_BKPT;
@@ -210419,7 +210551,7 @@ static void diskAnnPruneEdges(const DiskAnnIndex *pIndex, BlobSpot *pNodeBlob, i
 }
 
 // main search routine - called from both SEARCH and INSERT operation
-static int diskAnnSearchInternal(const DiskAnnIndex *pIndex, DiskAnnSearchCtx *pCtx, u64 nStartRowid, char **pzErrMsg){
+static int diskAnnSearchInternal(DiskAnnIndex *pIndex, DiskAnnSearchCtx *pCtx, u64 nStartRowid, char **pzErrMsg){
   DiskAnnTrace(("diskAnnSearchInternal: ready to search: rootId=%lld\n", nStartRowid));
   DiskAnnNode *start = NULL;
   // in case of SEARCH operation (blobMode == DISKANN_BLOB_READONLY) we don't need to preserve all node blobs in the memory
@@ -210431,20 +210563,20 @@ static int diskAnnSearchInternal(const DiskAnnIndex *pIndex, DiskAnnSearchCtx *p
 
   start = diskAnnNodeAlloc(pIndex, nStartRowid);
   if( start == NULL ){
-    *pzErrMsg = sqlite3_mprintf("failed to allocate new node");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to allocate new node");
     rc = SQLITE_NOMEM_BKPT;
     goto out;
   }
 
   rc = blobSpotCreate(pIndex, &start->pBlobSpot, nStartRowid, pIndex->nBlockSize, pCtx->blobMode);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to create new blob");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to create new blob");
     goto out;
   }
 
   rc = blobSpotReload(pIndex, start->pBlobSpot, nStartRowid, pIndex->nBlockSize);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to load new blob");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to load new blob");
     goto out;
   }
 
@@ -210491,7 +210623,7 @@ static int diskAnnSearchInternal(const DiskAnnIndex *pIndex, DiskAnnSearchCtx *p
       diskAnnSearchCtxDeleteCandidate(pCtx, iCandidate);
       continue;
     }else if( rc != SQLITE_OK ){
-      *pzErrMsg = sqlite3_mprintf("failed to create new blob for candidate");
+      *pzErrMsg = sqlite3_mprintf("vector index(search): failed to create new blob for candidate");
       goto out;
     }
 
@@ -210552,7 +210684,7 @@ out:
 
 // search k nearest neighbours for pVector in the pIndex (with pKey primary key structure) and put result in the pRows output
 int diskAnnSearch(
-  const DiskAnnIndex *pIndex,
+  DiskAnnIndex *pIndex,
   const Vector *pVector,
   int k,
   const VectorIdxKey *pKey,
@@ -210568,15 +210700,15 @@ int diskAnnSearch(
   DiskAnnTrace(("diskAnnSearch started\n"));
 
   if( k < 0 ){
-    *pzErrMsg = sqlite3_mprintf("k must be a non-negative integer");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): k must be a non-negative integer");
     return SQLITE_ERROR;
   }
   if( pIndex->nVectorDims != pVector->dims ){
-    *pzErrMsg = sqlite3_mprintf("dimensions are different: %d != %d", pVector->dims, pIndex->nVectorDims);
+    *pzErrMsg = sqlite3_mprintf("vector index(search): dimensions are different: %d != %d", pVector->dims, pIndex->nVectorDims);
     return SQLITE_ERROR;
   }
   if( pVector->type != VECTOR_TYPE_FLOAT32 ){
-    *pzErrMsg = sqlite3_mprintf("only f32 vectors are supported");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): only f32 vectors are supported");
     return SQLITE_ERROR;
   }
 
@@ -210587,12 +210719,12 @@ int diskAnnSearch(
     pRows->nCols = pKey->nKeyColumns;
     return SQLITE_OK;
   }else if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to select start node for search");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to select start node for search");
     return rc;
   }
   rc = diskAnnSearchCtxInit(&ctx, pVector, pIndex->searchL, DISKANN_BLOB_READONLY);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to initialize search context");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to initialize search context");
     goto out;
   }
   rc = diskAnnSearchInternal(pIndex, &ctx, nStartRowid, pzErrMsg);
@@ -210600,9 +210732,9 @@ int diskAnnSearch(
     goto out;
   }
   nOutRows = MIN(k, ctx.nCandidates);
-  rc = vectorOutRowsAlloc(pIndex->db, pRows, nOutRows, pKey->nKeyColumns, pKey->aKeyAffinity[0]);
+  rc = vectorOutRowsAlloc(pIndex->db, pRows, nOutRows, pKey->nKeyColumns, vectorIdxKeyRowidLike(pKey));
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to allocate output rows");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to allocate output rows");
     goto out;
   }
   for(i = 0; i < nOutRows; i++){
@@ -210612,7 +210744,7 @@ int diskAnnSearch(
       rc = diskAnnGetShadowRowKeys(pIndex, ctx.aCandidates[i]->nRowid, pKey, pRows, i);
     }
     if( rc != SQLITE_OK ){
-      *pzErrMsg = sqlite3_mprintf("failed to put result in the output row");
+      *pzErrMsg = sqlite3_mprintf("vector index(search): failed to put result in the output row");
       goto out;
     }
   }
@@ -210624,7 +210756,7 @@ out:
 
 // insert pVectorInRow in the pIndex
 int diskAnnInsert(
-  const DiskAnnIndex *pIndex,
+  DiskAnnIndex *pIndex,
   const VectorInRow *pVectorInRow,
   char **pzErrMsg
 ){
@@ -210635,11 +210767,11 @@ int diskAnnInsert(
   DiskAnnSearchCtx ctx;
 
   if( pVectorInRow->pVector->dims != pIndex->nVectorDims ){
-    *pzErrMsg = sqlite3_mprintf("dimensions are different: %d != %d", pVectorInRow->pVector->dims, pIndex->nVectorDims);
+    *pzErrMsg = sqlite3_mprintf("vector index(insert): dimensions are different: %d != %d", pVectorInRow->pVector->dims, pIndex->nVectorDims);
     return SQLITE_ERROR;
   }
   if( pVectorInRow->pVector->type != VECTOR_TYPE_FLOAT32 ){
-    *pzErrMsg = sqlite3_mprintf("only f32 vectors are supported");
+    *pzErrMsg = sqlite3_mprintf("vector index(insert): only f32 vectors are supported");
     return SQLITE_ERROR;
   }
 
@@ -210647,7 +210779,7 @@ int diskAnnInsert(
 
   rc = diskAnnSearchCtxInit(&ctx, pVectorInRow->pVector, pIndex->insertL, DISKANN_BLOB_WRITABLE);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to initialize search context");
+    *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to initialize search context");
     return rc;
   }
 
@@ -210656,7 +210788,7 @@ int diskAnnInsert(
   if( rc == SQLITE_DONE ){
     first = 1;
   }else if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to select start node for search");
+    *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to select start node for search");
     rc = SQLITE_ERROR;
     goto out;
   }
@@ -210670,13 +210802,13 @@ int diskAnnInsert(
 
   rc = diskAnnInsertShadowRow(pIndex, pVectorInRow, &nNewRowid);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to insert shadow row");
+    *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to insert shadow row");
     goto out;
   }
 
   rc = blobSpotCreate(pIndex, &pBlobSpot, nNewRowid, pIndex->nBlockSize, 1);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to read blob for shadow row");
+    *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to read blob for shadow row");
     goto out;
   }
   nodeBinInit(pIndex, pBlobSpot, nNewRowid, pVectorInRow->pVector);
@@ -210711,9 +210843,9 @@ int diskAnnInsert(
     nodeBinReplaceEdge(pIndex, pVisited->pBlobSpot, iReplace, nNewRowid, pVectorInRow->pVector);
     diskAnnPruneEdges(pIndex, pVisited->pBlobSpot, iReplace);
 
-    rc = blobSpotFlush(pVisited->pBlobSpot);
+    rc = blobSpotFlush(pIndex, pVisited->pBlobSpot);
     if( rc != SQLITE_OK ){
-      *pzErrMsg = sqlite3_mprintf("failed to flush blob");
+      *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to flush blob");
       goto out;
     }
   }
@@ -210721,9 +210853,9 @@ int diskAnnInsert(
   rc = SQLITE_OK;
 out:
   if( rc == SQLITE_OK ){
-    rc = blobSpotFlush(pBlobSpot);
+    rc = blobSpotFlush(pIndex, pBlobSpot);
     if( rc != SQLITE_OK ){
-      *pzErrMsg = sqlite3_mprintf("failed to flush blob");
+      *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to flush blob");
     }
   }
   if( pBlobSpot != NULL ){
@@ -210735,7 +210867,7 @@ out:
 
 // delete pInRow from pIndex
 int diskAnnDelete(
-  const DiskAnnIndex *pIndex,
+  DiskAnnIndex *pIndex,
   const VectorInRow *pInRow,
   char **pzErrMsg
 ){
@@ -210746,7 +210878,7 @@ int diskAnnDelete(
   if( vectorInRowTryGetRowid(pInRow, &nodeRowid) != 0 ){
     rc = diskAnnGetShadowRowid(pIndex, pInRow, &nodeRowid);
     if( rc != SQLITE_OK ){
-      *pzErrMsg = sqlite3_mprintf("failed to determined node id for deletion");
+      *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to determined node id for deletion");
       goto out;
     }
   }
@@ -210755,17 +210887,17 @@ int diskAnnDelete(
 
   rc = blobSpotCreate(pIndex, &pNodeBlob, nodeRowid, pIndex->nBlockSize, DISKANN_BLOB_WRITABLE);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to create blob for node row");
+    *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to create blob for node row");
     goto out;
   }
   rc = blobSpotReload(pIndex, pNodeBlob, nodeRowid, pIndex->nBlockSize);
   if( rc != 0 ){
-    *pzErrMsg = sqlite3_mprintf("failed to reload blob for node row");
+    *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to reload blob for node row");
     goto out;
   }
   rc = blobSpotCreate(pIndex, &pEdgeBlob, nodeRowid, pIndex->nBlockSize, DISKANN_BLOB_WRITABLE);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to create blob for edge rows");
+    *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to create blob for edge rows");
     goto out;
   }
   nNeighbours = nodeBinEdges(pIndex, pNodeBlob);
@@ -210776,7 +210908,7 @@ int diskAnnDelete(
     if( rc == DISKANN_ROW_NOT_FOUND ){
       continue;
     }else if( rc != SQLITE_OK ){
-      *pzErrMsg = sqlite3_mprintf("failed to reload blob for edge row: %d", rc);
+      *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to reload blob for edge row: %d", rc);
       goto out;
     }
     iDelete = nodeBinEdgeFindIdx(pIndex, pEdgeBlob, edgeRowid);
@@ -210784,16 +210916,16 @@ int diskAnnDelete(
       continue;
     }
     nodeBinDeleteEdge(pIndex, pEdgeBlob, iDelete);
-    rc = blobSpotFlush(pEdgeBlob);
+    rc = blobSpotFlush(pIndex, pEdgeBlob);
     if( rc != SQLITE_OK ){
-      *pzErrMsg = sqlite3_mprintf("failed to flush blob for edge row");
+      *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to flush blob for edge row");
       goto out;
     }
   }
 
   rc = diskAnnDeleteShadowRow(pIndex, nodeRowid);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to remove shadow row");
+    *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to remove shadow row");
     goto out;
   }
 
@@ -210817,6 +210949,7 @@ int diskAnnOpenIndex(
   DiskAnnIndex **ppIndex             /* OUT: Index */
 ){
   DiskAnnIndex *pIndex;
+  u64 nBlockSize;
   pIndex = sqlite3DbMallocRaw(db, sizeof(DiskAnnIndex));
   if( pIndex == NULL ){
     return SQLITE_NOMEM;
@@ -210829,14 +210962,22 @@ int diskAnnOpenIndex(
     diskAnnCloseIndex(pIndex);
     return SQLITE_NOMEM_BKPT;
   }
+  nBlockSize = vectorIdxParamsGetU64(pParams, VECTOR_BLOCK_SIZE_PARAM_ID);
+  // preserve backward compatibility: treat block size > 128 literally, but <= 128 with shift
+  if( nBlockSize <= 128 ){
+    nBlockSize <<= DISKANN_BLOCK_SIZE_SHIFT;
+  }
+
   pIndex->nFormatVersion = vectorIdxParamsGetU64(pParams, VECTOR_FORMAT_PARAM_ID);
   pIndex->nDistanceFunc = vectorIdxParamsGetU64(pParams, VECTOR_METRIC_TYPE_PARAM_ID);
-  pIndex->nBlockSize = vectorIdxParamsGetU64(pParams, VECTOR_BLOCK_SIZE_PARAM_ID) << DISKANN_BLOCK_SIZE_SHIFT;
+  pIndex->nBlockSize = nBlockSize;
   pIndex->nNodeVectorType = vectorIdxParamsGetU64(pParams, VECTOR_TYPE_PARAM_ID);
   pIndex->nVectorDims = vectorIdxParamsGetU64(pParams, VECTOR_DIM_PARAM_ID);
   pIndex->pruningAlpha = vectorIdxParamsGetF64(pParams, VECTOR_PRUNING_ALPHA_PARAM_ID);
   pIndex->insertL = vectorIdxParamsGetU64(pParams, VECTOR_INSERT_L_PARAM_ID);
   pIndex->searchL = vectorIdxParamsGetU64(pParams, VECTOR_SEARCH_L_PARAM_ID);
+  pIndex->nReads = 0;
+  pIndex->nWrites = 0;
   if( pIndex->nDistanceFunc == 0 ||
       pIndex->nBlockSize == 0 ||
       pIndex->nNodeVectorType == 0 ||
@@ -211112,11 +211253,7 @@ int vectorF32ParseSqliteBlob(
 
   assert( pVector->type == VECTOR_TYPE_FLOAT32 );
   assert( 0 <= pVector->dims && pVector->dims <= MAX_VECTOR_SZ );
-
-  if( sqlite3_value_type(arg) != SQLITE_BLOB ){
-    *pzErr = sqlite3_mprintf("invalid f32 vector: not a blob type");
-    goto error;
-  }
+  assert( sqlite3_value_type(arg) == SQLITE_BLOB );
 
   pBlob = sqlite3_value_blob(arg);
   if( sqlite3_value_bytes(arg) < sizeof(float) * pVector->dims ){
@@ -211377,11 +211514,7 @@ int vectorF64ParseSqliteBlob(
 
   assert( pVector->type == VECTOR_TYPE_FLOAT64 );
   assert( 0 <= pVector->dims && pVector->dims <= MAX_VECTOR_SZ );
-
-  if( sqlite3_value_type(arg) != SQLITE_BLOB ){
-    *pzErr = sqlite3_mprintf("invalid f64 vector: not a blob type");
-    goto error;
-  }
+  assert( sqlite3_value_type(arg) == SQLITE_BLOB );
 
   pBlob = sqlite3_value_blob(arg);
   if( sqlite3_value_bytes(arg) < sizeof(double) * pVector->dims ){
@@ -211434,9 +211567,29 @@ error:
 /* #include "sqliteInt.h" */
 /* #include "vectorIndexInt.h" */
 
+/*
+ * The code which glue SQLite internals with pure DiskANN implementation resides here
+ * Main internal API methods are:
+ * vectorIndexCreate()
+ * vectorIndexClear()
+ * vectorIndexDrop()
+ * vectorIndexSearch()
+ * vectorIndexCursorInit()
+ * vectorIndexCursorClose()
+ *
+ * + cursor operations:
+ * vectorIndexInsert(cursor)
+ * vectorIndexDelete(cursor)
+*/
+
 /**************************************************************************
 ** VectorIdxParams utilities
 ****************************************************************************/
+
+// VACUUM creates tables and indices first and only then populate data
+// we need to ignore inserts from 'INSERT INTO vacuum.t SELECT * FROM t' statements because
+// all shadow tables will be populated by VACUUM process during regular process of table copy
+#define IsVacuum(db) ((db->mDbFlags&DBFLAG_Vacuum)!=0)
 
 void vectorIdxParamsInit(VectorIdxParams *pParams, u8 *pBinBuf, int nBinSize) {
   assert( nBinSize <= VECTOR_INDEX_PARAMS_BUF_SIZE );
@@ -211489,28 +211642,39 @@ int vectorIdxParamsPutF64(VectorIdxParams *pParams, char tag, double value) {
 ** VectorIdxKey utilities
 ****************************************************************************/
 
-int vectorIdxKeyGet(Table *pTable, VectorIdxKey *pKey, const char **pzErrMsg) {
-  int i;
-  Index *pPk;
-  // we actually need to change strategy here and use PK if it's available and fallback to ROWID only if there is no other choice
-  // will change this later as it must be done carefully in order to not brake behaviour of existing indices
-  if( !HasRowid(pTable) ){
-    pPk = sqlite3PrimaryKeyIndex(pTable);
-    if( pPk->nKeyCol > VECTOR_INDEX_MAX_KEY_COLUMNS ){
-      *pzErrMsg = "exceeded limit for composite columns in primary key index";
-      return -1;
-    }
-    pKey->nKeyColumns = pPk->nKeyCol;
-    for(i = 0; i < pPk->nKeyCol; i++){
-      pKey->aKeyAffinity[i] = pTable->aCol[pPk->aiColumn[i]].affinity;
-      pKey->azKeyCollation[i] = pPk->azColl[i];
-    }
-  } else{
+int vectorIdxKeyGet(const Index *pIndex, VectorIdxKey *pKey, const char **pzErrMsg) {
+  Table *pTable;
+  Index *pPkIndex;
+  int i, nKeyColumns;
+
+  assert( pIndex->nKeyCol == 1 );
+  assert( pIndex->nColumn > pIndex->nKeyCol );
+
+  pTable = pIndex->pTable;
+  nKeyColumns = pIndex->nColumn - pIndex->nKeyCol;
+  if( nKeyColumns == 1 && pIndex->aiColumn[pIndex->nKeyCol] == XN_ROWID ){
     pKey->nKeyColumns = 1;
     pKey->aKeyAffinity[0] = SQLITE_AFF_INTEGER;
     pKey->azKeyCollation[0] = "BINARY";
+    return 0;
+  }
+  if( nKeyColumns > VECTOR_INDEX_MAX_KEY_COLUMNS ){
+    *pzErrMsg = "exceeded limit for composite columns in primary key index";
+    return -1;
+  }
+  pPkIndex = sqlite3PrimaryKeyIndex(pIndex->pTable);
+  assert( pPkIndex->nKeyCol == nKeyColumns );
+
+  pKey->nKeyColumns = nKeyColumns;
+  for(i = 0; i < pPkIndex->nKeyCol; i++){
+    pKey->aKeyAffinity[i] = pTable->aCol[pPkIndex->aiColumn[i]].affinity;
+    pKey->azKeyCollation[i] = pPkIndex->azColl[i];
   }
   return 0;
+}
+
+int vectorIdxKeyRowidLike(const VectorIdxKey *pKey){
+  return pKey->nKeyColumns == 1 && pKey->aKeyAffinity[0] == SQLITE_AFF_INTEGER && sqlite3StrICmp(pKey->azKeyCollation[0], "BINARY") == 0;
 }
 
 int vectorIdxKeyDefsRender(const VectorIdxKey *pKey, const char *prefix, char *pBuf, int nBufSize) {
@@ -211660,7 +211824,7 @@ void vectorInRowFree(sqlite3 *db, VectorInRow *pVectorInRow) {
 ** VectorOutRows utilities
 ****************************************************************************/
 
-int vectorOutRowsAlloc(sqlite3 *db, VectorOutRows *pRows, int nRows, int nCols, char firstColumnAff){
+int vectorOutRowsAlloc(sqlite3 *db, VectorOutRows *pRows, int nRows, int nCols, int rowidLike){
   assert( nCols > 0 && nRows >= 0 );
   pRows->nRows = nRows;
   pRows->nCols = nCols;
@@ -211671,7 +211835,8 @@ int vectorOutRowsAlloc(sqlite3 *db, VectorOutRows *pRows, int nRows, int nCols, 
     return SQLITE_NOMEM_BKPT;
   }
 
-  if( nCols == 1 && firstColumnAff == SQLITE_AFF_INTEGER ){
+  if( rowidLike ){
+    assert( nCols == 1 );
     pRows->aIntValues = sqlite3DbMallocRaw(db, nRows * sizeof(i64));
     if( pRows->aIntValues == NULL ){
       return SQLITE_NOMEM_BKPT;
@@ -211767,18 +211932,19 @@ static struct VectorColumnType VECTOR_COLUMN_TYPES[] = {
 struct VectorParamName {
   const char *zName;
   int tag;
-  int type; // 0 - enum, 1 - integer, 2 - float
+  int type; // 0 - string enum, 1 - integer, 2 - float
   const char *zValueStr;
   u64 value;
 };
 
 static struct VectorParamName VECTOR_PARAM_NAMES[] = {
-  { "type",     VECTOR_INDEX_TYPE_PARAM_ID, 0, "diskann", VECTOR_INDEX_TYPE_DISKANN },
-  { "metric",   VECTOR_METRIC_TYPE_PARAM_ID, 0, "cosine", VECTOR_METRIC_TYPE_COS },
-  { "metric",   VECTOR_METRIC_TYPE_PARAM_ID, 0, "l2",     VECTOR_METRIC_TYPE_L2 },
-  { "alpha",    VECTOR_PRUNING_ALPHA_PARAM_ID, 2, 0, 0 },
-  { "search_l", VECTOR_SEARCH_L_PARAM_ID, 1, 0, 0 },
-  { "insert_l", VECTOR_INSERT_L_PARAM_ID, 2, 0, 0 },
+  { "type",          VECTOR_INDEX_TYPE_PARAM_ID,    0, "diskann", VECTOR_INDEX_TYPE_DISKANN },
+  { "metric",        VECTOR_METRIC_TYPE_PARAM_ID,   0, "cosine", VECTOR_METRIC_TYPE_COS },
+  { "metric",        VECTOR_METRIC_TYPE_PARAM_ID,   0, "l2",     VECTOR_METRIC_TYPE_L2 },
+  { "alpha",         VECTOR_PRUNING_ALPHA_PARAM_ID, 2, 0, 0 },
+  { "search_l",      VECTOR_SEARCH_L_PARAM_ID,      1, 0, 0 },
+  { "insert_l",      VECTOR_INSERT_L_PARAM_ID,      1, 0, 0 },
+  { "max_neighbors", VECTOR_MAX_NEIGHBORS_PARAM_ID, 1, 0, 0 },
 };
 
 static int parseVectorIdxParam(const char *zParam, VectorIdxParams *pParams, const char **pErrMsg) {
@@ -211794,13 +211960,17 @@ static int parseVectorIdxParam(const char *zParam, VectorIdxParams *pParams, con
   zValue = zParam + iDelimiter + 1;
   nValueLen = sqlite3Strlen30(zValue);
   for(i = 0; i < ArraySize(VECTOR_PARAM_NAMES); i++){
-    if( sqlite3_strnicmp(VECTOR_PARAM_NAMES[i].zName, zParam, iDelimiter) != 0 ){
+    if( iDelimiter != strlen(VECTOR_PARAM_NAMES[i].zName) || sqlite3_strnicmp(VECTOR_PARAM_NAMES[i].zName, zParam, iDelimiter) != 0 ){
       continue;
     }
     if( VECTOR_PARAM_NAMES[i].type == 1 ){
-      u64 value = sqlite3Atoi(zValue);
+      int value = sqlite3Atoi(zValue);
       if( value == 0 ){
         *pErrMsg = "invalid representation of integer vector index parameter";
+        return -1;
+      }
+      if( value < 0 ){
+        *pErrMsg = "integer vector index parameter must be positive";
         return -1;
       }
       if( vectorIdxParamsPutU64(pParams, VECTOR_PARAM_NAMES[i].tag, value) != 0 ){
@@ -211833,7 +212003,7 @@ static int parseVectorIdxParam(const char *zParam, VectorIdxParams *pParams, con
       return -1;
     }
   }
-  *pErrMsg = "unexpected parameter key";
+  *pErrMsg = "invalid parameter";
   return -1;
 }
 
@@ -211841,25 +212011,25 @@ int parseVectorIdxParams(Parse *pParse, VectorIdxParams *pParams, int type, int 
   int i;
   const char *pErrMsg;
   if( vectorIdxParamsPutU64(pParams, VECTOR_FORMAT_PARAM_ID, VECTOR_FORMAT_DEFAULT) != 0 ){
-    sqlite3ErrorMsg(pParse, "unable to serialize vector index parameter: format");
+    sqlite3ErrorMsg(pParse, "vector index: unable to serialize vector index parameter: format");
     return SQLITE_ERROR;
   }
   if( vectorIdxParamsPutU64(pParams, VECTOR_TYPE_PARAM_ID, type) != 0 ){
-    sqlite3ErrorMsg(pParse, "unable to serialize vector index parameter: type");
+    sqlite3ErrorMsg(pParse, "vector index: unable to serialize vector index parameter: type");
     return SQLITE_ERROR;
   }
   if( vectorIdxParamsPutU64(pParams, VECTOR_DIM_PARAM_ID, dims) != 0 ){
-    sqlite3ErrorMsg(pParse, "unable to serialize vector index parameter: dim");
+    sqlite3ErrorMsg(pParse, "vector index: unable to serialize vector index parameter: dim");
     return SQLITE_ERROR;
   }
   for(i = 0; i < nArgs; i++){
     Expr *pArgExpr = pArgList[i].pExpr;
     if( pArgExpr->op != TK_STRING ){
-      sqlite3ErrorMsg(pParse, "all arguments after first must be strings");
+      sqlite3ErrorMsg(pParse, "vector index: all arguments after first must be strings");
       return SQLITE_ERROR;
     }
     if( parseVectorIdxParam(pArgExpr->u.zToken, pParams, &pErrMsg) != 0 ){
-      sqlite3ErrorMsg(pParse, "invalid vector index parameter '%s': %s", pArgExpr->u.zToken, pErrMsg);
+      sqlite3ErrorMsg(pParse, "vector index: invalid vector index parameter '%s': %s", pArgExpr->u.zToken, pErrMsg);
       return SQLITE_ERROR;
     }
   }
@@ -211996,9 +212166,11 @@ int insertIndexParameters(sqlite3* db, const char *zDbSName, const char *zName, 
     goto clear_and_exit;
   }
   rc = sqlite3_step(pStatement);
-  if( rc != SQLITE_DONE ){
+  if( rc == SQLITE_CONSTRAINT ){
+    rc = SQLITE_CONSTRAINT;
+  }else if( rc != SQLITE_DONE ){
     rc = SQLITE_ERROR;
-  } else {
+  }else{
     rc = SQLITE_OK;
   }
 clear_and_exit:
@@ -212037,51 +212209,25 @@ clear_and_exit:
   return rc;
 }
 
-int vectorIndexGetParameters(
-  sqlite3 *db,
-  const char *zIndexName,
-  VectorIdxParams *pParams
-) {
+int vectorIndexTryGetParametersFromTableFormat(sqlite3 *db, const char *zSql, const char *zIdxName, VectorIdxParams *pParams) {
   int rc = SQLITE_OK;
   sqlite3_stmt *pStmt = NULL;
   int nBinSize;
 
-  static const char* zSelectSql = "SELECT metadata FROM " VECTOR_INDEX_GLOBAL_META_TABLE " WHERE name = ?";
-  static const char* zSelectSqlPekkaLegacy = "SELECT vector_type, block_size, dims, distance_ops FROM libsql_vector_index WHERE type = ? AND name = ?";
-  rc = sqlite3_prepare_v2(db, zSelectSql, -1, &pStmt, 0);
-  if( rc == SQLITE_OK ) {
-    rc = sqlite3_bind_text(pStmt, 1, zIndexName, -1, SQLITE_STATIC);
-    if( rc != SQLITE_OK ){
-      goto out_free;
-    }
+  vectorIdxParamsInit(pParams, NULL, 0);
 
-    if( sqlite3_step(pStmt) == SQLITE_ROW ){
-      assert( sqlite3_column_type(pStmt, 0) == SQLITE_BLOB );
-      nBinSize = sqlite3_column_bytes(pStmt, 0);
-      if( nBinSize > VECTOR_INDEX_PARAMS_BUF_SIZE ){
-        rc = SQLITE_ERROR;
-        goto out_free;
-      }
-      vectorIdxParamsInit(pParams, (u8*)sqlite3_column_blob(pStmt, 0), nBinSize);
-      goto out_free;
-    }
-  }
-  if( pStmt ){
-    sqlite3_finalize(pStmt);
-    pStmt = NULL;
-  }
-
-  rc = sqlite3_prepare_v2(db, zSelectSqlPekkaLegacy, -1, &pStmt, 0);
+  rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
   if( rc != SQLITE_OK ){
-    goto out_free;
+    goto out;
   }
-  sqlite3_bind_text(pStmt, 1, "diskann", -1, SQLITE_STATIC);
-  sqlite3_bind_text(pStmt, 2, zIndexName, -1, SQLITE_STATIC);
+  rc = sqlite3_bind_text(pStmt, 1, zIdxName, -1, SQLITE_STATIC);
+  if( rc != SQLITE_OK ){
+    goto out;
+  }
   if( sqlite3_step(pStmt) != SQLITE_ROW ){
     rc = SQLITE_ERROR;
-    goto out_free;
+    goto out;
   }
-
   vectorIdxParamsPutU64(pParams, VECTOR_FORMAT_PARAM_ID, 1);
   vectorIdxParamsPutU64(pParams, VECTOR_INDEX_TYPE_PARAM_ID, VECTOR_INDEX_TYPE_DISKANN);
   vectorIdxParamsPutU64(pParams, VECTOR_TYPE_PARAM_ID, VECTOR_TYPE_FLOAT32);
@@ -212089,19 +212235,83 @@ int vectorIndexGetParameters(
   vectorIdxParamsPutU64(pParams, VECTOR_METRIC_TYPE_PARAM_ID, VECTOR_METRIC_TYPE_COS);
   if( vectorIdxParamsPutU64(pParams, VECTOR_BLOCK_SIZE_PARAM_ID, sqlite3_column_int(pStmt, 1)) != 0 ){
     rc = SQLITE_ERROR;
+    goto out;
   }
-out_free:
+  assert( sqlite3_step(pStmt) == SQLITE_DONE );
+  rc = SQLITE_OK;
+out:
   if( pStmt != NULL ){
     sqlite3_finalize(pStmt);
   }
   return rc;
 }
 
+int vectorIndexTryGetParametersFromBinFormat(sqlite3 *db, const char *zSql, const char *zIdxName, VectorIdxParams *pParams) {
+  int rc = SQLITE_OK;
+  sqlite3_stmt *pStmt = NULL;
+  int nBinSize;
+
+  vectorIdxParamsInit(pParams, NULL, 0);
+
+  rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
+  if( rc != SQLITE_OK ){
+    goto out;
+  }
+  rc = sqlite3_bind_text(pStmt, 1, zIdxName, -1, SQLITE_STATIC);
+  if( rc != SQLITE_OK ){
+    goto out;
+  }
+  if( sqlite3_step(pStmt) != SQLITE_ROW ){
+    rc = SQLITE_ERROR;
+    goto out;
+  }
+  assert( sqlite3_column_type(pStmt, 0) == SQLITE_BLOB );
+  nBinSize = sqlite3_column_bytes(pStmt, 0);
+  if( nBinSize > VECTOR_INDEX_PARAMS_BUF_SIZE ){
+    rc = SQLITE_ERROR;
+    goto out;
+  }
+  vectorIdxParamsInit(pParams, (u8*)sqlite3_column_blob(pStmt, 0), nBinSize);
+  assert( sqlite3_step(pStmt) == SQLITE_DONE );
+  rc = SQLITE_OK;
+out:
+  if( pStmt != NULL ){
+    sqlite3_finalize(pStmt);
+  }
+  return rc;
+}
+
+int vectorIndexGetParameters(
+  sqlite3 *db,
+  const char *zIdxName,
+  VectorIdxParams *pParams
+) {
+  int rc = SQLITE_OK;
+
+  static const char* zSelectSql = "SELECT metadata FROM " VECTOR_INDEX_GLOBAL_META_TABLE " WHERE name = ?";
+  // zSelectSqlPekkaLegacy handles the case when user created DB before 04 July 2024 (https://discord.com/channels/933071162680958986/1225560924526477322/1258367912402489397)
+  // when instead of table with binary parameters rigid schema was used for index settings
+  // we should drop this eventually - but for now we postponed this decision
+  static const char* zSelectSqlPekkaLegacy = "SELECT vector_type, block_size, dims, distance_ops FROM libsql_vector_index WHERE name = ?";
+  rc = vectorIndexTryGetParametersFromBinFormat(db, zSelectSql, zIdxName, pParams);
+  if( rc == SQLITE_OK ){
+    return SQLITE_OK;
+  }
+  rc = vectorIndexTryGetParametersFromTableFormat(db, zSelectSqlPekkaLegacy, zIdxName, pParams);
+  if( rc == SQLITE_OK ){
+    return SQLITE_OK;
+  }
+  return SQLITE_ERROR;
+}
 
 int vectorIndexDrop(sqlite3 *db, const char *zDbSName, const char *zIdxName) {
   // we want to try delete all traces of index on every attempt
   // this is done to prevent unrecoverable situations where index were dropped but index parameters deletion failed and second attempt will fail on first step
   int rcIdx, rcParams;
+
+  if( IsVacuum(db) ){
+    return SQLITE_OK;
+  }
 
   assert( zDbSName != NULL );
 
@@ -212112,14 +212322,41 @@ int vectorIndexDrop(sqlite3 *db, const char *zDbSName, const char *zIdxName) {
 
 int vectorIndexClear(sqlite3 *db, const char *zDbSName, const char *zIdxName) {
   assert( zDbSName != NULL );
+
+  if( IsVacuum(db) ){
+    return SQLITE_OK;
+  }
+
   return diskAnnClearIndex(db, zDbSName, zIdxName);
 }
 
-int vectorIndexCreate(Parse *pParse, Index *pIdx, const char *zDbSName, const IdList *pUsing) {
+/*
+ * vectorIndexCreate analyzes any index creation expression and create vector index if needed
+ * it tolerates the situation when insert into VECTOR_INDEX_GLOBAL_META_TABLE failed with conflict
+ * this made intentionally in order to natively support upload of SQLite dumps
+ *
+ * dump populates tables first and create indices after
+ * so we must omit them because shadow tables already filled
+ *
+ * 1. in case of any error                                        :-1 returned (and pParse errMsg is populated with some error message)
+ * 2. if vector index must not be created                         : 0 returned
+ * 3. if vector index must be created but refill must be skipped  : 1 returned
+ * 4. if vector index must be created and refilled from base table: 2 returned
+*/
+int vectorIndexCreate(Parse *pParse, const Index *pIdx, const char *zDbSName, const IdList *pUsing) {
+  static const int CREATE_FAIL = -1;
+  static const int CREATE_IGNORE = 0;
+  static const int CREATE_OK_SKIP_REFILL = 1;
+  static const int CREATE_OK = 2;
+
   int i, rc = SQLITE_OK;
   int dims, type;
   int hasLibsqlVectorIdxFn = 0, hasCollation = 0;
   const char *pzErrMsg;
+
+  if( IsVacuum(pParse->db) ){
+    return CREATE_IGNORE;
+  }
 
   assert( zDbSName != NULL );
 
@@ -212136,25 +212373,25 @@ int vectorIndexCreate(Parse *pParse, Index *pIdx, const char *zDbSName, const Id
   if( pParse->eParseMode ){
     // scheme can be re-parsed by SQLite for different reasons (for example, to check schema after
     // ALTER COLUMN statements) - so we must skip creation in such cases
-    goto ignored;
+    return CREATE_IGNORE;
   }
 
   // backward compatibility: preserve old indices with deprecated syntax but forbid creation of new indices with this syntax
   if( pParse->db->init.busy == 0 && pUsing != NULL ){
     if( pIdx->zName != NULL && pTable->zName != NULL && pIdx->nKeyCol == 1 && pIdx->aiColumn != NULL && pIdx->aiColumn[0] < pTable->nCol ){
-      sqlite3ErrorMsg(pParse, "USING syntax is deprecated, please use plain CREATE INDEX: CREATE INDEX %s ON %s ( " VECTOR_INDEX_MARKER_FUNCTION "(%s) )", pIdx->zName, pTable->zName, pTable->aCol[pIdx->aiColumn[0]].zCnName);
+      sqlite3ErrorMsg(pParse, "vector index: USING syntax is deprecated, please use plain CREATE INDEX: CREATE INDEX %s ON %s ( " VECTOR_INDEX_MARKER_FUNCTION "(%s) )", pIdx->zName, pTable->zName, pTable->aCol[pIdx->aiColumn[0]].zCnName);
     } else {
-      sqlite3ErrorMsg(pParse, "USING syntax is deprecated, please use plain CREATE INDEX: CREATE INDEX xxx ON yyy ( " VECTOR_INDEX_MARKER_FUNCTION "(zzz) )");
+      sqlite3ErrorMsg(pParse, "vector index: USING syntax is deprecated, please use plain CREATE INDEX: CREATE INDEX xxx ON yyy ( " VECTOR_INDEX_MARKER_FUNCTION "(zzz) )");
     }
-    return SQLITE_ERROR;
+    return CREATE_FAIL;
   }
   if( db->init.busy == 1 && pUsing != NULL ){
-    goto succeed;
+    return CREATE_OK;
   }
 
   // vector index must have expressions over column
   if( pIdx->aColExpr == NULL ) {
-    goto ignored;
+    return CREATE_IGNORE;
   }
 
   pListItem = pIdx->aColExpr->a;
@@ -212169,85 +212406,97 @@ int vectorIndexCreate(Parse *pParse, Index *pIdx, const char *zDbSName, const Id
     }
   }
   if( !hasLibsqlVectorIdxFn ) {
-    goto ignored;
+    return CREATE_IGNORE;
   }
   if( hasCollation ){
-    sqlite3ErrorMsg(pParse, "vector index can't have collation");
-    return SQLITE_ERROR;
+    sqlite3ErrorMsg(pParse, "vector index: collation in expression is forbidden");
+    return CREATE_FAIL;
   }
   if( pIdx->aColExpr->nExpr != 1 ) {
-    sqlite3ErrorMsg(pParse, "vector index must contain exactly one column wrapped into the " VECTOR_INDEX_MARKER_FUNCTION " function");
-    return SQLITE_ERROR;
+    sqlite3ErrorMsg(pParse, "vector index: must contain exactly one column wrapped into the " VECTOR_INDEX_MARKER_FUNCTION " function");
+    return CREATE_FAIL;
   }
   // we are able to support this but I doubt this works for now - more polishing required to make this work
   if( pIdx->pPartIdxWhere != NULL ) {
-    sqlite3ErrorMsg(pParse, "partial vector index is not supported");
-    return SQLITE_ERROR;
+    sqlite3ErrorMsg(pParse, "vector index: where condition is forbidden");
+    return CREATE_FAIL;
   }
 
   pArgsList = pIdx->aColExpr->a[0].pExpr->x.pList;
   pListItem = pArgsList->a;
 
   if( pArgsList->nExpr < 1 ){
-    sqlite3ErrorMsg(pParse, VECTOR_INDEX_MARKER_FUNCTION " must contain at least one argument");
-    return SQLITE_ERROR;
+    sqlite3ErrorMsg(pParse, "vector idnex: " VECTOR_INDEX_MARKER_FUNCTION " must contain at least one argument");
+    return CREATE_FAIL;
   }
   if( pListItem[0].pExpr->op != TK_COLUMN ) {
-    sqlite3ErrorMsg(pParse, VECTOR_INDEX_MARKER_FUNCTION " first argument must be a column token");
-    return SQLITE_ERROR;
+    sqlite3ErrorMsg(pParse, "vector index: " VECTOR_INDEX_MARKER_FUNCTION " first argument must be a column token");
+    return CREATE_FAIL;
   }
   iEmbeddingColumn = pListItem[0].pExpr->iColumn;
   if( iEmbeddingColumn < 0 ) {
-    sqlite3ErrorMsg(pParse, VECTOR_INDEX_MARKER_FUNCTION " first argument must be column with vector type");
-    return SQLITE_ERROR;
+    sqlite3ErrorMsg(pParse, "vector index: " VECTOR_INDEX_MARKER_FUNCTION " first argument must be column with vector type");
+    return CREATE_FAIL;
   }
   assert( iEmbeddingColumn >= 0 && iEmbeddingColumn < pTable->nCol );
 
   zEmbeddingColumnTypeName = sqlite3ColumnType(&pTable->aCol[iEmbeddingColumn], "");
   if( vectorIdxParseColumnType(zEmbeddingColumnTypeName, &type, &dims, &pzErrMsg) != 0 ){
-    sqlite3ErrorMsg(pParse, "%s: %s", pzErrMsg, zEmbeddingColumnTypeName);
-    return SQLITE_ERROR;
+    sqlite3ErrorMsg(pParse, "vector index: %s: %s", pzErrMsg, zEmbeddingColumnTypeName);
+    return CREATE_FAIL;
   }
 
   // schema is locked while db is initializing and we need to just proceed here
   if( db->init.busy == 1 ){
-    goto succeed;
+    return CREATE_OK;
   }
 
   rc = initVectorIndexMetaTable(db, zDbSName);
   if( rc != SQLITE_OK ){
-    return rc;
+    sqlite3ErrorMsg(pParse, "vector index: failed to init meta table: %s", sqlite3_errmsg(db));
+    return CREATE_FAIL;
   }
   rc = parseVectorIdxParams(pParse, &idxParams, type, dims, pListItem + 1, pArgsList->nExpr - 1);
   if( rc != SQLITE_OK ){
-    return rc;
+    return CREATE_FAIL;
   }
-  if( vectorIdxKeyGet(pTable, &idxKey, &pzErrMsg) != 0 ){
-    sqlite3ErrorMsg(pParse, "failed to detect underlying table key: %s", pzErrMsg);
-    return SQLITE_ERROR;
+  if( vectorIdxKeyGet(pIdx, &idxKey, &pzErrMsg) != 0 ){
+    sqlite3ErrorMsg(pParse, "vector index: failed to detect underlying table key: %s", pzErrMsg);
+    return CREATE_FAIL;
   }
   if( idxKey.nKeyColumns != 1 ){
-    sqlite3ErrorMsg(pParse, "vector index for tables without ROWID and composite primary key are not supported");
-    return SQLITE_ERROR;
+    sqlite3ErrorMsg(pParse, "vector index: unsupported for tables without ROWID and composite primary key");
+    return CREATE_FAIL;
   }
   rc = diskAnnCreateIndex(db, zDbSName, pIdx->zName, &idxKey, &idxParams);
   if( rc != SQLITE_OK ){
-    sqlite3ErrorMsg(pParse, "unable to initialize diskann vector index");
-    return rc;
+    sqlite3ErrorMsg(pParse, "vector index: unable to initialize diskann");
+    return CREATE_FAIL;
   }
   rc = insertIndexParameters(db, zDbSName, pIdx->zName, &idxParams);
-  if( rc != SQLITE_OK ){
-    sqlite3ErrorMsg(pParse, "unable to update global metadata table");
-    return rc;
+  if( rc == SQLITE_CONSTRAINT ){
+    // we are violating unique constraint here which means that someone inserted parameters in the table before us
+    // taking aside corruption scenarios, this can be in case of loading dump (because tables and data are loaded before indices)
+    // this case is valid and we must proceed with index creating but avoid index-refill step as it is already filled
+    return CREATE_OK_SKIP_REFILL;
   }
-succeed:
-  pIdx->idxType = SQLITE_IDXTYPE_VECTOR;
-  return SQLITE_OK;
-ignored:
-  return SQLITE_OK;
+  if( rc != SQLITE_OK ){
+    sqlite3ErrorMsg(pParse, "vector index: unable to update global metadata table");
+    return CREATE_FAIL;
+  }
+  return CREATE_OK;
 }
 
-int vectorIndexSearch(sqlite3 *db, const char* zDbSName, int argc, sqlite3_value **argv, VectorOutRows *pRows, char **pzErrMsg) {
+int vectorIndexSearch(
+  sqlite3 *db,
+  const char* zDbSName,
+  int argc,
+  sqlite3_value **argv,
+  VectorOutRows *pRows,
+  int *nReads,
+  int *nWrites,
+  char **pzErrMsg
+) {
   int type, dims, k, rc;
   const char *zIdxName;
   const char *zErrMsg;
@@ -212258,10 +212507,11 @@ int vectorIndexSearch(sqlite3 *db, const char* zDbSName, int argc, sqlite3_value
   VectorIdxParams idxParams;
   vectorIdxParamsInit(&idxParams, NULL, 0);
 
+  assert( !IsVacuum(db) );
   assert( zDbSName != NULL );
 
   if( argc != 3 ){
-    *pzErrMsg = sqlite3_mprintf("vector search must have exactly 3 parameters");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): got %d parameters, expected 3", argc);
     rc = SQLITE_ERROR;
     goto out;
   }
@@ -212270,7 +212520,7 @@ int vectorIndexSearch(sqlite3 *db, const char* zDbSName, int argc, sqlite3_value
     goto out;
   }
   if( type != VECTOR_TYPE_FLOAT32 ){
-    *pzErrMsg = sqlite3_mprintf("only f32 vectors are supported");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): only f32 vectors are supported");
     rc = SQLITE_ERROR;
     goto out;
   }
@@ -212284,46 +212534,48 @@ int vectorIndexSearch(sqlite3 *db, const char* zDbSName, int argc, sqlite3_value
     goto out;
   }
   if( sqlite3_value_type(argv[2]) != SQLITE_INTEGER ){
-    *pzErrMsg = sqlite3_mprintf("vector search third parameter (k) must be an integer");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): third parameter (k) must be a non-negative integer");
     rc = SQLITE_ERROR;
     goto out;
   }
   k = sqlite3_value_int(argv[2]);
   if( k < 0 ){
-    *pzErrMsg = sqlite3_mprintf("k must be a non-negative integer");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): third parameter (k) must be a non-negative integer");
     rc = SQLITE_ERROR;
     goto out;
   }
   if( sqlite3_value_type(argv[0]) != SQLITE_TEXT ){
-    *pzErrMsg = sqlite3_mprintf("vector search first parameter (index) must be a string");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): first parameter (index) must be a string");
     rc = SQLITE_ERROR;
     goto out;
   }
   zIdxName = (const char*)sqlite3_value_text(argv[0]);
   if( vectorIndexGetParameters(db, zIdxName, &idxParams) != 0 ){
-    *pzErrMsg = sqlite3_mprintf("failed to parse vector index parameters");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to parse vector index parameters");
     rc = SQLITE_ERROR;
     goto out;
   }
   pIndex = sqlite3FindIndex(db, zIdxName, zDbSName);
   if( pIndex == NULL ){
-    *pzErrMsg = sqlite3_mprintf("vector index not found");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): index not found");
     rc = SQLITE_ERROR;
     goto out;
   }
   rc = diskAnnOpenIndex(db, zDbSName, zIdxName, &idxParams, &pDiskAnn);
   if( rc != SQLITE_OK ){
-    *pzErrMsg = sqlite3_mprintf("failed to open diskann index");
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to open diskann index");
     goto out;
   }
-  if( vectorIdxKeyGet(pIndex->pTable, &pKey, &zErrMsg) != 0 ){
-    *pzErrMsg = sqlite3_mprintf("failed to extract table key: %s", zErrMsg);
+  if( vectorIdxKeyGet(pIndex, &pKey, &zErrMsg) != 0 ){
+    *pzErrMsg = sqlite3_mprintf("vector index(search): failed to extract table key: %s", zErrMsg);
     rc = SQLITE_ERROR;
     goto out;
   }
   rc = diskAnnSearch(pDiskAnn, pVector, k, &pKey, pRows, pzErrMsg);
 out:
   if( pDiskAnn != NULL ){
+    *nReads += pDiskAnn->nReads;
+    *nWrites += pDiskAnn->nWrites;
     diskAnnCloseIndex(pDiskAnn);
   }
   if( pVector != NULL ){
@@ -212339,6 +212591,10 @@ int vectorIndexInsert(
 ){
   int rc;
   VectorInRow vectorInRow;
+
+  if( IsVacuum(pCur->db) ){
+    return SQLITE_OK;
+  }
 
   rc = vectorInRowAlloc(pCur->db, pRecord, &vectorInRow, pzErrMsg);
   if( rc != SQLITE_OK ){
@@ -212358,6 +212614,11 @@ int vectorIndexDelete(
   char **pzErrMsg
 ){
   VectorInRow payload;
+
+  if( IsVacuum(pCur->db) ){
+    return SQLITE_OK;
+  }
+
   payload.pVector = NULL;
   payload.nKeys = r->nField - 1;
   payload.pKeyValues = r->aMem + 1;
@@ -212394,7 +212655,10 @@ int vectorIndexCursorInit(
   return SQLITE_OK;
 }
 
-void vectorIndexCursorClose(sqlite3 *db, VectorIdxCursor *pCursor){
+void vectorIndexCursorClose(sqlite3 *db, VectorIdxCursor *pCursor, int *nReads, int *nWrites){
+  *nReads = pCursor->pIndex->nReads;
+  *nWrites = pCursor->pIndex->nWrites;
+
   diskAnnCloseIndex(pCursor->pIndex);
   sqlite3DbFree(db, pCursor);
 }
@@ -212443,7 +212707,10 @@ struct vectorVtab {
 
 typedef struct vectorVtab_cursor vectorVtab_cursor;
 struct vectorVtab_cursor {
+  // first fields must copy fields from the sqlite3_vtab_cursor_tracked struct
   sqlite3_vtab_cursor base;  /* Base class - must be first */
+  int nReads;                /* Number of row read from the storage backing virtual table */
+  int nWrites;               /* Number of row written to the storage backing virtual table */
   VectorOutRows rows;
   int iRow;
 };
@@ -212498,7 +212765,7 @@ static int vectorVtabDisconnect(sqlite3_vtab *pVtab){
 static int vectorVtabOpen(sqlite3_vtab *p, sqlite3_vtab_cursor **ppCursor){
   vectorVtab *pVTab = (vectorVtab*)p;
   vectorVtab_cursor *pCur;
-  pCur = sqlite3_malloc( sizeof(*pCur) );
+  pCur = sqlite3_malloc( sizeof(vectorVtab_cursor) );
   if( pCur == NULL ){
     return SQLITE_NOMEM;
   }
@@ -212557,7 +212824,7 @@ static int vectorVtabFilter(
   pCur->rows.aIntValues = NULL;
   pCur->rows.ppValues = NULL;
 
-  if( vectorIndexSearch(pVTab->db, pVTab->zDbSName, argc, argv, &pCur->rows, &pVTab->base.zErrMsg) != 0 ){
+  if( vectorIndexSearch(pVTab->db, pVTab->zDbSName, argc, argv, &pCur->rows, &pCur->nReads, &pCur->nWrites, &pVTab->base.zErrMsg) != 0 ){
     return SQLITE_ERROR;
   }
 
