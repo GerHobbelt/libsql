@@ -81,6 +81,17 @@ pub struct PushResult {
     baton: Option<String>,
 }
 
+pub struct DropAbort(pub Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for DropAbort {
+    fn drop(&mut self) {
+        tracing::debug!("aborting");
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
 pub enum PushStatus {
     Ok,
     Conflict,
@@ -216,7 +227,9 @@ impl SyncContext {
 
         match result.status {
             PushStatus::Conflict => {
-                return Err(SyncError::InvalidPushFrameConflict(frame_no, result.max_frame_no).into());
+                return Err(
+                    SyncError::InvalidPushFrameConflict(frame_no, result.max_frame_no).into(),
+                );
             }
             _ => {}
         }
@@ -251,7 +264,11 @@ impl SyncContext {
         tracing::debug!(?durable_frame_num, "frame successfully pushed");
 
         // Update our last known max_frame_no from the server.
-        tracing::debug!(?generation, ?durable_frame_num, "updating remote generation and durable_frame_num");
+        tracing::debug!(
+            ?generation,
+            ?durable_frame_num,
+            "updating remote generation and durable_frame_num"
+        );
         self.durable_generation = generation;
         self.durable_frame_num = durable_frame_num;
 
@@ -261,7 +278,12 @@ impl SyncContext {
         })
     }
 
-    async fn push_with_retry(&self, mut uri: String, body: Bytes, max_retries: usize) -> Result<PushResult> {
+    async fn push_with_retry(
+        &self,
+        mut uri: String,
+        body: Bytes,
+        max_retries: usize,
+    ) -> Result<PushResult> {
         let mut nr_retries = 0;
         loop {
             let mut req = http::Request::post(uri.clone());
@@ -402,7 +424,9 @@ impl SyncContext {
             }
             // BUG ALERT: The server returns a 500 error if the remote database is empty.
             // This is a bug and should be fixed.
-            if res.status() == StatusCode::BAD_REQUEST || res.status() == StatusCode::INTERNAL_SERVER_ERROR {
+            if res.status() == StatusCode::BAD_REQUEST
+                || res.status() == StatusCode::INTERNAL_SERVER_ERROR
+            {
                 let res_body = hyper::body::to_bytes(res.into_body())
                     .await
                     .map_err(SyncError::HttpBody)?;
@@ -417,7 +441,9 @@ impl SyncContext {
                 let generation = generation
                     .as_u64()
                     .ok_or_else(|| SyncError::JsonValue(generation.clone()))?;
-                return Ok(PullResult::EndOfGeneration { max_generation: generation as u32 });
+                return Ok(PullResult::EndOfGeneration {
+                    max_generation: generation as u32,
+                });
             }
             if res.status().is_redirection() {
                 uri = match res.headers().get(hyper::header::LOCATION) {
@@ -448,7 +474,6 @@ impl SyncContext {
             nr_retries += 1;
         }
     }
-
 
     pub(crate) fn next_generation(&mut self) {
         self.durable_generation += 1;
@@ -741,9 +766,7 @@ pub async fn bootstrap_db(sync_ctx: &mut SyncContext) -> Result<()> {
         // if we are lagging behind, then we will call the export API and get to the latest
         // generation directly.
         let info = sync_ctx.get_remote_info().await?;
-        sync_ctx
-            .sync_db_if_needed(info.current_generation)
-            .await?;
+        sync_ctx.sync_db_if_needed(info.current_generation).await?;
         // when sync_ctx is initialised, we set durable_generation to 0. however, once
         // sync_db is called, it should be > 0.
         assert!(sync_ctx.durable_generation > 0, "generation should be > 0");
@@ -871,7 +894,7 @@ pub async fn try_pull(
     let insert_handle = conn.wal_insert_handle()?;
 
     let mut err = None;
-    
+
     loop {
         let generation = sync_ctx.durable_generation();
         let frame_no = sync_ctx.durable_frame_num() + 1;
