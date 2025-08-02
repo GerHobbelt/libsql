@@ -84,7 +84,7 @@ enum DbType {
         path: String,
         flags: OpenFlags,
         encryption_config: Option<EncryptionConfig>,
-        skip_saftey_assert: bool,
+        skip_safety_assert: bool,
     },
     #[cfg(feature = "replication")]
     Sync {
@@ -107,6 +107,7 @@ enum DbType {
         auth_token: String,
         connector: crate::util::ConnectorService,
         version: Option<String>,
+        namespace: Option<String>,
     },
 }
 
@@ -165,7 +166,7 @@ cfg_core! {
                     path: db_path.into(),
                     flags,
                     encryption_config: None,
-                    skip_saftey_assert: false,
+                    skip_safety_assert: false,
                 },
                 max_write_replication_index: Default::default(),
             })
@@ -249,6 +250,7 @@ cfg_replication! {
                 None,
                 OpenFlags::default(),
                 encryption_config.clone(),
+                None,
                 None,
             ).await?;
 
@@ -456,7 +458,7 @@ cfg_replication! {
                DbType::Sync { db, .. } => {
                    let path = db.path().to_string();
                    Ok(Database {
-                       db_type: DbType::File { path, flags: OpenFlags::default(), encryption_config: None, skip_saftey_assert: false },
+                       db_type: DbType::File { path, flags: OpenFlags::default(), encryption_config: None, skip_safety_assert: false },
                        max_write_replication_index: Default::default(),
                    })
                }
@@ -541,6 +543,7 @@ cfg_remote! {
                     auth_token: auth_token.into(),
                     connector: crate::util::ConnectorService::new(svc),
                     version,
+                    namespace: None,
                 },
                 max_write_replication_index: Default::default(),
             })
@@ -577,11 +580,11 @@ impl Database {
                 path,
                 flags,
                 encryption_config,
-                skip_saftey_assert,
+                skip_safety_assert,
             } => {
                 use crate::local::impls::LibsqlConnection;
 
-                let db = if !skip_saftey_assert {
+                let db = if !skip_safety_assert {
                     crate::local::Database::open(path, *flags)?
                 } else {
                     unsafe { crate::local::Database::open_raw(path, *flags)? }
@@ -704,6 +707,7 @@ impl Database {
                             auth_token.clone(),
                             connector.clone(),
                             None,
+                            None,
                         ),
                         read_your_writes: *read_your_writes,
                         context: db.sync_ctx.clone().unwrap(),
@@ -724,6 +728,7 @@ impl Database {
                 auth_token,
                 connector,
                 version,
+                namespace,
             } => {
                 let conn = std::sync::Arc::new(
                     crate::hrana::connection::HttpConnection::new_with_connector(
@@ -731,6 +736,7 @@ impl Database {
                         auth_token,
                         connector.clone(),
                         version.as_ref().map(|s| s.as_str()),
+                        namespace.as_ref().map(|s| s.as_str()),
                     ),
                 );
 
