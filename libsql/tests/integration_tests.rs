@@ -526,6 +526,17 @@ async fn blob() {
 
     let out = row.get::<Vec<u8>>(1).unwrap();
     assert_eq!(&out, &bytes);
+
+    let empty: Vec<u8> = vec![];
+    let mut rows = conn
+        .query(
+            "INSERT INTO bbb (data) VALUES (?1) RETURNING *",
+            [Value::Blob(empty.clone())],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<Vec<u8>>(1).unwrap(), empty);
 }
 
 #[tokio::test]
@@ -594,6 +605,26 @@ async fn debug_print_row() {
         format!("{:?}", rows.next().await.unwrap().unwrap()),
         "{Some(\"id\"): (Integer, 123), Some(\"name\"): (Text, \"potato\"), Some(\"score\"): (Real, 3.14), Some(\"data\"): (Blob, 4), Some(\"age\"): (Null, ())}"
     );
+}
+
+#[tokio::test]
+async fn fts5_invalid_tokenizer() {
+    let db = Database::open(":memory:").unwrap();
+    let conn = db.connect().unwrap();
+    assert!(conn
+        .execute(
+            "CREATE VIRTUAL TABLE t USING fts5(s, tokenize='trigram case_sensitive ')",
+            (),
+        )
+        .await
+        .is_err());
+    assert!(conn
+        .execute(
+            "CREATE VIRTUAL TABLE t USING fts5(s, tokenize='trigram remove_diacritics ')",
+            (),
+        )
+        .await
+        .is_err());
 }
 
 #[cfg(feature = "serde")]

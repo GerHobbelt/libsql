@@ -723,7 +723,7 @@ void sqlite3ColumnSetExpr(
 */
 Expr *sqlite3ColumnExpr(Table *pTab, Column *pCol){
   if( pCol->iDflt==0 ) return 0;
-  if( NEVER(!IsOrdinaryTable(pTab)) ) return 0;
+  if( !IsOrdinaryTable(pTab) ) return 0;
   if( NEVER(pTab->u.tab.pDfltList==0) ) return 0;
   if( NEVER(pTab->u.tab.pDfltList->nExpr<pCol->iDflt) ) return 0;
   return pTab->u.tab.pDfltList->a[pCol->iDflt-1].pExpr;
@@ -833,7 +833,7 @@ static void SQLITE_NOINLINE deleteTable(sqlite3 *db, Table *pTable){
   for(pIndex = pTable->pIndex; pIndex; pIndex=pNext){
     pNext = pIndex->pNext;
     assert( pIndex->pSchema==pTable->pSchema
-         || (IsVirtual(pTable) && !IsAppDefIndex(pIndex)) );
+         || (IsVirtual(pTable) && pIndex->idxType!=SQLITE_IDXTYPE_APPDEF) );
     if( db->pnBytesFreed==0 && !IsVirtual(pTable) ){
       char *zName = pIndex->zName;
       TESTONLY ( Index *pOld = ) sqlite3HashInsert(
@@ -875,6 +875,9 @@ void sqlite3DeleteTable(sqlite3 *db, Table *pTable){
   if( !pTable ) return;
   if( db->pnBytesFreed==0 && (--pTable->nTabRef)>0 ) return;
   deleteTable(db, pTable);
+}
+void sqlite3DeleteTableGeneric(sqlite3 *db, void *pTable){
+  sqlite3DeleteTable(db, (Table*)pTable);
 }
 
 
@@ -1413,7 +1416,8 @@ void sqlite3ColumnPropertiesFromName(Table *pTab, Column *pCol){
 /*
 ** Clean up the data structures associated with the RETURNING clause.
 */
-static void sqlite3DeleteReturning(sqlite3 *db, Returning *pRet){
+static void sqlite3DeleteReturning(sqlite3 *db, void *pArg){
+  Returning *pRet = (Returning*)pArg;
   Hash *pHash;
   pHash = &(db->aDb[1].pSchema->trigHash);
   sqlite3HashInsert(pHash, pRet->zName, 0);
@@ -1455,8 +1459,7 @@ void sqlite3AddReturning(Parse *pParse, ExprList *pList){
   pParse->u1.pReturning = pRet;
   pRet->pParse = pParse;
   pRet->pReturnEL = pList;
-  sqlite3ParserAddCleanup(pParse,
-     (void(*)(sqlite3*,void*))sqlite3DeleteReturning, pRet);
+  sqlite3ParserAddCleanup(pParse, sqlite3DeleteReturning, pRet);
   testcase( pParse->earlyCleanup );
   if( db->mallocFailed ) return;
   sqlite3_snprintf(sizeof(pRet->zName), pRet->zName,
@@ -1655,7 +1658,8 @@ char sqlite3AffinityType(const char *zIn, Column *pCol){
 
   assert( zIn!=0 );
   while( zIn[0] ){
-    h = (h<<8) + sqlite3UpperToLower[(*zIn)&0xff];
+    u8 x = *(u8*)zIn;
+    h = (h<<8) + sqlite3UpperToLower[x];
     zIn++;
     if( h==(('c'<<24)+('h'<<16)+('a'<<8)+'r') ){             /* CHAR */
       aff = SQLITE_AFF_TEXT;
@@ -4341,13 +4345,7 @@ void sqlite3CreateIndex(
     goto exit_create_index;
   }
   if( vectorIdxRc >= 1 ){
-    idxType = SQLITE_IDXTYPE_VECTOR;
-    /*
-     * SQLite can use B-Tree indices in some optimizations (like SELECT COUNT(*) can use any full B-Tree index instead of PK index)
-     * But, SQLite pretty conservative about usage of unordered indices - that's what we need here
-    */
-    pIndex->bUnordered = 1;
-    pIndex->idxType = idxType;
+    pIndex->idxIsVector = 1;
   }
   if( vectorIdxRc == 1 ){
     skipRefill = 1;
@@ -4395,7 +4393,7 @@ void sqlite3CreateIndex(
     for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
       int k;
       assert( IsUniqueIndex(pIdx) );
-      assert( !IsAppDefIndex(pIdx) );
+      assert( pIdx->idxType!=SQLITE_IDXTYPE_APPDEF );
       assert( IsUniqueIndex(pIndex) );
 
       if( pIdx->nKeyCol!=pIndex->nKeyCol ) continue;
@@ -4676,7 +4674,7 @@ void sqlite3DropIndex(Parse *pParse, SrcList *pName, int ifExists){
     pParse->checkSchema = 1;
     goto exit_drop_index;
   }
-  if( !IsAppDefIndex(pIndex) ){
+  if( pIndex->idxType!=SQLITE_IDXTYPE_APPDEF ){
     sqlite3ErrorMsg(pParse, "index associated with UNIQUE "
       "or PRIMARY KEY constraint cannot be dropped", 0);
     goto exit_drop_index;
@@ -5614,7 +5612,7 @@ void sqlite3Reindex(Parse *pParse, Token *pName1, Token *pName2){
   if( iDb<0 ) return;
   z = sqlite3NameFromToken(db, pObjName);
   if( z==0 ) return;
-  zDb = db->aDb[iDb].zDbSName;
+  zDb = pName2->n ? db->aDb[iDb].zDbSName : 0;
   pTab = sqlite3FindTable(db, z, zDb);
   if( pTab ){
     reindexTable(pParse, pTab, 0);
@@ -5624,6 +5622,7 @@ void sqlite3Reindex(Parse *pParse, Token *pName1, Token *pName2){
   pIndex = sqlite3FindIndex(db, z, zDb);
   sqlite3DbFree(db, z);
   if( pIndex ){
+    iDb = sqlite3SchemaToIndex(db, pIndex->pTable->pSchema);
     sqlite3BeginWriteOperation(pParse, 0, iDb);
     sqlite3RefillIndex(pParse, pIndex, -1);
     return;
@@ -5806,6 +5805,9 @@ void sqlite3WithDelete(sqlite3 *db, With *pWith){
     }
     sqlite3DbFree(db, pWith);
   }
+}
+void sqlite3WithDeleteGeneric(sqlite3 *db, void *pWith){
+  sqlite3WithDelete(db, (With*)pWith);
 }
 #endif /* !defined(SQLITE_OMIT_CTE) */
 

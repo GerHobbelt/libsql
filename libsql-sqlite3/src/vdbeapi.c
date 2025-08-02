@@ -152,7 +152,15 @@ int sqlite3_clear_bindings(sqlite3_stmt *pStmt){
   int rc = SQLITE_OK;
   Vdbe *p = (Vdbe*)pStmt;
 #if SQLITE_THREADSAFE
-  sqlite3_mutex *mutex = ((Vdbe*)pStmt)->db->mutex;
+  sqlite3_mutex *mutex;
+#endif
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( pStmt==0 ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+#if SQLITE_THREADSAFE
+  mutex = p->db->mutex;
 #endif
   sqlite3_mutex_enter(mutex);
   for(i=0; i<p->nVar; i++){
@@ -531,6 +539,18 @@ void sqlite3_result_subtype(sqlite3_context *pCtx, unsigned int eSubtype){
 #ifdef SQLITE_ENABLE_API_ARMOR
   if( pCtx==0 ) return;
 #endif
+#if defined(SQLITE_STRICT_SUBTYPE) && SQLITE_STRICT_SUBTYPE+0!=0
+  if( pCtx->pFunc!=0
+   && (pCtx->pFunc->funcFlags & SQLITE_RESULT_SUBTYPE)==0
+  ){
+    char zErr[200];
+    sqlite3_snprintf(sizeof(zErr), zErr,
+                     "misuse of sqlite3_result_subtype() by %s()", 
+                     pCtx->pFunc->zName);
+    sqlite3_result_error(pCtx, zErr, -1);
+    return;
+  }
+#endif /* SQLITE_STRICT_SUBTYPE */
   pOut = pCtx->pOut;
   assert( sqlite3_mutex_held(pOut->db->mutex) );
   pOut->eSubtype = eSubtype & 0xff;
@@ -869,6 +889,18 @@ end_of_step:
 }
 
 /*
+** Interrupt the statement.
+*/
+void libsql_stmt_interrupt(sqlite3_stmt *pStmt){
+  Vdbe *v = (Vdbe*)pStmt;  /* the prepared statement */
+  if( vdbeSafetyNotNull(v) ){
+    (void)SQLITE_MISUSE_BKPT;
+    return;
+  }
+  v->isInterrupted = 1;
+}
+
+/*
 ** This is the top-level implementation of sqlite3_step().  Call
 ** sqlite3Step() to do most of the work.  If a schema error occurs,
 ** call sqlite3Reprepare() and try again.
@@ -883,6 +915,12 @@ int sqlite3_step(sqlite3_stmt *pStmt){
     return SQLITE_MISUSE_BKPT;
   }
   db = v->db;
+  if( v->isInterrupted ){
+    rc = SQLITE_INTERRUPT;
+    v->rc = rc;
+    db->errCode = rc;
+    return rc;
+  }
   sqlite3_mutex_enter(db->mutex);
   while( (rc = sqlite3Step(v))==SQLITE_SCHEMA
          && cnt++ < SQLITE_MAX_SCHEMA_RETRY ){
@@ -930,9 +968,8 @@ int sqlite3_step(sqlite3_stmt *pStmt){
 void *sqlite3_user_data(sqlite3_context *p){
 #ifdef SQLITE_ENABLE_API_ARMOR
   if( p==0 ) return 0;
-#else
-  assert( p && p->pFunc );
 #endif
+  assert( p && p->pFunc );
   return p->pFunc->pUserData;
 }
 

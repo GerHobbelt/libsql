@@ -41,7 +41,10 @@ libsql.pc
 /sqlite3session.h
 tclsqlite.lo
 tclsqlite.o
-testdir/
+
+testdir/*
+!testdir/libsql_vector_index_v2.db
+
 tsrc/
 dbhash
 fuzzcheck
@@ -62,3 +65,5 @@ libsql
 /crates/target/
 /has_tclsh*
 /libsql.wasm
+test_libsql_f16_table.h
+test_libsql_f16

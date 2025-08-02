@@ -4,7 +4,7 @@ use tonic::metadata::errors::InvalidMetadataValueBytes;
 
 use crate::{
     auth::AuthError,
-    namespace::{ForkError, NamespaceName},
+    namespace::{configurator::fork::ForkError, NamespaceName},
     query_result_builder::QueryResultBuilderError,
 };
 
@@ -37,6 +37,8 @@ pub enum Error {
     InvalidBatchStep(usize),
     #[error("Not authorized to execute query: {0}")]
     NotAuthorized(String),
+    #[error("Authorization forbidden: {0}")]
+    Forbidden(String),
     #[error("The replicator exited, instance cannot make any progress.")]
     ReplicatorExited,
     #[error("Timed out while opening database connection")]
@@ -124,6 +126,8 @@ pub enum Error {
     AttachInMigration,
     #[error("join failure: {0}")]
     RuntimeTaskJoinError(#[from] tokio::task::JoinError),
+    #[error("database is not a primary")]
+    NotAPrimary,
 }
 
 impl AsRef<Self> for Error {
@@ -174,6 +178,7 @@ impl IntoResponse for &Error {
             Internal(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             InvalidBatchStep(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             NotAuthorized(_) => self.format_err(StatusCode::UNAUTHORIZED),
+            Forbidden(_) => self.format_err(StatusCode::FORBIDDEN),
             ReplicatorExited => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
             DbCreateTimeout => self.format_err(StatusCode::TOO_MANY_REQUESTS),
             BuilderError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -183,7 +188,7 @@ impl IntoResponse for &Error {
             QueryError(_) => self.format_err(StatusCode::BAD_REQUEST),
             InvalidHost(_) => self.format_err(StatusCode::BAD_REQUEST),
             InvalidPath(_) => self.format_err(StatusCode::BAD_REQUEST),
-            NamespaceDoesntExist(_) => self.format_err(StatusCode::BAD_REQUEST),
+            NamespaceDoesntExist(_) => self.format_err(StatusCode::NOT_FOUND),
             PrimaryConnectionTimeout => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             NamespaceAlreadyExist(_) => self.format_err(StatusCode::BAD_REQUEST),
             InvalidNamespace => self.format_err(StatusCode::BAD_REQUEST),
@@ -218,6 +223,7 @@ impl IntoResponse for &Error {
             HasLinkedDbs(_) => self.format_err(StatusCode::BAD_REQUEST),
             AttachInMigration => self.format_err(StatusCode::BAD_REQUEST),
             RuntimeTaskJoinError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
+            NotAPrimary => self.format_err(StatusCode::BAD_REQUEST),
         }
     }
 }
@@ -288,6 +294,8 @@ pub enum LoadDumpError {
     NoCommit,
     #[error("Path is not a file")]
     NotAFile,
+    #[error("The passed dump sql is invalid: {0}")]
+    InvalidSqlInput(String),
 }
 
 impl ResponseError for LoadDumpError {}
@@ -306,7 +314,8 @@ impl IntoResponse for &LoadDumpError {
             | NoTxn
             | NoCommit
             | NotAFile
-            | DumpFilePathNotAbsolute => self.format_err(StatusCode::BAD_REQUEST),
+            | DumpFilePathNotAbsolute
+            | InvalidSqlInput(_) => self.format_err(StatusCode::BAD_REQUEST),
         }
     }
 }
@@ -322,6 +331,7 @@ impl IntoResponse for &ForkError {
             | ForkError::BackupServiceNotConfigured
             | ForkError::CreateNamespace(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             ForkError::ForkReplica => self.format_err(StatusCode::BAD_REQUEST),
+            ForkError::ForkNoStorage => self.format_err(StatusCode::BAD_REQUEST),
         }
     }
 }

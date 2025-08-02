@@ -1,6 +1,7 @@
 cfg_core! {
     use crate::EncryptionConfig;
 }
+
 use crate::{Database, Result};
 
 use super::DbType;
@@ -12,6 +13,8 @@ use super::DbType;
 ///     it does no networking and does not connect to any remote database.
 /// - `new_remote_replica`/`RemoteReplica` creates an embedded replica database that will be able
 ///     to sync from the remote url and delegate writes to the remote primary.
+/// - `new_synced_database`/`SyncedDatabase` creates a database that can be written offline and
+///     synced to a remote server.
 /// - `new_local_replica`/`LocalReplica` creates an embedded replica similar to the remote version
 ///     except you must use `Database::sync_frames` to sync with the remote. This version also
 ///     includes the ability to delegate writes to a remote primary.
@@ -36,6 +39,7 @@ impl Builder<()> {
                     path: path.as_ref().to_path_buf(),
                     flags: crate::OpenFlags::default(),
                     encryption_config: None,
+                    skip_safety_assert: false,
                 },
             }
         }
@@ -61,7 +65,10 @@ impl Builder<()> {
                     read_your_writes: true,
                     sync_interval: None,
                     http_request_callback: None,
-                    namespace: None
+                    namespace: None,
+                    skip_safety_assert: false,
+                    #[cfg(feature = "sync")]
+                    sync_protocol: Default::default(),
                 },
             }
         }
@@ -75,6 +82,32 @@ impl Builder<()> {
                     remote: None,
                     encryption_config: None,
                     http_request_callback: None
+                },
+            }
+        }
+    }
+
+    cfg_sync! {
+        /// Create a database that can be written offline and synced to a remote server.
+        pub fn new_synced_database(
+            path: impl AsRef<std::path::Path>,
+            url: String,
+            auth_token: String,
+        ) -> Builder<SyncedDatabase> {
+            Builder {
+                inner: SyncedDatabase {
+                    path: path.as_ref().to_path_buf(),
+                    flags: crate::OpenFlags::default(),
+                    remote: Remote {
+                        url,
+                        auth_token,
+                        connector: None,
+                        version: None,
+                    },
+                    connector: None,
+                    read_your_writes: true,
+                    remote_writes: false,
+                    push_batch_size: 0,
                 },
             }
         }
@@ -95,7 +128,7 @@ impl Builder<()> {
     }
 }
 
-cfg_replication_or_remote! {
+cfg_replication_or_remote_or_sync! {
     /// Remote configuration type used in [`Builder`].
     pub struct Remote {
         url: String,
@@ -111,6 +144,7 @@ cfg_core! {
         path: std::path::PathBuf,
         flags: crate::OpenFlags,
         encryption_config: Option<EncryptionConfig>,
+        skip_safety_assert: bool,
     }
 
     impl Builder<Local> {
@@ -129,12 +163,32 @@ cfg_core! {
             self
         }
 
+        /// Skip the saftey assert used to ensure that sqlite3 is configured correctly for the way
+        /// that libsql uses the ffi code. By default, libsql will try to use the SERIALIZED
+        /// threadsafe mode for sqlite3. This allows us to implement Send/Sync for all the types to
+        /// allow them to move between threads safely. Due to the fact that sqlite3 has a global
+        /// config this may conflict with other sqlite3 connections in the same process.
+        ///
+        /// Using this setting is very UNSAFE and you are expected to use the libsql in adherence
+        /// with the sqlite3 threadsafe rules or else you WILL create undefined behavior. Use at
+        /// your own risk.
+        pub unsafe fn skip_saftey_assert(mut self, skip: bool) -> Builder<Local> {
+            self.inner.skip_safety_assert = skip;
+            self
+        }
+
         /// Build the local database.
         pub async fn build(self) -> Result<Database> {
             let db = if self.inner.path == std::path::Path::new(":memory:") {
-                let db = crate::local::Database::open(":memory:", crate::OpenFlags::default())?;
+                let db = if !self.inner.skip_safety_assert {
+                    crate::local::Database::open(":memory:", crate::OpenFlags::default())?
+                } else {
+                    unsafe { crate::local::Database::open_raw(":memory:", crate::OpenFlags::default())? }
+                };
+
                 Database {
                     db_type: DbType::Memory { db } ,
+                    max_write_replication_index: Default::default(),
                 }
             } else {
                 let path = self
@@ -149,7 +203,9 @@ cfg_core! {
                         path,
                         flags: self.inner.flags,
                         encryption_config: self.inner.encryption_config,
+                        skip_saftey_assert: self.inner.skip_safety_assert
                     },
+                    max_write_replication_index: Default::default(),
                 }
             };
 
@@ -168,6 +224,9 @@ cfg_replication! {
         sync_interval: Option<std::time::Duration>,
         http_request_callback: Option<crate::util::HttpRequestCallback>,
         namespace: Option<String>,
+        skip_safety_assert: bool,
+        #[cfg(feature = "sync")]
+        sync_protocol: super::SyncProtocol,
     }
 
     /// Local replica configuration type in [`Builder`].
@@ -220,6 +279,15 @@ cfg_replication! {
             self
         }
 
+        /// Set the duration at which the replicator will automatically call `sync` in the
+        /// background. The sync will continue for the duration that the resulted `Database`
+        /// type is alive for, once it is dropped the background task will get dropped and stop.
+        #[cfg(feature = "sync")]
+        pub fn sync_protocol(mut self, protocol: super::SyncProtocol) -> Builder<RemoteReplica> {
+            self.inner.sync_protocol = protocol;
+            self
+        }
+
         pub fn http_request_callback<F>(mut self, f: F) -> Builder<RemoteReplica>
         where
             F: Fn(&mut http::Request<()>) + Send + Sync + 'static
@@ -242,6 +310,20 @@ cfg_replication! {
             self
         }
 
+        /// Skip the saftey assert used to ensure that sqlite3 is configured correctly for the way
+        /// that libsql uses the ffi code. By default, libsql will try to use the SERIALIZED
+        /// threadsafe mode for sqlite3. This allows us to implement Send/Sync for all the types to
+        /// allow them to move between threads safely. Due to the fact that sqlite3 has a global
+        /// config this may conflict with other sqlite3 connections in the same process.
+        ///
+        /// Using this setting is very UNSAFE and you are expected to use the libsql in adherence
+        /// with the sqlite3 threadsafe rules or else you WILL create undefined behavior. Use at
+        /// your own risk.
+        pub unsafe fn skip_saftey_assert(mut self, skip: bool) -> Builder<RemoteReplica> {
+            self.inner.skip_safety_assert = skip;
+            self
+        }
+
         /// Build the remote embedded replica database.
         pub async fn build(self) -> Result<Database> {
             let RemoteReplica {
@@ -257,7 +339,10 @@ cfg_replication! {
                 read_your_writes,
                 sync_interval,
                 http_request_callback,
-                namespace
+                namespace,
+                skip_safety_assert,
+                #[cfg(feature = "sync")]
+                sync_protocol,
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
@@ -273,24 +358,104 @@ cfg_replication! {
                 crate::util::ConnectorService::new(svc)
             };
 
+            #[cfg(feature = "sync")]
+            {
+                use super::SyncProtocol;
+                match sync_protocol {
+                    p @ (SyncProtocol::Auto | SyncProtocol::V2) => {
+                        tracing::trace!("Probing for sync protocol version for {}", url);
+                        let client = hyper::client::Client::builder()
+                            .build::<_, hyper::Body>(connector.clone());
+
+                        let prefix = if url.starts_with("libsql://") {
+                            url.replacen("libsql://", "https://", 1)
+                        } else {
+                            url.to_string()
+                        };
+                        let req = http::Request::get(format!("{prefix}/sync/0/0/0"))
+                            .header("Authorization", format!("Bearer {}", auth_token))
+                            .body(hyper::Body::empty())
+                            .unwrap();
+
+                        let res = client
+                            .request(req)
+                            .await
+                            .map_err(|err| crate::Error::Sync(err.into()))?;
+
+                        tracing::trace!("Probe for sync protocol version for {} returned status {}", url, res.status());
+
+                        if res.status() == http::StatusCode::UNAUTHORIZED {
+                            return Err(crate::Error::Sync("Unauthorized".into()));
+                        }
+
+                        if matches!(p, SyncProtocol::V2) {
+                            if !res.status().is_success() {
+                                let status = res.status();
+                                let body_bytes = hyper::body::to_bytes(res.into_body())
+                                    .await
+                                    .map_err(|err| crate::Error::Sync(err.into()))?;
+                                let error_message = String::from_utf8_lossy(&body_bytes);
+                                return Err(crate::Error::Sync(format!("HTTP error {}: {}", status, error_message).into()));
+                            }
+                        }
+
+                        if res.status().is_success() {
+                            tracing::trace!("Using sync protocol v2 for {}", url);
+                            return Builder::new_synced_database(path, url, auth_token)
+                                .remote_writes(true)
+                                .read_your_writes(read_your_writes)
+                                .build()
+                                .await;
+                        }
+                        tracing::trace!("Using sync protocol v1 for {} based on probe results", url);
+                    }
+                    SyncProtocol::V1 => {
+                        tracing::trace!("Using sync protocol v1 for {}", url);
+                    }
+                }
+            }
+
             let path = path.to_str().ok_or(crate::Error::InvalidUTF8Path)?.to_owned();
 
-            let db = crate::local::Database::open_http_sync_internal(
-                connector,
-                path,
-                url,
-                auth_token,
-                version,
-                read_your_writes,
-                encryption_config.clone(),
-                sync_interval,
-                http_request_callback,
-                namespace,
-            )
-            .await?;
+            let db = if !skip_safety_assert {
+                crate::local::Database::open_http_sync_internal(
+                    connector,
+                    path,
+                    url,
+                    auth_token,
+                    version,
+                    read_your_writes,
+                    encryption_config.clone(),
+                    sync_interval,
+                    http_request_callback,
+                    namespace,
+                )
+                .await?
+            } else {
+                // SAFETY: this can only be enabled via the unsafe config function
+                // `skip_safety_assert`.
+                unsafe  {
+                    crate::local::Database::open_http_sync_internal2(
+                        connector,
+                        path,
+                        url,
+                        auth_token,
+                        version,
+                        read_your_writes,
+                        encryption_config.clone(),
+                        sync_interval,
+                        http_request_callback,
+                        namespace,
+                    )
+                    .await?
+                }
+
+            };
+
 
             Ok(Database {
                 db_type: DbType::Sync { db, encryption_config },
+                max_write_replication_index: Default::default(),
             })
         }
     }
@@ -360,6 +525,114 @@ cfg_replication! {
 
             Ok(Database {
                 db_type: DbType::Sync { db, encryption_config },
+                max_write_replication_index: Default::default(),
+            })
+        }
+    }
+}
+
+cfg_sync! {
+    /// Remote replica configuration type in [`Builder`].
+    pub struct SyncedDatabase {
+        path: std::path::PathBuf,
+        flags: crate::OpenFlags,
+        remote: Remote,
+        connector: Option<crate::util::ConnectorService>,
+        remote_writes: bool,
+        read_your_writes: bool,
+        push_batch_size: u32,
+    }
+
+    impl Builder<SyncedDatabase> {
+        #[doc(hidden)]
+        pub fn version(mut self, version: String) -> Builder<SyncedDatabase> {
+            self.inner.remote = self.inner.remote.version(version);
+            self
+        }
+
+        pub fn read_your_writes(mut self, v: bool) -> Builder<SyncedDatabase> {
+            self.inner.read_your_writes = v;
+            self
+        }
+
+        pub fn remote_writes(mut self, v: bool) -> Builder<SyncedDatabase> {
+            self.inner.remote_writes = v;
+            self
+        }
+
+        pub fn set_push_batch_size(mut self, v: u32) -> Builder<SyncedDatabase> {
+            self.inner.push_batch_size = v;
+            self
+        }
+
+        /// Provide a custom http connector that will be used to create http connections.
+        pub fn connector<C>(mut self, connector: C) -> Builder<SyncedDatabase>
+        where
+            C: tower::Service<http::Uri> + Send + Clone + Sync + 'static,
+            C::Response: crate::util::Socket,
+            C::Future: Send + 'static,
+            C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        {
+            self.inner.connector = Some(wrap_connector(connector));
+            self
+        }
+
+        /// Build a connection to a local database that can be synced to remote server.
+        pub async fn build(self) -> Result<Database> {
+            let SyncedDatabase {
+                path,
+                flags,
+                remote:
+                    Remote {
+                        url,
+                        auth_token,
+                        connector: _,
+                        version: _,
+                    },
+                connector,
+                remote_writes,
+                read_your_writes,
+                push_batch_size,
+            } = self.inner;
+
+            let path = path.to_str().ok_or(crate::Error::InvalidUTF8Path)?.to_owned();
+
+            let https = if let Some(connector) = connector {
+                connector
+            } else {
+                wrap_connector(super::connector()?)
+            };
+            use tower::ServiceExt;
+
+            let svc = https
+                .map_err(|e| e.into())
+                .map_response(|s| Box::new(s) as Box<dyn crate::util::Socket>);
+
+            let connector = crate::util::ConnectorService::new(svc);
+
+            let db = crate::local::Database::open_local_with_offline_writes(
+                connector.clone(),
+                path,
+                flags,
+                url.clone(),
+                auth_token.clone(),
+            )
+            .await?;
+
+            if push_batch_size > 0 {
+                db.sync_ctx.as_ref().unwrap().lock().await.set_push_batch_size(push_batch_size);
+            }
+
+            Ok(Database {
+                db_type: DbType::Offline {
+                    db,
+                    remote_writes,
+                    read_your_writes,
+                    url,
+                    auth_token,
+                    connector,
+                },
+                max_write_replication_index: Default::default(),
             })
         }
     }
@@ -414,12 +687,29 @@ cfg_remote! {
                     connector,
                     version,
                 },
+                max_write_replication_index: Default::default(),
             })
         }
     }
 }
 
-cfg_replication_or_remote! {
+cfg_replication_or_remote_or_sync! {
+    fn wrap_connector<C>(connector: C) -> crate::util::ConnectorService
+    where
+        C: tower::Service<http::Uri> + Send + Clone + Sync + 'static,
+        C::Response: crate::util::Socket,
+        C::Future: Send + 'static,
+        C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        use tower::ServiceExt;
+
+        let svc = connector
+            .map_err(|e| e.into())
+            .map_response(|s| Box::new(s) as Box<dyn crate::util::Socket>);
+
+        crate::util::ConnectorService::new(svc)
+    }
+
     impl Remote {
         fn connector<C>(mut self, connector: C) -> Remote
         where
@@ -428,15 +718,7 @@ cfg_replication_or_remote! {
             C::Future: Send + 'static,
             C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
         {
-            use tower::ServiceExt;
-
-            let svc = connector
-                .map_err(|e| e.into())
-                .map_response(|s| Box::new(s) as Box<dyn crate::util::Socket>);
-
-            let svc = crate::util::ConnectorService::new(svc);
-
-            self.connector = Some(svc);
+            self.connector = Some(wrap_connector(connector));
             self
         }
 

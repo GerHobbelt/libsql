@@ -148,7 +148,6 @@ where
                     }
                 },
                 Some(res) = recv.recv() => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     yield Ok(res);
                 },
                 (ret, request_id) = &mut current_request_fut => {
@@ -367,7 +366,7 @@ pub mod test {
     use tokio_stream::wrappers::ReceiverStream;
 
     use crate::auth::Authenticated;
-    use crate::connection::libsql::LibSqlConnection;
+    use crate::connection::legacy::LegacyConnection;
     use crate::connection::program::Program;
     use crate::namespace::meta_store::{metastore_connection_maker, MetaStore};
     use crate::namespace::NamespaceName;
@@ -390,15 +389,21 @@ pub mod test {
     #[tokio::test]
     async fn invalid_request() {
         let tmp = tempdir().unwrap();
-        let conn = LibSqlConnection::new_test(tmp.path()).await;
+        let conn = LegacyConnection::new_test(tmp.path()).await;
         let (snd, rcv) = mpsc::channel(1);
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let ctx = RequestContext::new(
             Authenticated::Anonymous,
             NamespaceName::default(),
-            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
-                .await
-                .unwrap(),
+            MetaStore::new(
+                Default::default(),
+                tmp.path(),
+                maker().unwrap(),
+                manager,
+                crate::database::DatabaseKind::Primary,
+            )
+            .await
+            .unwrap(),
         );
         let stream = make_proxy_stream(conn, ctx, ReceiverStream::new(rcv));
         pin!(stream);
@@ -416,15 +421,21 @@ pub mod test {
     #[tokio::test]
     async fn request_stream_dropped() {
         let tmp = tempdir().unwrap();
-        let conn = LibSqlConnection::new_test(tmp.path()).await;
+        let conn = LegacyConnection::new_test(tmp.path()).await;
         let (snd, rcv) = mpsc::channel(1);
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let ctx = RequestContext::new(
             Authenticated::FullAccess,
             NamespaceName::default(),
-            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
-                .await
-                .unwrap(),
+            MetaStore::new(
+                Default::default(),
+                tmp.path(),
+                maker().unwrap(),
+                manager,
+                crate::database::DatabaseKind::Primary,
+            )
+            .await
+            .unwrap(),
         );
         let stream = make_proxy_stream(conn, ctx, ReceiverStream::new(rcv));
 
@@ -438,15 +449,21 @@ pub mod test {
     #[tokio::test]
     async fn perform_query_simple() {
         let tmp = tempdir().unwrap();
-        let conn = LibSqlConnection::new_test(tmp.path()).await;
+        let conn = LegacyConnection::new_test(tmp.path()).await;
         let (snd, rcv) = mpsc::channel(1);
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let ctx = RequestContext::new(
             Authenticated::FullAccess,
             NamespaceName::default(),
-            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
-                .await
-                .unwrap(),
+            MetaStore::new(
+                Default::default(),
+                tmp.path(),
+                maker().unwrap(),
+                manager,
+                crate::database::DatabaseKind::Primary,
+            )
+            .await
+            .unwrap(),
         );
         let stream = make_proxy_stream(conn, ctx, ReceiverStream::new(rcv));
 
@@ -462,15 +479,21 @@ pub mod test {
     #[tokio::test]
     async fn single_query_split_response() {
         let tmp = tempdir().unwrap();
-        let conn = LibSqlConnection::new_test(tmp.path()).await;
+        let conn = LegacyConnection::new_test(tmp.path()).await;
         let (snd, rcv) = mpsc::channel(1);
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let ctx = RequestContext::new(
             Authenticated::FullAccess,
             NamespaceName::default(),
-            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
-                .await
-                .unwrap(),
+            MetaStore::new(
+                Default::default(),
+                tmp.path(),
+                maker().unwrap(),
+                manager,
+                crate::database::DatabaseKind::Primary,
+            )
+            .await
+            .unwrap(),
         );
         // limit the size of the response to force a split
         let stream = make_proxy_stream_inner(conn, ctx, ReceiverStream::new(rcv), 500);
@@ -519,15 +542,21 @@ pub mod test {
     #[tokio::test]
     async fn request_interupted() {
         let tmp = tempdir().unwrap();
-        let conn = LibSqlConnection::new_test(tmp.path()).await;
+        let conn = LegacyConnection::new_test(tmp.path()).await;
         let (snd, rcv) = mpsc::channel(2);
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let ctx = RequestContext::new(
             Authenticated::FullAccess,
             NamespaceName::default(),
-            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
-                .await
-                .unwrap(),
+            MetaStore::new(
+                Default::default(),
+                tmp.path(),
+                maker().unwrap(),
+                manager,
+                crate::database::DatabaseKind::Primary,
+            )
+            .await
+            .unwrap(),
         );
         let stream = make_proxy_stream(conn, ctx, ReceiverStream::new(rcv));
 
@@ -546,15 +575,21 @@ pub mod test {
     #[tokio::test]
     async fn perform_multiple_queries() {
         let tmp = tempdir().unwrap();
-        let conn = LibSqlConnection::new_test(tmp.path()).await;
+        let conn = LegacyConnection::new_test(tmp.path()).await;
         let (snd, rcv) = mpsc::channel(1);
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let ctx = RequestContext::new(
             Authenticated::FullAccess,
             NamespaceName::default(),
-            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
-                .await
-                .unwrap(),
+            MetaStore::new(
+                Default::default(),
+                tmp.path(),
+                maker().unwrap(),
+                manager,
+                crate::database::DatabaseKind::Primary,
+            )
+            .await
+            .unwrap(),
         );
         let stream = make_proxy_stream(conn, ctx, ReceiverStream::new(rcv));
 
@@ -573,15 +608,21 @@ pub mod test {
     #[tokio::test]
     async fn query_number_less_than_previous_query() {
         let tmp = tempdir().unwrap();
-        let conn = LibSqlConnection::new_test(tmp.path()).await;
+        let conn = LegacyConnection::new_test(tmp.path()).await;
         let (snd, rcv) = mpsc::channel(1);
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let ctx = RequestContext::new(
             Authenticated::FullAccess,
             NamespaceName::default(),
-            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
-                .await
-                .unwrap(),
+            MetaStore::new(
+                Default::default(),
+                tmp.path(),
+                maker().unwrap(),
+                manager,
+                crate::database::DatabaseKind::Primary,
+            )
+            .await
+            .unwrap(),
         );
         let stream = make_proxy_stream(conn, ctx, ReceiverStream::new(rcv));
 
@@ -602,15 +643,21 @@ pub mod test {
     #[tokio::test]
     async fn describe() {
         let tmp = tempdir().unwrap();
-        let conn = LibSqlConnection::new_test(tmp.path()).await;
+        let conn = LegacyConnection::new_test(tmp.path()).await;
         let (snd, rcv) = mpsc::channel(1);
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let ctx = RequestContext::new(
             Authenticated::FullAccess,
             NamespaceName::default(),
-            MetaStore::new(Default::default(), tmp.path(), maker().unwrap(), manager)
-                .await
-                .unwrap(),
+            MetaStore::new(
+                Default::default(),
+                tmp.path(),
+                maker().unwrap(),
+                manager,
+                crate::database::DatabaseKind::Primary,
+            )
+            .await
+            .unwrap(),
         );
         let stream = make_proxy_stream(conn, ctx, ReceiverStream::new(rcv));
 

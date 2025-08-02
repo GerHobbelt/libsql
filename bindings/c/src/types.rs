@@ -14,6 +14,7 @@ pub struct libsql_config {
     pub encryption_key: *const std::ffi::c_char,
     pub sync_interval: std::ffi::c_int,
     pub with_webpki: std::ffi::c_char,
+    pub offline: std::ffi::c_char,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +114,12 @@ impl From<&mut libsql_connection> for libsql_connection_t {
     fn from(value: &mut libsql_connection) -> Self {
         Self { ptr: value }
     }
+}
+
+#[repr(C)]
+pub struct replicated {
+    pub frame_no: std::ffi::c_int,
+    pub frames_synced: std::ffi::c_int,
 }
 
 pub struct stmt {

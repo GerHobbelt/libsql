@@ -40,6 +40,7 @@ fn apply_partial_snapshot() {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                         connector: TurmoilConnector,
                         disable_metrics: true,
+                        auth_key: None,
                     }),
                     rpc_server_config: Some(RpcServerConfig {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 5050)).await.unwrap(),
@@ -71,6 +72,7 @@ fn apply_partial_snapshot() {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                         connector: TurmoilConnector,
                         disable_metrics: true,
+                        auth_key: None,
                     }),
                     rpc_client_config: Some(RpcClientConfig {
                         remote_url: "http://primary:5050".into(),
@@ -167,6 +169,7 @@ fn replica_lazy_creation() {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                         connector: TurmoilConnector,
                         disable_metrics: true,
+                        auth_key: None,
                     }),
                     rpc_server_config: Some(RpcServerConfig {
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 5050)).await.unwrap(),
@@ -197,6 +200,7 @@ fn replica_lazy_creation() {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await.unwrap(),
                     connector: TurmoilConnector,
                     disable_metrics: true,
+                    auth_key: None,
                 }),
                 rpc_client_config: Some(RpcClientConfig {
                     remote_url: "http://primary:5050".into(),
@@ -312,6 +316,9 @@ fn replica_interactive_transaction() {
             .await
             .unwrap();
         tx.commit().await.unwrap();
+
+        // libsql-client doesn't support read your writes yet
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let count = conn
             .query("select count(0) from test", ())

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::{fmt, path::Path};
+use std::time::Duration;
 
 use crate::connection::BatchRows;
 use crate::{
     connection::Conn,
     params::Params,
-    rows::{RowInner, RowsInner},
+    rows::{ColumnsInner, RowInner, RowsInner},
     statement::Stmt,
     transaction::Tx,
     Column, Connection, Result, Row, Rows, Statement, Transaction, TransactionBehavior, Value,
@@ -54,6 +55,14 @@ impl Conn for LibsqlConnection {
         })
     }
 
+    fn interrupt(&self) -> Result<()> {
+        self.conn.interrupt()
+    }
+
+    fn busy_timeout(&self, timeout: Duration) -> Result<()> {
+        self.conn.busy_timeout(timeout)
+    }
+
     fn is_autocommit(&self) -> bool {
         self.conn.is_autocommit()
     }
@@ -87,7 +96,7 @@ impl Drop for LibsqlConnection {
     }
 }
 
-pub(crate) struct LibsqlStmt(pub(super) crate::local::Statement);
+pub(crate) struct LibsqlStmt(pub crate::local::Statement);
 
 #[async_trait::async_trait]
 impl Stmt for LibsqlStmt {
@@ -114,6 +123,10 @@ impl Stmt for LibsqlStmt {
         let stmt = self.0.clone();
 
         stmt.run(&params)
+    }
+
+    fn interrupt(&mut self) -> Result<()> {
+        self.0.interrupt()
     }
 
     fn reset(&mut self) {
@@ -159,7 +172,9 @@ impl RowsInner for LibsqlRows {
 
         Ok(row)
     }
+}
 
+impl ColumnsInner for LibsqlRows {
     fn column_count(&self) -> i32 {
         self.0.column_count()
     }
@@ -180,20 +195,22 @@ impl RowInner for LibsqlRow {
         self.0.get_value(idx)
     }
 
-    fn column_name(&self, idx: i32) -> Option<&str> {
-        self.0.column_name(idx)
-    }
-
     fn column_str(&self, idx: i32) -> Result<&str> {
         self.0.get::<&str>(idx)
+    }
+}
+
+impl ColumnsInner for LibsqlRow {
+    fn column_name(&self, idx: i32) -> Option<&str> {
+        self.0.column_name(idx)
     }
 
     fn column_type(&self, idx: i32) -> Result<ValueType> {
         self.0.column_type(idx).map(ValueType::from)
     }
 
-    fn column_count(&self) -> usize {
-        self.0.stmt.column_count()
+    fn column_count(&self) -> i32 {
+        self.0.stmt.column_count() as i32
     }
 }
 

@@ -1,11 +1,12 @@
 use anyhow::Context as _;
 use axum::body::StreamBody;
 use axum::extract::{FromRef, Path, State};
+use axum::middleware::Next;
 use axum::routing::delete;
 use axum::Json;
 use chrono::NaiveDateTime;
 use futures::{SinkExt, StreamExt, TryStreamExt};
-use hyper::{Body, Request};
+use hyper::{Body, Request, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,7 @@ struct AppState<C> {
     user_http_server: Arc<hrana::http::Server>,
     connector: C,
     metrics: Metrics,
+    set_env_filter: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Sync + Send + 'static>>,
 }
 
 impl<C> FromRef<Arc<AppState<C>>> for Metrics {
@@ -64,6 +66,8 @@ pub async fn run<A, C>(
     connector: C,
     disable_metrics: bool,
     shutdown: Arc<Notify>,
+    auth: Option<Arc<str>>,
+    set_env_filter: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Sync + Send + 'static>>,
 ) -> anyhow::Result<()>
 where
     A: crate::net::Accept,
@@ -93,9 +97,29 @@ where
 
         tokio::task::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let runtime = tokio::runtime::Handle::current();
+                let metrics = runtime.metrics();
+                crate::metrics::TOKIO_RUNTIME_BLOCKING_QUEUE_DEPTH
+                    .set(metrics.blocking_queue_depth() as f64);
+                crate::metrics::TOKIO_RUNTIME_INJECTION_QUEUE_DEPTH
+                    .set(metrics.global_queue_depth() as f64);
+                crate::metrics::TOKIO_RUNTIME_NUM_BLOCKING_THREADS
+                    .set(metrics.num_blocking_threads() as f64);
+                crate::metrics::TOKIO_RUNTIME_NUM_IDLE_BLOCKING_THREADS
+                    .set(metrics.num_idle_blocking_threads() as f64);
+                crate::metrics::TOKIO_RUNTIME_NUM_WORKERS.set(metrics.num_workers() as f64);
+
+                crate::metrics::TOKIO_RUNTIME_IO_DRIVER_FD_DEREGISTERED_COUNT
+                    .absolute(metrics.io_driver_fd_deregistered_count() as u64);
+                crate::metrics::TOKIO_RUNTIME_IO_DRIVER_FD_REGISTERED_COUNT
+                    .absolute(metrics.io_driver_fd_registered_count() as u64);
+                crate::metrics::TOKIO_RUNTIME_IO_DRIVER_READY_COUNT
+                    .absolute(metrics.io_driver_ready_count() as u64);
+                crate::metrics::TOKIO_RUNTIME_REMOTE_SCHEDULE_COUNT
+                    .absolute(metrics.remote_schedule_count() as u64);
 
                 crate::metrics::SERVER_COUNT.set(1.0);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
 
@@ -142,15 +166,17 @@ where
         )
         .route("/v1/diagnostics", get(handle_diagnostics))
         .route("/metrics", get(handle_metrics))
-        .with_state(Arc::new(AppState {
-            namespaces,
-            connector,
-            user_http_server,
-            metrics,
-        }))
         .route("/profile/heap/enable", post(enable_profile_heap))
         .route("/profile/heap/disable/:id", post(disable_profile_heap))
         .route("/profile/heap/:id", delete(delete_profile_heap))
+        .route("/log-filter", post(handle_set_log_filter))
+        .with_state(Arc::new(AppState {
+            namespaces: namespaces.clone(),
+            connector,
+            user_http_server,
+            metrics,
+            set_env_filter,
+        }))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .on_request(trace_request)
@@ -161,6 +187,16 @@ where
                 ),
         );
 
+    let admin_shell = crate::admin_shell::make_svc(namespaces.clone());
+    let grpc_router = tonic::transport::Server::builder()
+        .accept_http1(true)
+        .add_service(tonic_web::enable(admin_shell))
+        .into_router();
+
+    let router = router
+        .merge(grpc_router)
+        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware));
+
     hyper::server::Server::builder(acceptor)
         .serve(router.into_make_service())
         .with_graceful_shutdown(shutdown.notified())
@@ -168,6 +204,34 @@ where
         .context("Could not bind admin HTTP API server")?;
 
     Ok(())
+}
+
+async fn auth_middleware<B>(
+    State(auth): State<Option<Arc<str>>>,
+    request: Request<B>,
+    next: Next<B>,
+) -> Result<axum::response::Response, StatusCode> {
+    if let Some(ref auth) = auth {
+        let Some(auth_header) = request.headers().get("authorization") else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let Ok(auth_str) = std::str::from_utf8(auth_header.as_bytes()) else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+
+        let mut split = auth_str.split_whitespace();
+        match split.next() {
+            Some(s) if s.trim().eq_ignore_ascii_case("basic") => (),
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+
+        match split.next() {
+            Some(s) if s.trim() == auth.as_ref() => (),
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
+    Ok(next.run(request).await)
 }
 
 async fn handle_get_index() -> &'static str {
@@ -260,26 +324,42 @@ async fn handle_post_config<C>(
     }
     let store = app_state
         .namespaces
-        .config_store(NamespaceName::from_string(namespace)?)
+        .config_store(NamespaceName::from_string(namespace.clone())?)
         .await?;
-    let mut config = (*store.get()).clone();
-    config.block_reads = req.block_reads;
-    config.block_writes = req.block_writes;
-    config.block_reason = req.block_reason;
-    config.allow_attach = req.allow_attach;
-    config.txn_timeout = req.txn_timeout_s.map(Duration::from_secs);
+    let original = (*store.get()).clone();
+    let mut updated = original.clone();
+    updated.block_reads = req.block_reads;
+    updated.block_writes = req.block_writes;
+    updated.block_reason = req.block_reason;
+    updated.allow_attach = req.allow_attach;
+    updated.txn_timeout = req.txn_timeout_s.map(Duration::from_secs);
     if let Some(size) = req.max_db_size {
-        config.max_db_pages = size.as_u64() / LIBSQL_PAGE_SIZE;
+        updated.max_db_pages = size.as_u64() / LIBSQL_PAGE_SIZE;
     }
     if let Some(url) = req.heartbeat_url {
-        config.heartbeat_url = Some(Url::parse(&url)?);
+        updated.heartbeat_url = Some(Url::parse(&url)?);
     }
-    config.jwt_key = req.jwt_key;
+    updated.jwt_key = req.jwt_key;
     if let Some(mode) = req.durability_mode {
-        config.durability_mode = mode;
+        updated.durability_mode = mode;
     }
 
-    store.store(config).await?;
+    store.store(updated.clone()).await?;
+    // we better to not log jwt token - so let's explicitly log necessary fields
+    tracing::info!(
+        message = "updated db config",
+        namespace = namespace,
+        block_writes_before = original.block_writes,
+        block_writes_after = updated.block_writes,
+        block_reads_before = original.block_reads,
+        block_reads_after = updated.block_reads,
+        allow_attach_before = original.allow_attach,
+        allow_attach_after = updated.allow_attach,
+        max_db_pages_before = original.max_db_pages,
+        max_db_pages_after = updated.max_db_pages,
+        durability_mode_before = original.durability_mode.to_string(),
+        durability_mode_after = updated.durability_mode.to_string(),
+    );
 
     Ok(())
 }
@@ -331,7 +411,7 @@ async fn handle_create_namespace<C: Connector>(
             ));
         }
         // TODO: move this check into meta store
-        if !app_state.namespaces.exists(&ns) {
+        if !app_state.namespaces.exists(&ns).await {
             return Err(Error::NamespaceDoesntExist(ns.to_string()));
         }
 
@@ -449,6 +529,16 @@ async fn handle_delete_namespace<C>(
         .namespaces
         .destroy(NamespaceName::from_string(namespace)?, prune_all)
         .await?;
+    Ok(())
+}
+
+async fn handle_set_log_filter<C>(
+    State(app_state): State<Arc<AppState<C>>>,
+    body: String,
+) -> crate::Result<()> {
+    if let Some(ref cb) = app_state.set_env_filter {
+        cb(&body)?;
+    }
     Ok(())
 }
 

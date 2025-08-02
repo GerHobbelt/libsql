@@ -28,6 +28,11 @@ typedef struct libsql_stmt libsql_stmt;
 typedef const libsql_database *libsql_database_t;
 
 typedef struct {
+  int frame_no;
+  int frames_synced;
+} replicated;
+
+typedef struct {
   const char *db_path;
   const char *primary_url;
   const char *auth_token;
@@ -35,6 +40,7 @@ typedef struct {
   const char *encryption_key;
   int sync_interval;
   char with_webpki;
+  char offline;
 } libsql_config;
 
 typedef const libsql_connection *libsql_connection_t;
@@ -56,7 +62,11 @@ typedef struct {
 extern "C" {
 #endif // __cplusplus
 
+int libsql_enable_internal_tracing(void);
+
 int libsql_sync(libsql_database_t db, const char **out_err_msg);
+
+int libsql_sync2(libsql_database_t db, replicated *out_replicated, const char **out_err_msg);
 
 int libsql_open_sync(const char *db_path,
                      const char *primary_url,

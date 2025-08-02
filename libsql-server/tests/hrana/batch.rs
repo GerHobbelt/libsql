@@ -1,12 +1,15 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use insta::assert_json_snapshot;
+use insta::{assert_json_snapshot, assert_snapshot};
 use libsql::{params, Database};
+use libsql_server::config::UserApiConfig;
 use libsql_server::hrana_proto::{Batch, BatchStep, Stmt};
+use tokio::sync::Notify;
 
 use crate::common::http::Client;
-use crate::common::net::TurmoilConnector;
+use crate::common::net::{init_tracing, SimServer as _, TestServer, TurmoilConnector};
 
 #[test]
 fn sample_request() {
@@ -373,6 +376,205 @@ fn reindex_statement() {
         conn.execute("insert into t(x) values(?)", params!["hello"])
             .await?;
         conn.execute("reindex t_idx", ()).await?;
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn test_simulate_vector_index_load_from_dump() {
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    sim.host("primary", super::make_standalone_server);
+    sim.client("client", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
+        let conn = db.connect()?;
+
+        conn.execute("CREATE TABLE t ( v FLOAT32(2) );", ()).await?;
+        conn.execute("CREATE TABLE t_idx_shadow(index_key  INTEGER , data BLOB, PRIMARY KEY (index_key));", ()).await?;
+        conn.execute("CREATE TABLE libsql_vector_meta_shadow ( name TEXT PRIMARY KEY, metadata BLOB ) WITHOUT ROWID", ()).await?;
+        conn.execute("INSERT INTO libsql_vector_meta_shadow VALUES ('t_idx', x'');", ()).await?;
+        conn.execute("INSERT INTO t VALUES (vector('[1,2]')), (vector('[2,3]'));", ()).await?;
+        conn.execute("CREATE INDEX t_idx ON t (libsql_vector_idx(v));", ()).await?;
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn server_restart_query_execute_invalid_baton() {
+    server_restart(|notify, db| async move {
+        let conn = db.connect().unwrap();
+
+        conn.query("select 1;", ()).await.unwrap();
+
+        notify.notify_waiters();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let err = conn.execute("select 1;", ()).await.unwrap_err();
+        assert_snapshot!(err);
+
+        Ok(())
+    });
+}
+
+#[test]
+fn server_restart_txn_execute_execute_invalid_baton() {
+    server_restart(|notify, db| async move {
+        let conn = db.connect().unwrap();
+
+        let txn = conn.transaction().await.unwrap();
+
+        txn.execute("select 1;", ()).await.unwrap();
+
+        notify.notify_waiters();
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let err = txn.execute("select 1;", ()).await.unwrap_err();
+
+        assert_snapshot!(err);
+
+        Ok(())
+    });
+}
+
+#[test]
+fn server_restart_txn_query_execute_invalid_baton() {
+    server_restart(|notify, db| async move {
+        let conn = db.connect().unwrap();
+
+        let txn = conn.transaction().await.unwrap();
+
+        txn.query("select 1;", ()).await.unwrap();
+
+        notify.notify_waiters();
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let err = txn.execute("select 1;", ()).await.unwrap_err();
+
+        assert_snapshot!(err);
+
+        Ok(())
+    });
+}
+
+#[test]
+fn server_restart_txn_execute_query_invalid_baton() {
+    server_restart(|notify, db| async move {
+        let conn = db.connect().unwrap();
+
+        let txn = conn.transaction().await.unwrap();
+
+        txn.execute("select 1;", ()).await.unwrap();
+
+        notify.notify_waiters();
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let err = txn.query("select 1;", ()).await.unwrap_err();
+
+        assert_snapshot!(err);
+
+        Ok(())
+    });
+}
+
+#[test]
+fn server_restart_execute_query() {
+    server_restart(|notify, db| async move {
+        let conn = db.connect().unwrap();
+        conn.execute("select 1;", ()).await.unwrap();
+
+        notify.notify_waiters();
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        conn.query("select 1;", ()).await.unwrap();
+
+        Ok(())
+    });
+}
+
+#[test]
+fn server_timeout() {
+    server_restart(|_notify, db| async move {
+        let conn = db.connect().unwrap();
+        conn.query("select 1;", ()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+
+        let err = conn.execute("select 1;", ()).await.unwrap_err();
+
+        assert_snapshot!(err);
+
+        let conn = db.connect().unwrap();
+        conn.execute("select 1;", ()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+
+        conn.execute("select 1;", ()).await.unwrap();
+
+        Ok(())
+    });
+}
+
+#[track_caller]
+fn server_restart<F, Fut>(f: F)
+where
+    F: Fn(Arc<Notify>, Database) -> Fut + 'static,
+    Fut: std::future::Future<Output = Result<(), libsql::Error>> + 'static,
+{
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+
+    init_tracing();
+
+    let notify = Arc::new(Notify::new());
+
+    let notify_clone = notify.clone();
+
+    sim.host("primary", move || {
+        let notify = notify.clone();
+        async move {
+            let tmp = tempfile::tempdir()?;
+
+            let make_server = || TestServer {
+                path: tmp.path().to_owned().into(),
+                user_api_config: UserApiConfig {
+                    hrana_ws_acceptor: None,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let server = make_server();
+
+            tokio::select! {
+                res = server.start_sim(8080) => {
+                    res.unwrap()
+                }
+                _ = notify.notified() => (),
+            }
+
+            let server = make_server();
+            server.start_sim(8080).await.unwrap();
+
+            Ok(())
+        }
+    });
+
+    sim.client("client", async move {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)?;
+
+        f(notify_clone, db).await.unwrap();
 
         Ok(())
     });

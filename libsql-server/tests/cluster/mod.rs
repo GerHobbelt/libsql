@@ -17,6 +17,7 @@ use crate::common::{http::Client, net::SimServer, snapshot_metrics};
 
 mod replica_restart;
 mod replication;
+mod schema_dbs;
 
 pub fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool) {
     init_tracing();
@@ -33,6 +34,7 @@ pub fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool)
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
                     connector: TurmoilConnector,
                     disable_metrics: true,
+                    auth_key: None,
                 }),
                 rpc_server_config: Some(RpcServerConfig {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
@@ -63,6 +65,7 @@ pub fn make_cluster(sim: &mut Sim, num_replica: usize, disable_namespaces: bool)
                         acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
                         connector: TurmoilConnector,
                         disable_metrics: true,
+                        auth_key: None,
                     }),
                     rpc_client_config: Some(RpcClientConfig {
                         remote_url: "http://primary:4567".into(),
@@ -300,6 +303,35 @@ fn large_proxy_query() {
         let conn = db.connect().unwrap();
 
         conn.execute_batch("begin immediate; select * from test limit (4000)")
+            .await
+            .unwrap();
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn replicate_from_shared_schema() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(10000))
+        .tcp_capacity(100000)
+        .build();
+    make_cluster(&mut sim, 1, true);
+
+    sim.client("client", async {
+        let db = Database::open_remote_with_connector("http://primary:8080", "", TurmoilConnector)
+            .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("create table test (x)", ()).await.unwrap();
+
+        let db = Database::open_remote_with_connector("http://replica0:8080", "", TurmoilConnector)
+            .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute_batch("select * from sqlite_master;")
             .await
             .unwrap();
 

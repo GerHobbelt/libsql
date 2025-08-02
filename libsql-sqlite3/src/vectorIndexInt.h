@@ -64,8 +64,9 @@ void blobSpotFree(BlobSpot *pBlobSpot);
 
 /*
  * Accessor for node binary format
- * - v1 format is the following:
- *   [u64 nRowid] [u16 nEdges] [node vector] [edge vector] * nEdges [trash vector] * (nMaxEdges - nEdges) ([u64 legacyField] [u64 edgeId]) * nEdges
+ * - default format is the following:
+ *   [u64 nRowid] [u16 nEdges] [6 byte padding] [node vector] [edge vector] * nEdges [trash vector] * (nMaxEdges - nEdges) ([u32 unused] [f32 distance] [u64 edgeId]) * nEdges
+ *   Note, that 6 byte padding after nEdges required to align [node vector] by word boundary and avoid unaligned reads
  *   Note, that node vector and edge vector can have different representations (and edge vector can be smaller in size than node vector)
 */
 int nodeEdgesMaxCount(const DiskAnnIndex *pIndex);
@@ -73,10 +74,10 @@ int nodeEdgesMetadataOffset(const DiskAnnIndex *pIndex);
 void nodeBinInit(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, Vector *pVector);
 void nodeBinVector(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, Vector *pVector);
 u16 nodeBinEdges(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot);
-void nodeBinEdge(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, int iEdge, u64 *pRowid, Vector *pVector);
+void nodeBinEdge(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, int iEdge, u64 *pRowid, float *distance, Vector *pVector);
 int nodeBinEdgeFindIdx(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, u64 nRowid);
 void nodeBinPruneEdges(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int nPruned);
-void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iReplace, u64 nRowid, Vector *pVector);
+void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iReplace, u64 nRowid, float distance, Vector *pVector);
 void nodeBinDeleteEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iDelete);
 void nodeBinDebug(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot);
 
@@ -100,43 +101,49 @@ typedef u8 MetricType;
 */
 
 /* format version which can help to upgrade vector on-disk format without breaking older version of the db */
-#define VECTOR_FORMAT_PARAM_ID         1
+#define VECTOR_FORMAT_PARAM_ID              1
 /*
- * 1 - initial version
+ * 1 - v1 version; node block format: [node meta] [node vector] [edge vectors] ... [ [u64 unused               ] [u64 edge rowid] ] ...
+ * 2 - v2 version; node block format: [node meta] [node vector] [edge vectors] ... [ [u32 unused] [f32 distance] [u64 edge rowid] ] ...
+ * 3 - v3 version; node meta aligned to 8-byte boundary (instead of having u64 + u16 size - we round it up to u64 + u64)
 */
-#define VECTOR_FORMAT_DEFAULT          1
+#define VECTOR_FORMAT_V1                    1
+#define VECTOR_FORMAT_V2                    2
+#define VECTOR_FORMAT_DEFAULT               3
 
 /* type of the vector index */
-#define VECTOR_INDEX_TYPE_PARAM_ID     2
-#define VECTOR_INDEX_TYPE_DISKANN      1
+#define VECTOR_INDEX_TYPE_PARAM_ID          2
+#define VECTOR_INDEX_TYPE_DISKANN           1
 
 /* type of the underlying vector for the vector index */
-#define VECTOR_TYPE_PARAM_ID           3
+#define VECTOR_TYPE_PARAM_ID                3
 /* dimension of the underlying vector for the vector index */
-#define VECTOR_DIM_PARAM_ID            4
+#define VECTOR_DIM_PARAM_ID                 4
 
 /* metric type used for comparing two vectors */
-#define VECTOR_METRIC_TYPE_PARAM_ID    5
-#define VECTOR_METRIC_TYPE_COS         1
-#define VECTOR_METRIC_TYPE_L2          2
+#define VECTOR_METRIC_TYPE_PARAM_ID         5
+#define VECTOR_METRIC_TYPE_COS              1
+#define VECTOR_METRIC_TYPE_L2               2
 
 /* block size */
-#define VECTOR_BLOCK_SIZE_PARAM_ID     6
-#define VECTOR_BLOCK_SIZE_DEFAULT      128
+#define VECTOR_BLOCK_SIZE_PARAM_ID          6
+#define VECTOR_BLOCK_SIZE_DEFAULT           128
 
-#define VECTOR_PRUNING_ALPHA_PARAM_ID  7
-#define VECTOR_PRUNING_ALPHA_DEFAULT   1.2
+#define VECTOR_PRUNING_ALPHA_PARAM_ID       7
+#define VECTOR_PRUNING_ALPHA_DEFAULT        1.2
 
-#define VECTOR_INSERT_L_PARAM_ID       8
-#define VECTOR_INSERT_L_DEFAULT        70
+#define VECTOR_INSERT_L_PARAM_ID            8
+#define VECTOR_INSERT_L_DEFAULT             70
 
-#define VECTOR_SEARCH_L_PARAM_ID       9
-#define VECTOR_SEARCH_L_DEFAULT        200
+#define VECTOR_SEARCH_L_PARAM_ID            9
+#define VECTOR_SEARCH_L_DEFAULT             200
 
-#define VECTOR_MAX_NEIGHBORS_PARAM_ID  10
+#define VECTOR_MAX_NEIGHBORS_PARAM_ID       10
+
+#define VECTOR_COMPRESS_NEIGHBORS_PARAM_ID  11
 
 /* total amount of vector index parameters */
-#define VECTOR_PARAM_IDS_COUNT         9
+#define VECTOR_PARAM_IDS_COUNT              11
 
 /*
  * Vector index parameters are stored in simple binary format (1 byte tag + 8 byte u64 integer / f64 float)
@@ -218,7 +225,7 @@ int vectorOutRowsPut(VectorOutRows *, int, int, const u64 *, sqlite3_value *);
 void vectorOutRowsGet(sqlite3_context *, const VectorOutRows *, int, int);
 void vectorOutRowsFree(sqlite3 *, VectorOutRows *);
 
-int diskAnnCreateIndex(sqlite3 *, const char *, const char *, const VectorIdxKey *, VectorIdxParams *);
+int diskAnnCreateIndex(sqlite3 *, const char *, const char *, const VectorIdxKey *, VectorIdxParams *, const char **);
 int diskAnnClearIndex(sqlite3 *, const char *, const char *);
 int diskAnnDropIndex(sqlite3 *, const char *, const char *);
 int diskAnnOpenIndex(sqlite3 *, const char *, const char *, const VectorIdxParams *, DiskAnnIndex **);
@@ -238,7 +245,7 @@ int vectorIdxParseColumnType(const char *, int *, int *, const char **);
 int vectorIndexCreate(Parse*, const Index*, const char *, const IdList*);
 int vectorIndexClear(sqlite3 *, const char *, const char *);
 int vectorIndexDrop(sqlite3 *, const char *, const char *);
-int vectorIndexSearch(sqlite3 *, const char *, int, sqlite3_value **, VectorOutRows *, int *, int *, char **);
+int vectorIndexSearch(sqlite3 *, int, sqlite3_value **, VectorOutRows *, int *, int *, char **);
 int vectorIndexCursorInit(sqlite3 *, const char *, const char *, VectorIdxCursor **);
 void vectorIndexCursorClose(sqlite3 *, VectorIdxCursor *, int *, int *);
 int vectorIndexInsert(VectorIdxCursor *, const UnpackedRecord *, char **);

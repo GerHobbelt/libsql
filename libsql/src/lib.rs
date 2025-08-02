@@ -88,8 +88,32 @@
 //! that will allow you to sync you remote database locally.
 //! - `remote` this feature flag only includes HTTP code that will allow you to run queries against
 //! a remote database.
+//! - `tls` this feature flag disables the builtin TLS connector and instead requires that you pass
+//! your own connector for any of the features that require HTTP.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(
+    all(
+        any(
+            not(feature = "remote"),
+            not(feature = "replication"),
+            not(feature = "core")
+        ),
+        feature = "tls"
+    ),
+    allow(unused_imports)
+)]
+#![cfg_attr(
+    all(
+        any(
+            not(feature = "remote"),
+            not(feature = "replication"),
+            not(feature = "core")
+        ),
+        feature = "tls"
+    ),
+    allow(dead_code)
+)]
 
 #[macro_use]
 mod macros;
@@ -104,6 +128,11 @@ cfg_core! {
 }
 
 pub mod params;
+
+cfg_sync! {
+    mod sync;
+    pub use database::SyncProtocol;
+}
 
 cfg_replication! {
     pub mod replication;
@@ -147,7 +176,7 @@ cfg_hrana! {
 }
 
 pub use self::{
-    connection::Connection,
+    connection::{BatchRows, Connection},
     database::{Builder, Database},
     load_extension_guard::LoadExtensionGuard,
     rows::{Column, Row, Rows},

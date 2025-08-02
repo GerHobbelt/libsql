@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use bottomless::replicator::Replicator;
@@ -45,7 +46,7 @@ pub type Result<T> = anyhow::Result<T>;
 pub enum Connection {
     Primary(PrimaryConnection),
     Replica(ReplicaConnection),
-    Schema(SchemaConnection),
+    Schema(SchemaConnection<PrimaryConnection>),
 }
 
 impl fmt::Debug for Connection {
@@ -137,12 +138,20 @@ impl crate::connection::Connection for Connection {
             Connection::Schema(conn) => conn.diagnostics(),
         }
     }
+
+    fn with_raw<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
+        match self {
+            Connection::Primary(c) => c.with_raw(f),
+            Connection::Replica(c) => c.with_raw(f),
+            Connection::Schema(c) => c.with_raw(f),
+        }
+    }
 }
 
 pub enum Database {
     Primary(PrimaryDatabase),
     Replica(ReplicaDatabase),
-    Schema(SchemaDatabase),
+    Schema(SchemaDatabase<PrimaryConnectionMaker>),
 }
 
 impl fmt::Debug for Database {
@@ -150,7 +159,7 @@ impl fmt::Debug for Database {
         match self {
             Self::Primary(_) => write!(f, "Primary"),
             Self::Replica(_) => write!(f, "Replica"),
-            Database::Schema(_) => write!(f, "Schema"),
+            Self::Schema(_) => write!(f, "Schema"),
         }
     }
 }
@@ -184,7 +193,14 @@ impl Database {
         match self {
             Database::Primary(p) => Some(p.wal_wrapper.wrapper().logger()),
             Database::Replica(_) => None,
-            Database::Schema(s) => Some(s.wal_wrapper.wrapper().logger()),
+            Database::Schema(s) => Some(s.wal_wrapper.as_ref().unwrap().wrapper().logger()),
+        }
+    }
+
+    pub fn block_writes(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Primary(p) => Some(p.block_writes.clone()),
+            _ => None,
         }
     }
 
@@ -198,29 +214,21 @@ impl Database {
                     .subscribe(),
             ),
             Database::Replica(_) => None,
-            Database::Schema(s) => Some(
-                s.wal_wrapper
-                    .wrapper()
-                    .logger()
-                    .new_frame_notifier
-                    .subscribe(),
-            ),
+            Database::Schema(s) => Some(s.new_frame_notifier.clone()),
         }
     }
 
-    pub fn as_primary(&self) -> Option<&PrimaryDatabase> {
-        if let Self::Primary(v) = self {
-            Some(v)
-        } else {
-            None
+    pub fn is_primary(&self) -> bool {
+        match self {
+            Self::Primary(_) => true,
+            _ => false,
         }
     }
 
-    pub(crate) fn as_schema(&self) -> Option<&SchemaDatabase> {
-        if let Self::Schema(v) = self {
-            Some(v)
-        } else {
-            None
+    pub(crate) fn is_schema(&self) -> bool {
+        match self {
+            Self::Schema(_) => true,
+            _ => false,
         }
     }
 

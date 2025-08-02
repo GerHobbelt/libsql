@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::params::{IntoParams, Params};
 use crate::rows::Rows;
@@ -20,6 +21,10 @@ pub(crate) trait Conn {
     async fn prepare(&self, sql: &str) -> Result<Statement>;
 
     async fn transaction(&self, tx_behavior: TransactionBehavior) -> Result<Transaction>;
+
+    fn interrupt(&self) -> Result<()>;
+
+    fn busy_timeout(&self, timeout: Duration) -> Result<()>;
 
     fn is_autocommit(&self) -> bool;
 
@@ -125,7 +130,7 @@ impl Connection {
     ///
     /// # Return
     ///
-    /// This returns a `BatchRows` currently only the `remote` connection supports this feature and
+    /// This returns a `BatchRows` currently only the `remote`  and `local` connection supports this feature and
     /// all other connection types will return an empty set always.
     pub async fn execute_batch(&self, sql: &str) -> Result<BatchRows> {
         tracing::trace!("executing batch `{}`", sql);
@@ -136,7 +141,7 @@ impl Connection {
     ///
     /// # Return
     ///
-    /// This returns a `BatchRows` currently only the `remote` connection supports this feature and
+    /// This returns a `BatchRows` currently only the `remote` and `local` connection supports this feature and
     /// all other connection types will return an empty set always.
     pub async fn execute_transactional_batch(&self, sql: &str) -> Result<BatchRows> {
         tracing::trace!("executing batch transactional `{}`", sql);
@@ -183,6 +188,15 @@ impl Connection {
     ) -> Result<Transaction> {
         tracing::trace!("starting {:?} transaction", tx_behavior);
         self.conn.transaction(tx_behavior).await
+    }
+
+    /// Cancel ongoing operations and return at earliest opportunity.
+    pub fn interrupt(&self) -> Result<()> {
+        self.conn.interrupt()
+    }
+
+    pub fn busy_timeout(&self, timeout: Duration) -> Result<()> {
+        self.conn.busy_timeout(timeout)
     }
 
     /// Check weather libsql is in `autocommit` or not.
@@ -243,5 +257,11 @@ impl Connection {
         entry_point: Option<&str>,
     ) -> Result<()> {
         self.conn.load_extension(dylib_path.as_ref(), entry_point)
+    }
+}
+
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection").finish()
     }
 }

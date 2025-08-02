@@ -9,6 +9,7 @@ use crate::namespace::NamespaceName;
 use crate::schema::status::{MigrationJobProgress, MigrationJobSummary};
 
 use super::status::MigrationProgress;
+use super::validate_migration;
 use super::{
     status::{MigrationJob, MigrationTask},
     Error, MigrationDetails, MigrationJobStatus, MigrationSummary, MigrationTaskStatus,
@@ -328,15 +329,17 @@ pub(super) fn get_next_pending_migration_job(
             |row| {
                 let job_id = row.get::<_, i64>(0)?;
                 let status = MigrationJobStatus::from_int(row.get::<_, u64>(1)?);
-                let migration = serde_json::from_str(row.get_ref(2)?.as_str()?).unwrap();
+                let mut migration = serde_json::from_str(row.get_ref(2)?.as_str()?).unwrap();
                 let schema = NamespaceName::from_string(row.get::<_, String>(3)?).unwrap();
+                let disable_foreign_key = validate_migration(&mut migration).unwrap();
                 Ok(MigrationJob {
                     schema,
                     job_id,
                     status,
-                    migration,
                     progress: Default::default(),
                     task_error: None,
+                    disable_foreign_key,
+                    migration: migration.into(),
                 })
             },
         )
@@ -482,6 +485,7 @@ mod test {
     async fn register_schema(meta_store: &MetaStore, schema: &'static str) {
         meta_store
             .handle(schema.into())
+            .await
             .store(DatabaseConfig {
                 is_shared_schema: true,
                 ..Default::default()
@@ -497,6 +501,7 @@ mod test {
     ) -> crate::Result<()> {
         meta_store
             .handle(name.into())
+            .await
             .store(DatabaseConfig {
                 shared_schema_name: Some(schema.into()),
                 ..Default::default()
@@ -509,9 +514,15 @@ mod test {
         let tmp = tempdir().unwrap();
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let conn = maker().unwrap();
-        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
-            .await
-            .unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            conn,
+            manager,
+            crate::database::DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
         let mut conn = maker().unwrap();
         setup_schema(&mut conn).unwrap();
 
@@ -553,14 +564,21 @@ mod test {
         let tmp = tempdir().unwrap();
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let conn = maker().unwrap();
-        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
-            .await
-            .unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            conn,
+            manager,
+            crate::database::DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
 
         // FIXME: the actual error reported here is a shitty constraint error, we should make the
         // necessary checks beforehand, and return a nice error message.
         assert!(meta_store
             .handle("ns1".into())
+            .await
             .store(DatabaseConfig {
                 shared_schema_name: Some("schema1".into()),
                 ..Default::default()
@@ -574,9 +592,15 @@ mod test {
         let tmp = tempdir().unwrap();
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let conn = maker().unwrap();
-        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
-            .await
-            .unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            conn,
+            manager,
+            crate::database::DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
         let mut conn = maker().unwrap();
         setup_schema(&mut conn).unwrap();
 
@@ -621,9 +645,15 @@ mod test {
         let tmp = tempdir().unwrap();
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let conn = maker().unwrap();
-        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
-            .await
-            .unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            conn,
+            manager,
+            crate::database::DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
         let mut conn = maker().unwrap();
         setup_schema(&mut conn).unwrap();
 
@@ -671,9 +701,15 @@ mod test {
         let tmp = tempdir().unwrap();
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let conn = maker().unwrap();
-        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
-            .await
-            .unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            conn,
+            manager,
+            crate::database::DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
         let mut conn = maker().unwrap();
         setup_schema(&mut conn).unwrap();
 
@@ -722,9 +758,15 @@ mod test {
         let tmp = tempdir().unwrap();
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let conn = maker().unwrap();
-        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
-            .await
-            .unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            conn,
+            manager,
+            crate::database::DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
         let mut conn = maker().unwrap();
         setup_schema(&mut conn).unwrap();
 
@@ -748,9 +790,15 @@ mod test {
         let tmp = tempdir().unwrap();
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let conn = maker().unwrap();
-        let meta_store = MetaStore::new(Default::default(), tmp.path(), conn, manager)
-            .await
-            .unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            conn,
+            manager,
+            crate::database::DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
         let mut conn = maker().unwrap();
         setup_schema(&mut conn).unwrap();
 

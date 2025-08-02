@@ -10,23 +10,26 @@ use tonic::metadata::BinaryMetadataValue;
 
 use crate::auth::Authenticated;
 use crate::error::Error;
+use crate::http::user::timing::sample_time;
 use crate::metrics::{
     CONCURRENT_CONNECTIONS_COUNT, CONNECTION_ALIVE_DURATION, CONNECTION_CREATE_TIME,
+    TOTAL_RESPONSE_SIZE_HIST,
 };
 use crate::namespace::meta_store::MetaStore;
 use crate::namespace::NamespaceName;
 use crate::query::{Params, Query};
 use crate::query_analysis::Statement;
-use crate::query_result_builder::{IgnoreResult, QueryResultBuilder};
+use crate::query_result_builder::{IgnoreResult, QueryResultBuilder, TOTAL_RESPONSE_SIZE};
 use crate::replication::FrameNo;
 use crate::Result;
 
 use self::program::{Cond, DescribeResponse, Program, Step};
 
 pub mod config;
+mod connection_core;
 pub mod connection_manager;
 pub mod dump;
-pub mod libsql;
+pub mod legacy;
 pub mod program;
 pub mod write_proxy;
 
@@ -169,6 +172,8 @@ pub trait Connection: Send + Sync + 'static {
     async fn vacuum_if_needed(&self) -> Result<()>;
 
     fn diagnostics(&self) -> String;
+
+    fn with_raw<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R;
 }
 
 fn make_batch_program(batch: Vec<Query>) -> Vec<Step> {
@@ -200,6 +205,7 @@ pub trait MakeConnection: Send + Sync + 'static {
         timeout: Option<Duration>,
         max_total_response_size: u64,
         max_concurrent_requests: u64,
+        disable_intelligent_throttling: bool,
     ) -> MakeThrottledConnection<Self>
     where
         Self: Sized,
@@ -210,6 +216,7 @@ pub trait MakeConnection: Send + Sync + 'static {
             timeout,
             max_total_response_size,
             max_concurrent_requests,
+            disable_intelligent_throttling,
         )
     }
 
@@ -275,6 +282,7 @@ pub struct MakeThrottledConnection<F> {
     max_total_response_size: u64,
     waiters: AtomicUsize,
     max_concurrent_requests: u64,
+    disable_intelligent_throttling: bool,
 }
 
 impl<F> MakeThrottledConnection<F> {
@@ -284,6 +292,7 @@ impl<F> MakeThrottledConnection<F> {
         timeout: Option<Duration>,
         max_total_response_size: u64,
         max_concurrent_requests: u64,
+        disable_intelligent_throttling: bool,
     ) -> Self {
         Self {
             semaphore,
@@ -292,12 +301,16 @@ impl<F> MakeThrottledConnection<F> {
             max_total_response_size,
             waiters: AtomicUsize::new(0),
             max_concurrent_requests,
+            disable_intelligent_throttling,
         }
     }
 
     // How many units should be acquired from the semaphore,
     // depending on current memory pressure.
     fn units_to_take(&self) -> u32 {
+        if self.disable_intelligent_throttling {
+            return 1;
+        }
         let total_response_size = crate::query_result_builder::TOTAL_RESPONSE_SIZE
             .load(std::sync::atomic::Ordering::Relaxed) as u64;
         if total_response_size * 2 > self.max_total_response_size {
@@ -309,6 +322,13 @@ impl<F> MakeThrottledConnection<F> {
         } else {
             1
         }
+    }
+
+    pub async fn untracked(&self) -> Result<F::Connection, Error>
+    where
+        F: MakeConnection,
+    {
+        self.connection_maker.create().await
     }
 }
 
@@ -340,6 +360,8 @@ impl<F: MakeConnection> MakeConnection for MakeThrottledConnection<F> {
             "Available semaphore units: {}",
             self.semaphore.available_permits()
         );
+        TOTAL_RESPONSE_SIZE_HIST
+            .record(TOTAL_RESPONSE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f64);
         let units = self.units_to_take();
         let waiters_guard = WaitersGuard::new(&self.waiters);
         if (waiters_guard.waiters.load(Ordering::Relaxed) as u64) >= self.max_concurrent_requests {
@@ -387,6 +409,7 @@ pub struct TrackedConnection<DB> {
 
 impl<T> Drop for TrackedConnection<T> {
     fn drop(&mut self) {
+        sample_time("connection-duration", self.created_at.elapsed());
         CONCURRENT_CONNECTIONS_COUNT.decrement(1.0);
         CONNECTION_ALIVE_DURATION.record(self.created_at.elapsed());
     }
@@ -444,6 +467,10 @@ impl<DB: Connection> Connection for TrackedConnection<DB> {
     fn diagnostics(&self) -> String {
         self.inner.diagnostics()
     }
+
+    fn with_raw<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
+        self.inner.with_raw(f)
+    }
 }
 
 #[cfg(test)]
@@ -489,6 +516,10 @@ pub mod test {
         fn diagnostics(&self) -> String {
             "dummy".into()
         }
+
+        fn with_raw<R>(&self, _f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
+            todo!()
+        }
     }
 
     #[tokio::test]
@@ -498,6 +529,7 @@ pub mod test {
             Some(Duration::from_millis(100)),
             u64::MAX,
             u64::MAX,
+            false,
         );
 
         let mut conns = Vec::with_capacity(10);

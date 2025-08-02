@@ -4,15 +4,21 @@ Welcome to the `sqld` user guide!
 
 ## Table of Contents
 
-* [Overview](#overview)
-* [Replication](#replication)
-    * [TLS configuration](#tls-configuration)
-    * [Launching a primary server](#launching-a-primary-server)
-    * [Launching a replica server](#launching-a-replica-server)
-* [Client Authentication](#clientauthentication)
-* [Deployment](#deployment)
-    * [Deploying with Docker](#deploying-with-docker)
-    * [Deploying on Fly](#deploying-on-fly)
+- [`sqld` User Guide](#sqld-user-guide)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Replication](#replication)
+    - [TLS configuration](#tls-configuration)
+    - [Launching a primary server](#launching-a-primary-server)
+    - [Launching a replica server](#launching-a-replica-server)
+  - [Client Authentication](#client-authentication)
+  - [Deployment](#deployment)
+    - [Deploying with Docker](#deploying-with-docker)
+    - [Deploying on Fly](#deploying-on-fly)
+  - [Incremental snapshots](#incremental-snapshots)
+  - [Multitenancy](#multitenancy)
+    - [Path based routing](#path-based-routing)
+    - [Wildcard domain for development](#wildcard-domain-for-development)
 
 ## Overview
 
@@ -37,13 +43,13 @@ In this section, we will walk you through how to set up a libsql cluster.
 
 The nodes in a `sqld` cluster communicate over gRPC with TLS. To set up a `sqld` cluster, you need the following TLS configuration:
 
-* Certificate authority (CA) certificate and private key
-* Primary server certificate and private key
-* Replica server certificates and private keys
+- Certificate authority (CA) certificate and private key
+- Primary server certificate and private key
+- Replica server certificates and private keys
 
 In TLS speak, the primary server is the server and the replica servers are the clients.
 
-For *development and testing* purposes, you can generate TLS keys and certificates with:
+For _development and testing_ purposes, you can generate TLS keys and certificates with:
 
 ```console
 python scripts/gen_certs.py
@@ -51,12 +57,12 @@ python scripts/gen_certs.py
 
 The script generates the following files:
 
-* `ca_cert.pem` -- certificate authority certificate
-* `ca_key.pem` -- certificate authority private key
-* `server_cert.pem` -- primary server certificate
-* `server_key.pem` -- primary server private key
-* `client_cert.pem` -- replica server certificate
-* `client_key.pem ` -- replica server private key
+- `ca_cert.pem` -- certificate authority certificate
+- `ca_key.pem` -- certificate authority private key
+- `server_cert.pem` -- primary server certificate
+- `server_key.pem` -- primary server private key
+- `client_cert.pem` -- replica server certificate
+- `client_key.pem` -- replica server private key
 
 ### Launching a primary server
 
@@ -126,20 +132,24 @@ You can find more information about the Docker image [here](./DOCKER.md).
 You can use the existing `fly.toml` file from this repository.
 
 Just run
+
 ```console
 flyctl launch
 ```
+
 ... then pick a name and respond "Yes" when the prompt asks you to deploy.
 
 You now have `sqld` running on Fly listening for HTTP connections.
 
 Give it a try with this snippet, replacing `$YOUR_APP` with your app name:
-```
+
+```console
 curl -X POST -d '{"statements": ["create table testme(a,b,c)"]}' $YOUR_APP.fly.dev
 curl -X POST -d '{"statements": ["insert into testme values(1,2,3)"]}' $YOUR_APP.fly.dev
 curl -X POST -d '{"statements": ["select * from testme"]}' $YOUR_APP.fly.dev
 ```
-```
+
+```json
 [{"b":2,"a":1,"c":3}]
 ```
 
@@ -160,6 +170,10 @@ SNAPSHOT_FILE="$1"
 NAMESPACE="$2"
 
 echo "Generated incremental snapshot $SNAPSHOT_FILE for namespace $NAMESPACE"
+
+# At this point we can ship the snapshot file to wherever we would like but we
+# must delete it from its location on disk or else sqld will panic.
+rm $SNAPSHOT_FILE
 ```
 
 and then configure `sqld` to generate an incremental snapshot every 5 seconds and invoke the shell script when `sqld` generates a snapshot:
@@ -216,6 +230,12 @@ async fn main() {
 }
 ```
 
+When applying snapshots the format of the file name gives certain information.
+The format is `{namespace}:{log_id}:{start_frame_no:020x}-{end_frame_no:020x}.snap` where log_id represents the unique write ahead log and then
+for each unique log_id there will be snapshots starting at frame `0` up until
+the end. Snapshots must be applied sequentially for each log_id starting at
+frame 0.
+
 ## Multitenancy
 
 The `sqld` server supports more than one database. To create a database, send a create namespace request to the [admin API](ADMIN_API.md).
@@ -236,6 +256,12 @@ For example, if you have the following entries in your `/etc/hosts` file:
 
 You can access `db1` with the `http://db1.local:8080`URL and `db2` with `http://db2.local:8080`.
 The database files for the databases are stored in `<data dir>/dbs/db1` and `<data dir/dbs/db2`, respectively.
+
+### Path based routing
+
+For local development and testing, you can also connect to your databases by specifying the database namespace in the URL path.
+
+You can access namespace `db1` with the `http://local:8080/dev/db1` URL and `db2` with `http://local:8080/dev/db2`, respectively.
 
 ### Wildcard domain for development
 

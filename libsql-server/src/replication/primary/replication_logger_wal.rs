@@ -100,11 +100,12 @@ impl ReplicationLoggerWalWrapper {
 
     /// write buffered pages to the logger, without committing.
     fn flush(&mut self, size_after: u32) -> anyhow::Result<()> {
-        if !self.buffer.is_empty() {
-            self.buffer.last_mut().unwrap().size_after = size_after;
-            self.logger.write_pages(&self.buffer)?;
-            self.buffer.clear();
-        }
+        let Some(last_page) = self.buffer.last_mut() else {
+            return Ok(());
+        };
+        last_page.size_after = size_after;
+        self.logger.write_pages(&self.buffer)?;
+        self.buffer.clear();
 
         Ok(())
     }
@@ -152,7 +153,7 @@ mod test {
         );
 
         let wal_manager = ReplicationLoggerWalWrapper::new(logger.clone());
-        let db = crate::connection::libsql::open_conn_active_checkpoint(
+        let db = crate::connection::legacy::open_conn_active_checkpoint(
             tmp.path(),
             Sqlite3WalManager::default().wrap(wal_manager),
             None,
