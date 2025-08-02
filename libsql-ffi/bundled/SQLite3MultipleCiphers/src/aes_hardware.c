@@ -7,6 +7,8 @@
 ** License:     MIT
 */
 
+#include <stdint.h>
+
 /*
 ** Check whether the platform offers hardware support for AES
 */
