@@ -76,8 +76,12 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> 
 /// propagate into OUT_DIR. If not present, when trying to rewrite a file, a `Permission denied`
 /// error will occur.
 fn copy_with_cp(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
-    match Command::new("cp")
-        .arg("--no-preserve=mode,ownership")
+    let mut command = Command::new("cp");
+    // --no-preserve is enabled by default on macos
+    // preserve must be explicitly enabled with the -p flag
+    #[cfg(not(target_os = "macos"))]
+    let command = command.arg("--no-preserve=mode,ownership");
+    match command
         .arg("-R")
         .arg(from.as_ref().to_str().unwrap())
         .arg(to.as_ref().to_str().unwrap())
@@ -469,6 +473,18 @@ fn build_multiple_ciphers(out_path: &Path) -> PathBuf {
         .define("SQLITE_USE_URI", "ON")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
         .profile("Release");
+
+    if let Ok(cc) = env::var("CMAKE_C_COMPILER") {
+        let mut build = cc::Build::new();
+        build.compiler(cc);
+        config.init_c_cfg(build);
+    }
+
+    if let Ok(cxx) = env::var("CMAKE_CXX_COMPILER") {
+        let mut build = cc::Build::new();
+        build.compiler(cxx);
+        config.init_cxx_cfg(build);
+    }
 
     if cfg!(feature = "wasmtime-bindings") {
         config.define("LIBSQL_ENABLE_WASM_RUNTIME", "1");
