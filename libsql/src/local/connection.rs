@@ -12,8 +12,8 @@ use super::{Database, Error, Result, Rows, RowsFuture, Statement, Transaction};
 use crate::TransactionBehavior;
 
 use libsql_sys::ffi;
-use std::cell::RefCell;
 use std::{ffi::c_int, fmt, path::Path, sync::Arc};
+use parking_lot::RwLock;
 
 /// A connection to a libSQL database.
 #[derive(Clone)]
@@ -25,7 +25,7 @@ pub struct Connection {
     #[cfg(feature = "replication")]
     pub(crate) writer: Option<crate::replication::Writer>,
 
-    authorizer: RefCell<Option<AuthHook>>,
+    authorizer: Arc<RwLock<Option<AuthHook>>>,
 }
 
 impl Drop for Connection {
@@ -68,7 +68,7 @@ impl Connection {
             drop_ref: Arc::new(()),
             #[cfg(feature = "replication")]
             writer: db.writer()?,
-            authorizer: RefCell::new(None),
+            authorizer: Arc::new(RwLock::new(None)),
         };
         #[cfg(feature = "sync")]
         if let Some(_) = db.sync_ctx {
@@ -93,7 +93,7 @@ impl Connection {
             drop_ref: Arc::new(()),
             #[cfg(feature = "replication")]
             writer: None,
-            authorizer: RefCell::new(None),
+            authorizer: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -473,14 +473,14 @@ impl Connection {
             }
         }
 
-        *self.authorizer.borrow_mut() = hook.clone();
+        *self.authorizer.write() = hook.clone();
 
         let (callback, user_data) = match hook {
             Some(_) => {
                 let callback = authorizer_callback as unsafe extern "C" fn(_, _, _, _, _, _) -> _;
                 let user_data = self as *const Connection as *mut ::std::os::raw::c_void;
                 (Some(callback), user_data)
-            },
+            }
             None => (None, std::ptr::null_mut()),
         };
 
@@ -495,7 +495,22 @@ impl Connection {
     }
 
     pub(crate) fn wal_checkpoint(&self, truncate: bool) -> Result<()> {
-        let rc = unsafe { libsql_sys::ffi::sqlite3_wal_checkpoint_v2(self.handle(), std::ptr::null(), truncate as i32, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let mut pn_log = 0i32;
+        let mut pn_ckpt = 0i32;
+        let checkpoint_mode = if truncate {
+            libsql_sys::ffi::SQLITE_CHECKPOINT_TRUNCATE
+        } else {
+            libsql_sys::ffi::SQLITE_CHECKPOINT_PASSIVE
+        };
+        let rc = unsafe {
+            libsql_sys::ffi::sqlite3_wal_checkpoint_v2(
+                self.handle(),
+                std::ptr::null(),
+                checkpoint_mode,
+                &mut pn_log,
+                &mut pn_ckpt,
+            )
+        };
         if rc != 0 {
             let err_msg = unsafe { libsql_sys::ffi::sqlite3_errmsg(self.handle()) };
             let err_msg = unsafe { std::ffi::CStr::from_ptr(err_msg) };
@@ -503,6 +518,12 @@ impl Connection {
             return Err(crate::errors::Error::SqliteFailure(
                 rc as std::ffi::c_int,
                 format!("Failed to checkpoint WAL: {}", err_msg),
+            ));
+        }
+        if truncate && (pn_log != 0 || pn_ckpt != 0) {
+            return Err(crate::errors::Error::SqliteFailure(
+                libsql_sys::ffi::SQLITE_ERROR,
+                "unable to truncate WAL".to_string(),
             ));
         }
         Ok(())
@@ -596,6 +617,9 @@ impl Connection {
             )
         };
 
+        if conflict != 0 {
+            return Err(errors::Error::WalConflict);
+        }
         if rc != 0 {
             return Err(errors::Error::SqliteFailure(
                 rc as std::ffi::c_int,
@@ -603,16 +627,14 @@ impl Connection {
             ));
         }
 
-        if conflict != 0 {
-            return Err(errors::Error::WalConflict);
-        }
-
         Ok(())
     }
 
-    pub(crate) fn wal_insert_handle(&self) -> Result<WalInsertHandle<'_>> {
-        self.wal_insert_begin()?;
-        Ok(WalInsertHandle { conn: self, in_session: RefCell::new(true) })
+    pub(crate) fn wal_insert_handle(&self) -> WalInsertHandle<'_> {
+        WalInsertHandle {
+            conn: self,
+            in_session: RwLock::new(false),
+        }
     }
 }
 
@@ -625,7 +647,7 @@ unsafe extern "C" fn authorizer_callback(
     accessor: *const ::std::os::raw::c_char,
 ) -> ::std::os::raw::c_int {
     let conn = user_data as *const Connection;
-    let hook = unsafe { (*conn).authorizer.borrow() };
+    let hook = unsafe { (*conn).authorizer.read() };
     let hook = match &*hook {
         Some(hook) => hook,
         None => return ffi::SQLITE_OK,
@@ -666,37 +688,37 @@ unsafe extern "C" fn authorizer_callback(
 
 pub(crate) struct WalInsertHandle<'a> {
     conn: &'a Connection,
-    in_session: RefCell<bool>,
+    in_session: RwLock<bool>
 }
 
 impl WalInsertHandle<'_> {
     pub fn insert_at(&self, frame_no: u32, frame: &[u8]) -> Result<()> {
-        assert!(*self.in_session.borrow());
+        assert!(*self.in_session.read());
         self.conn.wal_insert_frame(frame_no, frame)
     }
 
     pub fn in_session(&self) -> bool {
-        *self.in_session.borrow()
+        *self.in_session.read()
     }
 
     pub fn begin(&self) -> Result<()> {
-        assert!(!*self.in_session.borrow());
+        assert!(!*self.in_session.read());
         self.conn.wal_insert_begin()?;
-        self.in_session.replace(true);
+        *self.in_session.write() = true;
         Ok(())
     }
 
     pub fn end(&self) -> Result<()> {
-        assert!(*self.in_session.borrow());
+        assert!(*self.in_session.read());
         self.conn.wal_insert_end()?;
-        self.in_session.replace(false);
+        *self.in_session.write() = false;
         Ok(())
     }
 }
 
 impl Drop for WalInsertHandle<'_> {
     fn drop(&mut self) {
-        if *self.in_session.borrow() {
+        if *self.in_session.read() {
             if let Err(err) = self.conn.wal_insert_end() {
                 tracing::error!("{:?}", err);
                 Err(err).unwrap()
@@ -748,7 +770,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let handle = conn2.wal_insert_handle().unwrap();
+        let handle = conn2.wal_insert_handle();
+        handle.begin().unwrap();
+
         let frame_count = conn1.wal_frame_count();
         for frame_no in 0..frame_count {
             let frame = conn1.wal_get_frame(frame_no + 1, 4096).unwrap();
