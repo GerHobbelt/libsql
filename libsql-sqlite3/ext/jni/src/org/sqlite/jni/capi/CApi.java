@@ -1410,7 +1410,7 @@ public final class CApi {
 
   /**
      Works like the canonical sqlite3_prepare_v2() but its "tail"
-     output paramter is returned as the index offset into the given
+     output parameter is returned as the index offset into the given
      byte array at which SQL parsing stopped.
   */
   public static int sqlite3_prepare_v2(
@@ -1462,7 +1462,7 @@ public final class CApi {
 
   /**
      Works like the canonical sqlite3_prepare_v2() but its "tail"
-     output paramter is returned as the index offset into the given
+     output parameter is returned as the index offset into the given
      byte array at which SQL parsing stopped.
   */
   public static int sqlite3_prepare_v3(
