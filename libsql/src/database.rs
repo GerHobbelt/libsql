@@ -691,17 +691,16 @@ impl Database {
                 };
                 use tokio::sync::Mutex;
 
-                let _ = tokio::task::block_in_place(move || {
+                tokio::task::block_in_place(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .unwrap();
                     rt.block_on(async {
-                        // we will ignore if any errors occurred during the bootstrapping the db,
-                        // because the client could be offline when trying to connect.
-                        let _ = db.bootstrap_db().await;
+                        db.bootstrap_db().await?;
+                        Ok::<(), crate::Error>(())
                     })
-                });
+                })?;
 
                 let local = db.connect()?;
 
@@ -719,7 +718,6 @@ impl Database {
                         read_your_writes: *read_your_writes,
                         context: db.sync_ctx.clone().unwrap(),
                         state: std::sync::Arc::new(Mutex::new(State::Init)),
-                        needs_pull: std::sync::atomic::AtomicBool::new(false).into(),
                     };
 
                     let conn = std::sync::Arc::new(synced);
